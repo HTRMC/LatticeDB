@@ -1,1 +1,3 @@
 /compiler
+/.zig-cache
+/zig-out
