@@ -261,7 +261,7 @@ test "page insert and retrieve tuple" {
     var data: [PAGE_SIZE]u8 align(8) = undefined;
     var page = Page.init(&data, 1);
 
-    const tuple1 = "Hello, LatticeDB!";
+    const tuple1 = "Hello, GrapheneDB!";
     const tuple2 = "Second tuple";
 
     const slot1 = page.insertTuple(tuple1) orelse unreachable;
