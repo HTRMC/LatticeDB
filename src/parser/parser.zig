@@ -1,0 +1,496 @@
+const std = @import("std");
+const lexer_mod = @import("lexer.zig");
+const ast = @import("ast.zig");
+
+const Lexer = lexer_mod.Lexer;
+const Token = lexer_mod.Token;
+const TokenType = lexer_mod.TokenType;
+
+pub const ParseError = error{
+    UnexpectedToken,
+    UnexpectedEof,
+    InvalidSyntax,
+    OutOfMemory,
+};
+
+pub const Parser = struct {
+    lexer: Lexer,
+    current: Token,
+    allocator: std.mem.Allocator,
+
+    // Arena for AST allocations - caller frees everything at once
+    arena_state: std.heap.ArenaAllocator,
+
+    const Self = @This();
+
+    pub fn init(allocator: std.mem.Allocator, input: []const u8) Self {
+        var p = Self{
+            .lexer = Lexer.init(input),
+            .current = undefined,
+            .allocator = allocator,
+            .arena_state = std.heap.ArenaAllocator.init(allocator),
+        };
+        p.current = p.lexer.nextToken();
+        return p;
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.arena_state.deinit();
+    }
+
+    fn arena(self: *Self) std.mem.Allocator {
+        return self.arena_state.allocator();
+    }
+
+    /// Parse a single SQL statement
+    pub fn parse(self: *Self) ParseError!ast.Statement {
+        const stmt = switch (self.current.type) {
+            .kw_select => ast.Statement{ .select = try self.parseSelect() },
+            .kw_insert => ast.Statement{ .insert = try self.parseInsert() },
+            .kw_delete => ast.Statement{ .delete = try self.parseDelete() },
+            .kw_create => ast.Statement{ .create_table = try self.parseCreateTable() },
+            .kw_drop => ast.Statement{ .drop_table = try self.parseDropTable() },
+            .eof => return ParseError.UnexpectedEof,
+            else => return ParseError.UnexpectedToken,
+        };
+
+        // Optional semicolon
+        if (self.current.type == .semicolon) {
+            self.advance();
+        }
+
+        return stmt;
+    }
+
+    // ============================================================
+    // SELECT columns FROM table [WHERE expr]
+    // ============================================================
+    fn parseSelect(self: *Self) ParseError!ast.Select {
+        try self.expect(.kw_select);
+
+        // Parse column list
+        const alloc = self.arena();
+        var cols: std.ArrayList(ast.SelectColumn) = .empty;
+        if (self.current.type == .op_star) {
+            cols.append(alloc, .{ .all_columns = {} }) catch return ParseError.OutOfMemory;
+            self.advance();
+        } else {
+            cols.append(alloc, .{ .named = try self.expectIdentifier() }) catch return ParseError.OutOfMemory;
+            while (self.current.type == .comma) {
+                self.advance();
+                cols.append(alloc, .{ .named = try self.expectIdentifier() }) catch return ParseError.OutOfMemory;
+            }
+        }
+
+        try self.expect(.kw_from);
+        const table_name = try self.expectIdentifier();
+
+        // Optional WHERE
+        var where: ?*const ast.Expression = null;
+        if (self.current.type == .kw_where) {
+            self.advance();
+            where = try self.parseExpression();
+        }
+
+        return .{
+            .columns = cols.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
+            .table_name = table_name,
+            .where_clause = where,
+        };
+    }
+
+    // ============================================================
+    // INSERT INTO table VALUES (val, val, ...)
+    // ============================================================
+    fn parseInsert(self: *Self) ParseError!ast.Insert {
+        try self.expect(.kw_insert);
+        try self.expect(.kw_into);
+        const table_name = try self.expectIdentifier();
+        try self.expect(.kw_values);
+        try self.expect(.left_paren);
+
+        const alloc = self.arena();
+        var vals: std.ArrayList(ast.LiteralValue) = .empty;
+        vals.append(alloc, try self.parseLiteral()) catch return ParseError.OutOfMemory;
+        while (self.current.type == .comma) {
+            self.advance();
+            vals.append(alloc, try self.parseLiteral()) catch return ParseError.OutOfMemory;
+        }
+
+        try self.expect(.right_paren);
+
+        return .{
+            .table_name = table_name,
+            .values = vals.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
+        };
+    }
+
+    // ============================================================
+    // DELETE FROM table [WHERE expr]
+    // ============================================================
+    fn parseDelete(self: *Self) ParseError!ast.Delete {
+        try self.expect(.kw_delete);
+        try self.expect(.kw_from);
+        const table_name = try self.expectIdentifier();
+
+        var where: ?*const ast.Expression = null;
+        if (self.current.type == .kw_where) {
+            self.advance();
+            where = try self.parseExpression();
+        }
+
+        return .{
+            .table_name = table_name,
+            .where_clause = where,
+        };
+    }
+
+    // ============================================================
+    // CREATE TABLE name (col type, col type, ...)
+    // ============================================================
+    fn parseCreateTable(self: *Self) ParseError!ast.CreateTable {
+        try self.expect(.kw_create);
+        try self.expect(.kw_table);
+        const table_name = try self.expectIdentifier();
+        try self.expect(.left_paren);
+
+        const alloc = self.arena();
+        var cols: std.ArrayList(ast.ColumnDef) = .empty;
+        cols.append(alloc, try self.parseColumnDef()) catch return ParseError.OutOfMemory;
+        while (self.current.type == .comma) {
+            self.advance();
+            cols.append(alloc, try self.parseColumnDef()) catch return ParseError.OutOfMemory;
+        }
+
+        try self.expect(.right_paren);
+
+        return .{
+            .table_name = table_name,
+            .columns = cols.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
+        };
+    }
+
+    // ============================================================
+    // DROP TABLE name
+    // ============================================================
+    fn parseDropTable(self: *Self) ParseError!ast.DropTable {
+        try self.expect(.kw_drop);
+        try self.expect(.kw_table);
+        const table_name = try self.expectIdentifier();
+        return .{ .table_name = table_name };
+    }
+
+    // ============================================================
+    // Column definition: name TYPE [(length)] [PRIMARY KEY]
+    // ============================================================
+    fn parseColumnDef(self: *Self) ParseError!ast.ColumnDef {
+        const name = try self.expectIdentifier();
+        const data_type = try self.parseDataType();
+
+        var max_length: u16 = 0;
+        // Optional (length) for VARCHAR
+        if (self.current.type == .left_paren) {
+            self.advance();
+            if (self.current.type != .integer_literal) return ParseError.UnexpectedToken;
+            max_length = @intCast(std.fmt.parseInt(u16, self.current.text, 10) catch return ParseError.InvalidSyntax);
+            self.advance();
+            try self.expect(.right_paren);
+        }
+
+        var is_primary_key = false;
+        if (self.current.type == .kw_primary) {
+            self.advance();
+            try self.expect(.kw_key);
+            is_primary_key = true;
+        }
+
+        return .{
+            .name = name,
+            .data_type = data_type,
+            .max_length = max_length,
+            .nullable = !is_primary_key,
+            .is_primary_key = is_primary_key,
+        };
+    }
+
+    fn parseDataType(self: *Self) ParseError!ast.DataType {
+        const dt: ast.DataType = switch (self.current.type) {
+            .kw_int => .int,
+            .kw_integer => .integer,
+            .kw_bigint => .bigint,
+            .kw_float => .float,
+            .kw_boolean => .boolean,
+            .kw_varchar => .varchar,
+            .kw_text => .text,
+            else => return ParseError.UnexpectedToken,
+        };
+        self.advance();
+        return dt;
+    }
+
+    // ============================================================
+    // Expression parsing (WHERE clauses)
+    // Precedence: OR < AND < NOT < comparison
+    // ============================================================
+
+    fn parseExpression(self: *Self) ParseError!*const ast.Expression {
+        return self.parseOrExpr();
+    }
+
+    fn parseOrExpr(self: *Self) ParseError!*const ast.Expression {
+        var left = try self.parseAndExpr();
+
+        while (self.current.type == .kw_or) {
+            self.advance();
+            const right = try self.parseAndExpr();
+            const expr = try self.arena().create(ast.Expression);
+            expr.* = .{ .or_expr = .{ .left = left, .right = right } };
+            left = expr;
+        }
+
+        return left;
+    }
+
+    fn parseAndExpr(self: *Self) ParseError!*const ast.Expression {
+        var left = try self.parseNotExpr();
+
+        while (self.current.type == .kw_and) {
+            self.advance();
+            const right = try self.parseNotExpr();
+            const expr = try self.arena().create(ast.Expression);
+            expr.* = .{ .and_expr = .{ .left = left, .right = right } };
+            left = expr;
+        }
+
+        return left;
+    }
+
+    fn parseNotExpr(self: *Self) ParseError!*const ast.Expression {
+        if (self.current.type == .kw_not) {
+            self.advance();
+            const operand = try self.parseComparison();
+            const expr = try self.arena().create(ast.Expression);
+            expr.* = .{ .not_expr = .{ .operand = operand } };
+            return expr;
+        }
+        return self.parseComparison();
+    }
+
+    fn parseComparison(self: *Self) ParseError!*const ast.Expression {
+        const left = try self.parsePrimary();
+
+        const op: ?ast.CompOp = switch (self.current.type) {
+            .op_eq => .eq,
+            .op_neq => .neq,
+            .op_lt => .lt,
+            .op_gt => .gt,
+            .op_lte => .lte,
+            .op_gte => .gte,
+            else => null,
+        };
+
+        if (op) |comp_op| {
+            self.advance();
+            const right = try self.parsePrimary();
+            const expr = try self.arena().create(ast.Expression);
+            expr.* = .{ .comparison = .{ .left = left, .op = comp_op, .right = right } };
+            return expr;
+        }
+
+        return left;
+    }
+
+    fn parsePrimary(self: *Self) ParseError!*const ast.Expression {
+        const expr = try self.arena().create(ast.Expression);
+
+        switch (self.current.type) {
+            .integer_literal => {
+                const val = std.fmt.parseInt(i64, self.current.text, 10) catch return ParseError.InvalidSyntax;
+                expr.* = .{ .literal = .{ .integer = val } };
+                self.advance();
+            },
+            .float_literal => {
+                const val = std.fmt.parseFloat(f64, self.current.text) catch return ParseError.InvalidSyntax;
+                expr.* = .{ .literal = .{ .float = val } };
+                self.advance();
+            },
+            .string_literal => {
+                expr.* = .{ .literal = .{ .string = self.current.text } };
+                self.advance();
+            },
+            .kw_true => {
+                expr.* = .{ .literal = .{ .boolean = true } };
+                self.advance();
+            },
+            .kw_false => {
+                expr.* = .{ .literal = .{ .boolean = false } };
+                self.advance();
+            },
+            .kw_null => {
+                expr.* = .{ .literal = .{ .null_value = {} } };
+                self.advance();
+            },
+            .identifier => {
+                expr.* = .{ .column_ref = self.current.text };
+                self.advance();
+            },
+            .left_paren => {
+                self.advance();
+                const inner = try self.parseExpression();
+                try self.expect(.right_paren);
+                return inner;
+            },
+            else => return ParseError.UnexpectedToken,
+        }
+
+        return expr;
+    }
+
+    // ============================================================
+    // Helpers
+    // ============================================================
+
+    fn parseLiteral(self: *Self) ParseError!ast.LiteralValue {
+        switch (self.current.type) {
+            .integer_literal => {
+                const val = std.fmt.parseInt(i64, self.current.text, 10) catch return ParseError.InvalidSyntax;
+                self.advance();
+                return .{ .integer = val };
+            },
+            .float_literal => {
+                const val = std.fmt.parseFloat(f64, self.current.text) catch return ParseError.InvalidSyntax;
+                self.advance();
+                return .{ .float = val };
+            },
+            .string_literal => {
+                const text = self.current.text;
+                self.advance();
+                return .{ .string = text };
+            },
+            .kw_true => {
+                self.advance();
+                return .{ .boolean = true };
+            },
+            .kw_false => {
+                self.advance();
+                return .{ .boolean = false };
+            },
+            .kw_null => {
+                self.advance();
+                return .{ .null_value = {} };
+            },
+            else => return ParseError.UnexpectedToken,
+        }
+    }
+
+    fn advance(self: *Self) void {
+        self.current = self.lexer.nextToken();
+    }
+
+    fn expect(self: *Self, expected: TokenType) ParseError!void {
+        if (self.current.type != expected) {
+            return ParseError.UnexpectedToken;
+        }
+        self.advance();
+    }
+
+    fn expectIdentifier(self: *Self) ParseError![]const u8 {
+        if (self.current.type != .identifier) {
+            return ParseError.UnexpectedToken;
+        }
+        const text = self.current.text;
+        self.advance();
+        return text;
+    }
+};
+
+// Tests
+
+test "parse CREATE TABLE" {
+    var parser = Parser.init(std.testing.allocator, "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), email TEXT)");
+    defer parser.deinit();
+
+    const stmt = try parser.parse();
+    const ct = stmt.create_table;
+
+    try std.testing.expectEqualStrings("users", ct.table_name);
+    try std.testing.expectEqual(@as(usize, 3), ct.columns.len);
+
+    try std.testing.expectEqualStrings("id", ct.columns[0].name);
+    try std.testing.expectEqual(ast.DataType.int, ct.columns[0].data_type);
+    try std.testing.expect(ct.columns[0].is_primary_key);
+    try std.testing.expect(!ct.columns[0].nullable);
+
+    try std.testing.expectEqualStrings("name", ct.columns[1].name);
+    try std.testing.expectEqual(ast.DataType.varchar, ct.columns[1].data_type);
+    try std.testing.expectEqual(@as(u16, 255), ct.columns[1].max_length);
+
+    try std.testing.expectEqualStrings("email", ct.columns[2].name);
+    try std.testing.expectEqual(ast.DataType.text, ct.columns[2].data_type);
+}
+
+test "parse INSERT" {
+    var parser = Parser.init(std.testing.allocator, "INSERT INTO users VALUES (1, 'alice', 'alice@example.com')");
+    defer parser.deinit();
+
+    const stmt = try parser.parse();
+    const ins = stmt.insert;
+
+    try std.testing.expectEqualStrings("users", ins.table_name);
+    try std.testing.expectEqual(@as(usize, 3), ins.values.len);
+    try std.testing.expectEqual(@as(i64, 1), ins.values[0].integer);
+    try std.testing.expectEqualStrings("alice", ins.values[1].string);
+    try std.testing.expectEqualStrings("alice@example.com", ins.values[2].string);
+}
+
+test "parse SELECT with WHERE" {
+    var parser = Parser.init(std.testing.allocator, "SELECT name, email FROM users WHERE id = 1");
+    defer parser.deinit();
+
+    const stmt = try parser.parse();
+    const sel = stmt.select;
+
+    try std.testing.expectEqualStrings("users", sel.table_name);
+    try std.testing.expectEqual(@as(usize, 2), sel.columns.len);
+    try std.testing.expectEqualStrings("name", sel.columns[0].named);
+    try std.testing.expectEqualStrings("email", sel.columns[1].named);
+
+    // WHERE id = 1
+    const where = sel.where_clause.?;
+    try std.testing.expectEqualStrings("id", where.comparison.left.column_ref);
+    try std.testing.expectEqual(ast.CompOp.eq, where.comparison.op);
+    try std.testing.expectEqual(@as(i64, 1), where.comparison.right.literal.integer);
+}
+
+test "parse SELECT *" {
+    var parser = Parser.init(std.testing.allocator, "SELECT * FROM users");
+    defer parser.deinit();
+
+    const stmt = try parser.parse();
+    const sel = stmt.select;
+
+    try std.testing.expectEqual(@as(usize, 1), sel.columns.len);
+    try std.testing.expectEqual(ast.SelectColumn{ .all_columns = {} }, sel.columns[0]);
+}
+
+test "parse DELETE with compound WHERE" {
+    var parser = Parser.init(std.testing.allocator, "DELETE FROM users WHERE id > 5 AND name = 'bob'");
+    defer parser.deinit();
+
+    const stmt = try parser.parse();
+    const del = stmt.delete;
+
+    try std.testing.expectEqualStrings("users", del.table_name);
+
+    // WHERE (id > 5) AND (name = 'bob')
+    const where = del.where_clause.?;
+    const left = where.and_expr.left;
+    const right = where.and_expr.right;
+
+    try std.testing.expectEqual(ast.CompOp.gt, left.comparison.op);
+    try std.testing.expectEqualStrings("id", left.comparison.left.column_ref);
+
+    try std.testing.expectEqual(ast.CompOp.eq, right.comparison.op);
+    try std.testing.expectEqualStrings("name", right.comparison.left.column_ref);
+    try std.testing.expectEqualStrings("bob", right.comparison.right.literal.string);
+}
