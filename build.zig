@@ -13,6 +13,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    exe.root_module.addWin32ResourceFile(.{
+        .file = b.path("src/resources.rc"),
+    });
+
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the app");
