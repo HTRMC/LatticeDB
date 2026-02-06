@@ -24,11 +24,17 @@ pub const Server = struct {
     executor: *Executor,
     exec_mutex: std.Thread.Mutex,
 
+    pub const TlsCert = union(enum) {
+        hash: [20]u8, // Windows Schannel: SHA-1 thumbprint from cert store
+        files: struct { cert: [*:0]const u8, key: [*:0]const u8 }, // Linux OpenSSL: PEM paths
+        pkcs12: struct { der: []const u8, password: ?[*:0]const u8 }, // OpenSSL: PKCS12 DER bytes
+        context: *anyopaque, // Windows: PCCERT_CONTEXT from cert store
+    };
+
     pub fn init(
         allocator: std.mem.Allocator,
         executor: *Executor,
-        cert_file: ?[*:0]const u8,
-        key_file: ?[*:0]const u8,
+        tls_cert: TlsCert,
     ) !Server {
         // Open msquic API
         var api: *const msquic.QUIC_API_TABLE = undefined;
@@ -75,23 +81,42 @@ pub const Server = struct {
 
         // Load TLS credential
         var cred_config = std.mem.zeroes(msquic.QUIC_CREDENTIAL_CONFIG);
-
+        var cert_hash_config: msquic.QUIC_CERTIFICATE_HASH = undefined;
         var cert_file_config: msquic.QUIC_CERTIFICATE_FILE = undefined;
-        if (cert_file != null and key_file != null) {
-            cert_file_config = .{
-                .private_key_file = key_file.?,
-                .certificate_file = cert_file.?,
-            };
-            cred_config.cred_type = .certificate_file;
-            cred_config.certificate = @ptrCast(&cert_file_config);
-        } else {
-            // No cert provided — use self-signed (development only)
-            cred_config.cred_type = .none;
-            cred_config.flags.no_certificate_validation = true;
+        var cert_pkcs12_config: msquic.QUIC_CERTIFICATE_PKCS12 = undefined;
+
+        switch (tls_cert) {
+            .hash => |hash| {
+                cert_hash_config = .{ .sha_hash = hash };
+                cred_config.cred_type = .certificate_hash;
+                cred_config.certificate = @ptrCast(&cert_hash_config);
+            },
+            .files => |files| {
+                cert_file_config = .{
+                    .private_key_file = files.key,
+                    .certificate_file = files.cert,
+                };
+                cred_config.cred_type = .certificate_file;
+                cred_config.certificate = @ptrCast(&cert_file_config);
+            },
+            .pkcs12 => |p12| {
+                cert_pkcs12_config = .{
+                    .asn1_blob = p12.der.ptr,
+                    .asn1_blob_length = @intCast(p12.der.len),
+                    .private_key_password = p12.password,
+                };
+                cred_config.cred_type = .certificate_pkcs12;
+                cred_config.certificate = @ptrCast(&cert_pkcs12_config);
+            },
+            .context => |ctx| {
+                cred_config.cred_type = .certificate_context;
+                cred_config.certificate = ctx;
+            },
         }
 
         const cred_status = api.configuration_load_credential(configuration, &cred_config);
         if (!msquic.statusSucceeded(cred_status)) {
+            std.log.err("msquic credential load failed: status=0x{x}", .{@as(u32, @bitCast(cred_status))});
             api.configuration_close(configuration);
             api.registration_close(registration);
             msquic.MsQuicClose(api);

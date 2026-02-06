@@ -1,6 +1,7 @@
 const std = @import("std");
 const msquic = @import("msquic.zig");
 const protocol = @import("protocol.zig");
+const tls = @import("tls.zig");
 
 const ALPN = "graphenedb";
 
@@ -16,6 +17,18 @@ pub const Client = struct {
     response_data: std.ArrayListUnmanaged(u8),
     connected_event: std.Thread.ResetEvent,
     connect_status: ?msquic.QUIC_STATUS,
+
+    // Certificate pinning (TOFU)
+    expected_fingerprint: ?[32]u8,
+    server_fingerprint: ?[32]u8,
+    pin_result: PinResult,
+
+    pub const PinResult = enum {
+        none, // No cert received yet
+        trusted, // Known host, fingerprint matches
+        new_host, // Unknown host, TOFU accepted
+        mismatch, // WARNING: fingerprint changed
+    };
 
     pub fn init(allocator: std.mem.Allocator) !Client {
         var api: *const msquic.QUIC_API_TABLE = undefined;
@@ -55,11 +68,12 @@ pub const Client = struct {
             return error.ConfigurationFailed;
         }
 
-        // Client credential — no cert, skip server validation for development
+        // Client credential — no cert, custom validation via TOFU pinning
         var cred_config = std.mem.zeroes(msquic.QUIC_CREDENTIAL_CONFIG);
         cred_config.cred_type = .none;
         cred_config.flags.client = true;
         cred_config.flags.no_certificate_validation = true;
+        cred_config.flags.indicate_certificate_received = true;
 
         const cred_status = api.configuration_load_credential(configuration, &cred_config);
         if (!msquic.statusSucceeded(cred_status)) {
@@ -79,6 +93,9 @@ pub const Client = struct {
             .response_data = .empty,
             .connected_event = .unset,
             .connect_status = null,
+            .expected_fingerprint = null,
+            .server_fingerprint = null,
+            .pin_result = .none,
         };
     }
 
@@ -203,6 +220,30 @@ pub const Client = struct {
             .shutdown_initiated_by_peer => {
                 self.connected_event.set();
                 self.response_event.set();
+            },
+            .peer_certificate_received => {
+                const cert = event.payload.peer_certificate_received.certificate orelse {
+                    self.pin_result = .none;
+                    return msquic.QUIC_STATUS_SUCCESS;
+                };
+
+                const fp = tls.fingerprintFromPeerCert(cert) catch {
+                    return @bitCast(@as(u32, 0x80004005)); // E_FAIL
+                };
+                self.server_fingerprint = fp;
+
+                if (self.expected_fingerprint) |expected| {
+                    if (std.mem.eql(u8, &fp, &expected)) {
+                        self.pin_result = .trusted;
+                        return msquic.QUIC_STATUS_SUCCESS;
+                    } else {
+                        self.pin_result = .mismatch;
+                        return @bitCast(@as(u32, 0x80004005)); // Reject
+                    }
+                } else {
+                    self.pin_result = .new_host;
+                    return msquic.QUIC_STATUS_SUCCESS;
+                }
             },
             .shutdown_complete => {},
             else => {},

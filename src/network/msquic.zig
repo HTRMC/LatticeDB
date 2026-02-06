@@ -152,29 +152,28 @@ pub const QUIC_CREDENTIAL_TYPE = enum(c_int) {
 };
 
 pub const QUIC_CREDENTIAL_FLAGS = packed struct(u32) {
-    none: bool = false, // bit 0: unused/none indicator
-    client: bool = false, // bit 1
-    load_asynchronous: bool = false, // bit 2
-    no_certificate_validation: bool = false, // bit 3
-    enable_ocsp: bool = false, // bit 4
-    indicate_certificate_received: bool = false, // bit 5
-    defer_certificate_validation: bool = false, // bit 6
-    require_client_authentication: bool = false, // bit 7
-    use_tls_builtin_certificate_validation: bool = false, // bit 8
-    revocation_check_end_cert: bool = false, // bit 9
-    revocation_check_chain: bool = false, // bit 10
-    revocation_check_chain_exclude_root: bool = false, // bit 11
-    ignore_no_revocation_check: bool = false, // bit 12
-    ignore_revocation_offline: bool = false, // bit 13
-    set_allowed_cipher_suites: bool = false, // bit 14
-    use_portable_certificates: bool = false, // bit 15
-    use_supplied_credentials: bool = false, // bit 16
-    use_system_mapper: bool = false, // bit 17
-    cache_only_url_retrieval: bool = false, // bit 18
-    revocation_check_cache_only: bool = false, // bit 19
-    inproc_peer_certificate: bool = false, // bit 20
-    set_ca_certificate_file: bool = false, // bit 21
-    _padding: u10 = 0,
+    client: bool = false, // bit 0 (0x01)
+    load_asynchronous: bool = false, // bit 1 (0x02)
+    no_certificate_validation: bool = false, // bit 2 (0x04)
+    enable_ocsp: bool = false, // bit 3 (0x08)
+    indicate_certificate_received: bool = false, // bit 4 (0x10)
+    defer_certificate_validation: bool = false, // bit 5 (0x20)
+    require_client_authentication: bool = false, // bit 6 (0x40)
+    use_tls_builtin_certificate_validation: bool = false, // bit 7 (0x80)
+    revocation_check_end_cert: bool = false, // bit 8
+    revocation_check_chain: bool = false, // bit 9
+    revocation_check_chain_exclude_root: bool = false, // bit 10
+    ignore_no_revocation_check: bool = false, // bit 11
+    ignore_revocation_offline: bool = false, // bit 12
+    set_allowed_cipher_suites: bool = false, // bit 13
+    use_portable_certificates: bool = false, // bit 14
+    use_supplied_credentials: bool = false, // bit 15
+    use_system_mapper: bool = false, // bit 16
+    cache_only_url_retrieval: bool = false, // bit 17
+    revocation_check_cache_only: bool = false, // bit 18
+    inproc_peer_certificate: bool = false, // bit 19
+    set_ca_certificate_file: bool = false, // bit 20
+    _padding: u11 = 0,
 };
 
 pub const QUIC_CERTIFICATE_FILE = extern struct {
@@ -184,6 +183,12 @@ pub const QUIC_CERTIFICATE_FILE = extern struct {
 
 pub const QUIC_CERTIFICATE_HASH = extern struct {
     sha_hash: [20]u8,
+};
+
+pub const QUIC_CERTIFICATE_PKCS12 = extern struct {
+    asn1_blob: [*]const u8,
+    asn1_blob_length: u32,
+    private_key_password: ?[*:0]const u8,
 };
 
 pub const QUIC_CREDENTIAL_CONFIG = extern struct {
@@ -260,6 +265,12 @@ pub const QUIC_CONNECTION_EVENT = extern struct {
         peer_stream_started: extern struct {
             stream: HQUIC,
             flags: u32,
+        },
+        peer_certificate_received: extern struct {
+            certificate: ?*anyopaque, // QUIC_CERTIFICATE* (OpenSSL: X509*)
+            deferred_error_flags: u32,
+            deferred_status: QUIC_STATUS,
+            chain: ?*anyopaque, // QUIC_CERTIFICATE_CHAIN* (OpenSSL: X509_STORE_CTX*)
         },
         // Other events use raw bytes for now
         raw: [64]u8,
