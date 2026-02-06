@@ -13,8 +13,32 @@ zig build test -Dmsquic-path=deps/msquic/build/native
 
 ```
 graphenedb                      # local REPL
-graphenedb serve [port]         # start QUIC server (default: 4567)
+graphenedb serve [options]      # start QUIC server (default port: 4567)
 graphenedb connect [host:port]  # connect to server (default: localhost:4567)
+```
+
+### Server options
+
+QUIC requires TLS, so the server needs a certificate.
+
+**Windows** (Schannel — uses Windows certificate store):
+```powershell
+# Generate a self-signed certificate (one-time setup)
+New-SelfSignedCertificate -DnsName localhost -CertStoreLocation cert:\CurrentUser\My -FriendlyName "GrapheneDB Dev"
+
+# Start server with the thumbprint from the output
+graphenedb serve --cert-hash THUMBPRINT
+graphenedb serve 4567 --cert-hash THUMBPRINT  # custom port
+```
+
+**Linux** (OpenSSL — uses PEM files):
+```bash
+# Generate cert and key (one-time setup)
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj '/CN=localhost'
+
+# Start server
+graphenedb serve --cert cert.pem --key key.pem
+graphenedb serve 4567 --cert cert.pem --key key.pem  # custom port
 ```
 
 ## msquic Setup
