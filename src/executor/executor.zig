@@ -335,7 +335,7 @@ pub const Executor = struct {
 
         const schema = result.schema;
 
-        // Check if this is an aggregate query
+        // Check if this is an aggregate or GROUP BY query
         var has_aggregates = false;
         for (sel.columns) |col| {
             if (col == .aggregate) {
@@ -344,7 +344,7 @@ pub const Executor = struct {
             }
         }
 
-        if (has_aggregates) {
+        if (has_aggregates or sel.group_by != null) {
             return self.execSelectAggregate(sel, &table, schema);
         }
 
@@ -491,8 +491,129 @@ pub const Executor = struct {
     }
 
     // ============================================================
-    // Aggregate SELECT (COUNT, SUM, AVG, MIN, MAX)
+    // Aggregate SELECT (COUNT, SUM, AVG, MIN, MAX) with GROUP BY
     // ============================================================
+
+    const GroupState = struct {
+        count: u64,
+        sums: []f64,
+        mins: []?f64,
+        maxs: []?f64,
+        str_mins: []?[]const u8,
+        str_maxs: []?[]const u8,
+        non_null_counts: []u64,
+        group_values: [][]const u8, // formatted GROUP BY column values
+    };
+
+    fn initGroupState(allocator: std.mem.Allocator, num_cols: usize, group_vals: [][]const u8) ExecError!GroupState {
+        var state: GroupState = .{
+            .count = 0,
+            .sums = allocator.alloc(f64, num_cols) catch return ExecError.OutOfMemory,
+            .mins = allocator.alloc(?f64, num_cols) catch return ExecError.OutOfMemory,
+            .maxs = allocator.alloc(?f64, num_cols) catch return ExecError.OutOfMemory,
+            .str_mins = allocator.alloc(?[]const u8, num_cols) catch return ExecError.OutOfMemory,
+            .str_maxs = allocator.alloc(?[]const u8, num_cols) catch return ExecError.OutOfMemory,
+            .non_null_counts = allocator.alloc(u64, num_cols) catch return ExecError.OutOfMemory,
+            .group_values = group_vals,
+        };
+        for (0..num_cols) |i| {
+            state.sums[i] = 0;
+            state.mins[i] = null;
+            state.maxs[i] = null;
+            state.str_mins[i] = null;
+            state.str_maxs[i] = null;
+            state.non_null_counts[i] = 0;
+        }
+        return state;
+    }
+
+    fn freeGroupState(self: *Self, state: *GroupState) void {
+        self.allocator.free(state.sums);
+        self.allocator.free(state.mins);
+        self.allocator.free(state.maxs);
+        for (state.str_mins) |s| if (s) |v| self.allocator.free(v);
+        self.allocator.free(state.str_mins);
+        for (state.str_maxs) |s| if (s) |v| self.allocator.free(v);
+        self.allocator.free(state.str_maxs);
+        self.allocator.free(state.non_null_counts);
+        for (state.group_values) |gv| self.allocator.free(gv);
+        self.allocator.free(state.group_values);
+    }
+
+    fn accumulateAgg(self: *Self, state: *GroupState, col_idx: usize, val: Value) void {
+        if (val == .null_value) return;
+        state.non_null_counts[col_idx] += 1;
+
+        const num_val: ?f64 = switch (val) {
+            .integer => |v| @floatFromInt(v),
+            .bigint => |v| @floatFromInt(v),
+            .float => |v| v,
+            else => null,
+        };
+
+        if (num_val) |nv| {
+            state.sums[col_idx] += nv;
+            if (state.mins[col_idx] == null or nv < state.mins[col_idx].?) state.mins[col_idx] = nv;
+            if (state.maxs[col_idx] == null or nv > state.maxs[col_idx].?) state.maxs[col_idx] = nv;
+        } else {
+            const sv = formatValue(self.allocator, val) catch return;
+            if (state.str_mins[col_idx]) |cur| {
+                if (std.mem.order(u8, sv, cur) == .lt) {
+                    self.allocator.free(cur);
+                    state.str_mins[col_idx] = sv;
+                } else if (state.str_maxs[col_idx]) |cur_max| {
+                    if (std.mem.order(u8, sv, cur_max) == .gt) {
+                        self.allocator.free(cur_max);
+                        state.str_maxs[col_idx] = sv;
+                    } else {
+                        self.allocator.free(sv);
+                    }
+                } else {
+                    state.str_maxs[col_idx] = sv;
+                }
+            } else {
+                state.str_mins[col_idx] = sv;
+                state.str_maxs[col_idx] = self.allocator.dupe(u8, sv) catch return;
+            }
+        }
+    }
+
+    fn formatAggValue(self: *Self, func: ast.AggregateFunc, has_column: bool, col_idx: usize, state: *const GroupState) ExecError![]const u8 {
+        return switch (func) {
+            .count => blk: {
+                if (has_column) {
+                    break :blk std.fmt.allocPrint(self.allocator, "{d}", .{state.non_null_counts[col_idx]}) catch return ExecError.OutOfMemory;
+                }
+                break :blk std.fmt.allocPrint(self.allocator, "{d}", .{state.count}) catch return ExecError.OutOfMemory;
+            },
+            .sum => std.fmt.allocPrint(self.allocator, "{d:.6}", .{state.sums[col_idx]}) catch return ExecError.OutOfMemory,
+            .avg => blk: {
+                if (state.non_null_counts[col_idx] == 0) {
+                    break :blk self.allocator.dupe(u8, "NULL") catch return ExecError.OutOfMemory;
+                }
+                break :blk std.fmt.allocPrint(self.allocator, "{d:.6}", .{state.sums[col_idx] / @as(f64, @floatFromInt(state.non_null_counts[col_idx]))}) catch return ExecError.OutOfMemory;
+            },
+            .min => blk: {
+                if (state.mins[col_idx]) |m| {
+                    break :blk std.fmt.allocPrint(self.allocator, "{d:.6}", .{m}) catch return ExecError.OutOfMemory;
+                }
+                if (state.str_mins[col_idx]) |sm| {
+                    break :blk self.allocator.dupe(u8, sm) catch return ExecError.OutOfMemory;
+                }
+                break :blk self.allocator.dupe(u8, "NULL") catch return ExecError.OutOfMemory;
+            },
+            .max => blk: {
+                if (state.maxs[col_idx]) |m| {
+                    break :blk std.fmt.allocPrint(self.allocator, "{d:.6}", .{m}) catch return ExecError.OutOfMemory;
+                }
+                if (state.str_maxs[col_idx]) |sm| {
+                    break :blk self.allocator.dupe(u8, sm) catch return ExecError.OutOfMemory;
+                }
+                break :blk self.allocator.dupe(u8, "NULL") catch return ExecError.OutOfMemory;
+            },
+        };
+    }
+
     fn execSelectAggregate(
         self: *Self,
         sel: ast.Select,
@@ -501,77 +622,59 @@ pub const Executor = struct {
     ) ExecError!ExecResult {
         const num_cols = sel.columns.len;
 
-        // Resolve column indices for each aggregate that references a column
-        const agg_col_indices = self.allocator.alloc(?usize, num_cols) catch {
-            return ExecError.OutOfMemory;
-        };
+        // Resolve column indices for each SELECT column
+        const agg_col_indices = self.allocator.alloc(?usize, num_cols) catch return ExecError.OutOfMemory;
         defer self.allocator.free(agg_col_indices);
 
         for (sel.columns, 0..) |col, i| {
             switch (col) {
                 .aggregate => |agg| {
                     if (agg.column) |col_name| {
-                        var found = false;
-                        for (schema.columns, 0..) |sc, ci| {
-                            if (std.ascii.eqlIgnoreCase(sc.name, col_name)) {
-                                agg_col_indices[i] = ci;
-                                found = true;
-                                break;
-                            }
-                        }
-                        if (!found) return ExecError.ColumnNotFound;
+                        agg_col_indices[i] = resolveColumnIndex(schema, col_name) orelse return ExecError.ColumnNotFound;
                     } else {
                         agg_col_indices[i] = null; // COUNT(*)
                     }
                 },
                 .named => |name| {
-                    // Mixed aggregate and non-aggregate columns (without GROUP BY = error)
-                    // For now, allow it but it returns value from last row
-                    var found = false;
-                    for (schema.columns, 0..) |sc, ci| {
-                        if (std.ascii.eqlIgnoreCase(sc.name, name)) {
-                            agg_col_indices[i] = ci;
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) return ExecError.ColumnNotFound;
+                    agg_col_indices[i] = resolveColumnIndex(schema, name) orelse return ExecError.ColumnNotFound;
                 },
-                .all_columns => return ExecError.ColumnNotFound, // Can't mix * with aggregates
+                .all_columns => return ExecError.ColumnNotFound,
             }
         }
 
-        // Aggregate state
-        var count: u64 = 0;
-        const sums = self.allocator.alloc(f64, num_cols) catch return ExecError.OutOfMemory;
-        defer self.allocator.free(sums);
-        const mins = self.allocator.alloc(?f64, num_cols) catch return ExecError.OutOfMemory;
-        defer self.allocator.free(mins);
-        const maxs = self.allocator.alloc(?f64, num_cols) catch return ExecError.OutOfMemory;
-        defer self.allocator.free(maxs);
-        // Track string min/max for non-numeric types
-        const str_mins = self.allocator.alloc(?[]const u8, num_cols) catch return ExecError.OutOfMemory;
-        defer self.allocator.free(str_mins);
-        const str_maxs = self.allocator.alloc(?[]const u8, num_cols) catch return ExecError.OutOfMemory;
-        defer {
-            for (str_mins) |s| if (s) |v| self.allocator.free(v);
-            for (str_maxs) |s| if (s) |v| self.allocator.free(v);
-            self.allocator.free(str_maxs);
+        // Resolve GROUP BY column indices
+        var group_by_indices: []usize = &.{};
+        if (sel.group_by) |gb_cols| {
+            group_by_indices = self.allocator.alloc(usize, gb_cols.len) catch return ExecError.OutOfMemory;
+            for (gb_cols, 0..) |gb_name, gi| {
+                group_by_indices[gi] = resolveColumnIndex(schema, gb_name) orelse {
+                    self.allocator.free(group_by_indices);
+                    return ExecError.ColumnNotFound;
+                };
+            }
         }
-        const non_null_counts = self.allocator.alloc(u64, num_cols) catch return ExecError.OutOfMemory;
-        defer self.allocator.free(non_null_counts);
+        defer if (group_by_indices.len > 0) self.allocator.free(group_by_indices);
 
-        for (0..num_cols) |i| {
-            sums[i] = 0;
-            mins[i] = null;
-            maxs[i] = null;
-            str_mins[i] = null;
-            str_maxs[i] = null;
-            non_null_counts[i] = 0;
-        }
+        const has_group_by = group_by_indices.len > 0;
 
         // Use explicit txn or begin implicit for read
         const txn = self.current_txn orelse self.beginImplicitTxn();
+
+        // Groups: key = concatenated group values, value = GroupState
+        var groups = std.StringArrayHashMap(GroupState).init(self.allocator);
+        defer {
+            for (groups.values()) |*gs| self.freeGroupState(gs);
+            for (groups.keys()) |k| self.allocator.free(k);
+            groups.deinit();
+        }
+
+        // For non-GROUP BY aggregates, use a single group with empty key
+        if (!has_group_by) {
+            const empty_vals = self.allocator.alloc([]const u8, 0) catch return ExecError.OutOfMemory;
+            const state = initGroupState(self.allocator, num_cols, empty_vals) catch return ExecError.OutOfMemory;
+            const key = self.allocator.dupe(u8, "") catch return ExecError.OutOfMemory;
+            groups.put(key, state) catch return ExecError.OutOfMemory;
+        }
 
         var iter = table.scanWithTxn(txn) catch {
             self.abortImplicitTxn(txn);
@@ -589,76 +692,124 @@ pub const Executor = struct {
                 if (!self.evalWhere(where, schema, row.values)) continue;
             }
 
-            count += 1;
-
-            // Accumulate aggregates
-            for (0..num_cols) |i| {
-                const ci = agg_col_indices[i] orelse continue;
-                const val = row.values[ci];
-
-                if (val == .null_value) continue;
-                non_null_counts[i] += 1;
-
-                const num_val: ?f64 = switch (val) {
-                    .integer => |v| @floatFromInt(v),
-                    .bigint => |v| @floatFromInt(v),
-                    .float => |v| v,
-                    else => null,
-                };
-
-                if (num_val) |nv| {
-                    sums[i] += nv;
-                    if (mins[i] == null or nv < mins[i].?) mins[i] = nv;
-                    if (maxs[i] == null or nv > maxs[i].?) maxs[i] = nv;
-                } else {
-                    // String comparison for MIN/MAX
-                    const sv = formatValue(self.allocator, val) catch {
+            // Build group key
+            var group_key: []u8 = undefined;
+            if (has_group_by) {
+                var key_parts: std.ArrayList(u8) = .empty;
+                for (group_by_indices, 0..) |gi, idx| {
+                    if (idx > 0) key_parts.append(self.allocator, 0) catch {
+                        key_parts.deinit(self.allocator);
                         self.abortImplicitTxn(txn);
                         return ExecError.OutOfMemory;
                     };
-                    if (str_mins[i]) |cur| {
-                        if (std.mem.order(u8, sv, cur) == .lt) {
-                            self.allocator.free(cur);
-                            str_mins[i] = sv;
-                        } else if (str_maxs[i]) |cur_max| {
-                            if (std.mem.order(u8, sv, cur_max) == .gt) {
-                                self.allocator.free(cur_max);
-                                str_maxs[i] = sv;
-                            } else {
-                                self.allocator.free(sv);
-                            }
-                        } else {
-                            str_maxs[i] = sv;
-                        }
-                    } else {
-                        str_mins[i] = sv;
-                        str_maxs[i] = self.allocator.dupe(u8, sv) catch {
-                            self.abortImplicitTxn(txn);
-                            return ExecError.OutOfMemory;
-                        };
-                    }
+                    const fv = formatValue(self.allocator, row.values[gi]) catch {
+                        key_parts.deinit(self.allocator);
+                        self.abortImplicitTxn(txn);
+                        return ExecError.OutOfMemory;
+                    };
+                    defer self.allocator.free(fv);
+                    key_parts.appendSlice(self.allocator, fv) catch {
+                        key_parts.deinit(self.allocator);
+                        self.abortImplicitTxn(txn);
+                        return ExecError.OutOfMemory;
+                    };
                 }
+                group_key = key_parts.toOwnedSlice(self.allocator) catch {
+                    key_parts.deinit(self.allocator);
+                    self.abortImplicitTxn(txn);
+                    return ExecError.OutOfMemory;
+                };
+            } else {
+                group_key = self.allocator.dupe(u8, "") catch {
+                    self.abortImplicitTxn(txn);
+                    return ExecError.OutOfMemory;
+                };
+            }
+
+            // Get or create group
+            if (!groups.contains(group_key)) {
+                // Create group values
+                const gv = self.allocator.alloc([]const u8, group_by_indices.len) catch {
+                    self.allocator.free(group_key);
+                    self.abortImplicitTxn(txn);
+                    return ExecError.OutOfMemory;
+                };
+                for (group_by_indices, 0..) |gi, idx| {
+                    gv[idx] = formatValue(self.allocator, row.values[gi]) catch {
+                        for (gv[0..idx]) |v| self.allocator.free(v);
+                        self.allocator.free(gv);
+                        self.allocator.free(group_key);
+                        self.abortImplicitTxn(txn);
+                        return ExecError.OutOfMemory;
+                    };
+                }
+                const state = initGroupState(self.allocator, num_cols, gv) catch {
+                    for (gv) |v| self.allocator.free(v);
+                    self.allocator.free(gv);
+                    self.allocator.free(group_key);
+                    self.abortImplicitTxn(txn);
+                    return ExecError.OutOfMemory;
+                };
+                groups.put(group_key, state) catch {
+                    self.allocator.free(group_key);
+                    self.abortImplicitTxn(txn);
+                    return ExecError.OutOfMemory;
+                };
+            } else {
+                self.allocator.free(group_key);
+            }
+
+            // Get group and accumulate (need to find the key again since we may have freed it)
+            const state_ptr: *GroupState = if (has_group_by) blk: {
+                // Rebuild key for lookup
+                var key_parts2: std.ArrayList(u8) = .empty;
+                for (group_by_indices, 0..) |gi, idx| {
+                    if (idx > 0) key_parts2.append(self.allocator, 0) catch {
+                        key_parts2.deinit(self.allocator);
+                        self.abortImplicitTxn(txn);
+                        return ExecError.OutOfMemory;
+                    };
+                    const fv2 = formatValue(self.allocator, row.values[gi]) catch {
+                        key_parts2.deinit(self.allocator);
+                        self.abortImplicitTxn(txn);
+                        return ExecError.OutOfMemory;
+                    };
+                    defer self.allocator.free(fv2);
+                    key_parts2.appendSlice(self.allocator, fv2) catch {
+                        key_parts2.deinit(self.allocator);
+                        self.abortImplicitTxn(txn);
+                        return ExecError.OutOfMemory;
+                    };
+                }
+                const lookup_key = key_parts2.toOwnedSlice(self.allocator) catch {
+                    key_parts2.deinit(self.allocator);
+                    self.abortImplicitTxn(txn);
+                    return ExecError.OutOfMemory;
+                };
+                defer self.allocator.free(lookup_key);
+                break :blk groups.getPtr(lookup_key).?;
+            } else groups.getPtr("").?;
+
+            state_ptr.count += 1;
+
+            for (0..num_cols) |i| {
+                const ci = agg_col_indices[i] orelse continue;
+                self.accumulateAgg(state_ptr, i, row.values[ci]);
             }
         }
 
         self.commitImplicitTxn(txn);
 
-        // Build column headers and result row
+        // Build column headers
         const col_names = self.allocator.alloc([]const u8, num_cols) catch return ExecError.OutOfMemory;
         errdefer {
             for (col_names) |cn| self.allocator.free(cn);
             self.allocator.free(col_names);
         }
 
-        const formatted = self.allocator.alloc([]const u8, num_cols) catch return ExecError.OutOfMemory;
-        errdefer {
-            for (formatted) |f| self.allocator.free(f);
-            self.allocator.free(formatted);
-        }
-
         for (sel.columns, 0..) |col, i| {
-            switch (col) {
-                .aggregate => |agg| {
+            col_names[i] = switch (col) {
+                .aggregate => |agg| blk: {
                     const func_name = switch (agg.func) {
                         .count => "count",
                         .sum => "sum",
@@ -666,60 +817,61 @@ pub const Executor = struct {
                         .min => "min",
                         .max => "max",
                     };
-                    col_names[i] = if (agg.column) |cn|
+                    break :blk if (agg.column) |cn|
                         std.fmt.allocPrint(self.allocator, "{s}({s})", .{ func_name, cn }) catch return ExecError.OutOfMemory
                     else
                         std.fmt.allocPrint(self.allocator, "{s}(*)", .{func_name}) catch return ExecError.OutOfMemory;
-
-                    formatted[i] = switch (agg.func) {
-                        .count => blk: {
-                            if (agg.column != null) {
-                                break :blk std.fmt.allocPrint(self.allocator, "{d}", .{non_null_counts[i]}) catch return ExecError.OutOfMemory;
-                            }
-                            break :blk std.fmt.allocPrint(self.allocator, "{d}", .{count}) catch return ExecError.OutOfMemory;
-                        },
-                        .sum => std.fmt.allocPrint(self.allocator, "{d:.6}", .{sums[i]}) catch return ExecError.OutOfMemory,
-                        .avg => blk: {
-                            if (non_null_counts[i] == 0) {
-                                break :blk self.allocator.dupe(u8, "NULL") catch return ExecError.OutOfMemory;
-                            }
-                            break :blk std.fmt.allocPrint(self.allocator, "{d:.6}", .{sums[i] / @as(f64, @floatFromInt(non_null_counts[i]))}) catch return ExecError.OutOfMemory;
-                        },
-                        .min => blk: {
-                            if (mins[i]) |m| {
-                                break :blk std.fmt.allocPrint(self.allocator, "{d:.6}", .{m}) catch return ExecError.OutOfMemory;
-                            }
-                            if (str_mins[i]) |sm| {
-                                break :blk self.allocator.dupe(u8, sm) catch return ExecError.OutOfMemory;
-                            }
-                            break :blk self.allocator.dupe(u8, "NULL") catch return ExecError.OutOfMemory;
-                        },
-                        .max => blk: {
-                            if (maxs[i]) |m| {
-                                break :blk std.fmt.allocPrint(self.allocator, "{d:.6}", .{m}) catch return ExecError.OutOfMemory;
-                            }
-                            if (str_maxs[i]) |sm| {
-                                break :blk self.allocator.dupe(u8, sm) catch return ExecError.OutOfMemory;
-                            }
-                            break :blk self.allocator.dupe(u8, "NULL") catch return ExecError.OutOfMemory;
-                        },
-                    };
                 },
-                .named => |name| {
-                    col_names[i] = self.allocator.dupe(u8, name) catch return ExecError.OutOfMemory;
-                    formatted[i] = self.allocator.dupe(u8, "NULL") catch return ExecError.OutOfMemory;
-                },
+                .named => |name| self.allocator.dupe(u8, name) catch return ExecError.OutOfMemory,
                 .all_columns => unreachable,
-            }
+            };
         }
 
-        const row_slice = self.allocator.alloc(ResultRow, 1) catch return ExecError.OutOfMemory;
-        row_slice[0] = .{ .values = formatted };
+        // Build result rows — one per group
+        var result_rows: std.ArrayList(ResultRow) = .empty;
+        errdefer {
+            for (result_rows.items) |rr| {
+                for (rr.values) |v| self.allocator.free(v);
+                self.allocator.free(rr.values);
+            }
+            result_rows.deinit(self.allocator);
+        }
+
+        for (groups.values()) |*state| {
+            const formatted = self.allocator.alloc([]const u8, num_cols) catch return ExecError.OutOfMemory;
+
+            for (sel.columns, 0..) |col, i| {
+                formatted[i] = switch (col) {
+                    .aggregate => |agg| try self.formatAggValue(agg.func, agg.column != null, i, state),
+                    .named => |name| blk: {
+                        // For GROUP BY columns, output the group value
+                        if (sel.group_by) |gb_cols| {
+                            for (gb_cols, 0..) |gb_name, gi| {
+                                if (std.ascii.eqlIgnoreCase(gb_name, name)) {
+                                    break :blk self.allocator.dupe(u8, state.group_values[gi]) catch return ExecError.OutOfMemory;
+                                }
+                            }
+                        }
+                        break :blk self.allocator.dupe(u8, "NULL") catch return ExecError.OutOfMemory;
+                    },
+                    .all_columns => unreachable,
+                };
+            }
+
+            result_rows.append(self.allocator, .{ .values = formatted }) catch return ExecError.OutOfMemory;
+        }
 
         return .{ .rows = .{
             .columns = col_names,
-            .rows = row_slice,
+            .rows = result_rows.toOwnedSlice(self.allocator) catch return ExecError.OutOfMemory,
         } };
+    }
+
+    fn resolveColumnIndex(schema: *const Schema, name: []const u8) ?usize {
+        for (schema.columns, 0..) |col, i| {
+            if (std.ascii.eqlIgnoreCase(col.name, name)) return i;
+        }
+        return null;
     }
 
     fn orderCompareRows(
@@ -1762,4 +1914,103 @@ test "executor MIN MAX" {
     defer exec.freeResult(sel2);
     try std.testing.expectEqualStrings("Alice", sel2.rows.rows[0].values[0]);
     try std.testing.expectEqualStrings("Zara", sel2.rows.rows[0].values[1]);
+}
+
+test "executor GROUP BY" {
+    const test_file = "test_exec_groupby.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const ct = try exec.execute("CREATE TABLE emp (id INT, dept TEXT, salary INT)");
+    exec.freeResult(ct);
+
+    const r1 = try exec.execute("INSERT INTO emp VALUES (1, 'Engineering', 100)");
+    exec.freeResult(r1);
+    const r2 = try exec.execute("INSERT INTO emp VALUES (2, 'Engineering', 120)");
+    exec.freeResult(r2);
+    const r3 = try exec.execute("INSERT INTO emp VALUES (3, 'Sales', 80)");
+    exec.freeResult(r3);
+    const r4 = try exec.execute("INSERT INTO emp VALUES (4, 'Sales', 90)");
+    exec.freeResult(r4);
+    const r5 = try exec.execute("INSERT INTO emp VALUES (5, 'HR', 95)");
+    exec.freeResult(r5);
+
+    // GROUP BY dept with COUNT
+    const sel = try exec.execute("SELECT dept, COUNT(*) FROM emp GROUP BY dept");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 2), sel.rows.columns.len);
+    try std.testing.expectEqualStrings("dept", sel.rows.columns[0]);
+    try std.testing.expectEqualStrings("count(*)", sel.rows.columns[1]);
+    try std.testing.expectEqual(@as(usize, 3), sel.rows.rows.len); // 3 departments
+
+    // GROUP BY dept with SUM
+    const sel2 = try exec.execute("SELECT dept, SUM(salary) FROM emp GROUP BY dept");
+    defer exec.freeResult(sel2);
+    try std.testing.expectEqual(@as(usize, 3), sel2.rows.rows.len);
+
+    // Verify Engineering group: sum should be 220
+    for (sel2.rows.rows) |row| {
+        if (std.mem.eql(u8, row.values[0], "Engineering")) {
+            const sum_val = std.fmt.parseFloat(f64, row.values[1]) catch unreachable;
+            try std.testing.expectEqual(@as(f64, 220.0), sum_val);
+        }
+    }
+}
+
+test "executor GROUP BY with WHERE" {
+    const test_file = "test_exec_groupby_where.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const ct = try exec.execute("CREATE TABLE orders (id INT, category TEXT, amount INT)");
+    exec.freeResult(ct);
+
+    const r1 = try exec.execute("INSERT INTO orders VALUES (1, 'Food', 50)");
+    exec.freeResult(r1);
+    const r2 = try exec.execute("INSERT INTO orders VALUES (2, 'Food', 30)");
+    exec.freeResult(r2);
+    const r3 = try exec.execute("INSERT INTO orders VALUES (3, 'Tech', 200)");
+    exec.freeResult(r3);
+    const r4 = try exec.execute("INSERT INTO orders VALUES (4, 'Tech', 10)");
+    exec.freeResult(r4);
+
+    // GROUP BY with WHERE filter (only amounts > 20)
+    const sel = try exec.execute("SELECT category, COUNT(*), SUM(amount) FROM orders WHERE amount > 20 GROUP BY category");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 2), sel.rows.rows.len); // Food and Tech
+
+    for (sel.rows.rows) |row| {
+        if (std.mem.eql(u8, row.values[0], "Food")) {
+            try std.testing.expectEqualStrings("2", row.values[1]); // 2 food items > 20
+        }
+        if (std.mem.eql(u8, row.values[0], "Tech")) {
+            try std.testing.expectEqualStrings("1", row.values[1]); // only 1 tech item > 20
+        }
+    }
 }

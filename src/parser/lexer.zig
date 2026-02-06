@@ -37,6 +37,10 @@ pub const TokenType = enum {
     kw_min,
     kw_max,
 
+    // GROUP BY / HAVING
+    kw_group,
+    kw_having,
+
     // Transaction keywords
     kw_begin,
     kw_commit,
@@ -117,6 +121,8 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "avg", .kw_avg },
     .{ "min", .kw_min },
     .{ "max", .kw_max },
+    .{ "group", .kw_group },
+    .{ "having", .kw_having },
     .{ "begin", .kw_begin },
     .{ "commit", .kw_commit },
     .{ "rollback", .kw_rollback },

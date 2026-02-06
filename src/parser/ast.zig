@@ -121,6 +121,8 @@ pub const Select = struct {
     columns: []const SelectColumn,
     table_name: []const u8,
     where_clause: ?*const Expression,
+    group_by: ?[]const []const u8,
+    having_clause: ?*const Expression,
     order_by: ?[]const OrderByClause,
     limit: ?u64,
 };

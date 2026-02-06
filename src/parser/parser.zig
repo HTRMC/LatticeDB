@@ -105,6 +105,28 @@ pub const Parser = struct {
             where = try self.parseExpression();
         }
 
+        // Optional GROUP BY col [, col ...]
+        var group_by: ?[]const []const u8 = null;
+        if (self.current.type == .kw_group) {
+            self.advance();
+            try self.expect(.kw_by);
+
+            var group_cols: std.ArrayList([]const u8) = .empty;
+            group_cols.append(alloc, try self.expectIdentifier()) catch return ParseError.OutOfMemory;
+            while (self.current.type == .comma) {
+                self.advance();
+                group_cols.append(alloc, try self.expectIdentifier()) catch return ParseError.OutOfMemory;
+            }
+            group_by = group_cols.toOwnedSlice(alloc) catch return ParseError.OutOfMemory;
+        }
+
+        // Optional HAVING expr (only valid with GROUP BY)
+        var having: ?*const ast.Expression = null;
+        if (self.current.type == .kw_having) {
+            self.advance();
+            having = try self.parseExpression();
+        }
+
         // Optional ORDER BY col [ASC|DESC] [, ...]
         var order_by: ?[]const ast.OrderByClause = null;
         if (self.current.type == .kw_order) {
@@ -133,6 +155,8 @@ pub const Parser = struct {
             .columns = cols.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
             .table_name = table_name,
             .where_clause = where,
+            .group_by = group_by,
+            .having_clause = having,
             .order_by = order_by,
             .limit = limit,
         };
@@ -697,6 +721,42 @@ test "parse SELECT with aggregates" {
         const sel = stmt.select;
         try std.testing.expectEqual(ast.AggregateFunc.count, sel.columns[0].aggregate.func);
         try std.testing.expectEqualStrings("name", sel.columns[0].aggregate.column.?);
+    }
+}
+
+test "parse SELECT with GROUP BY" {
+    {
+        var p = Parser.init(std.testing.allocator, "SELECT dept, COUNT(*) FROM employees GROUP BY dept");
+        defer p.deinit();
+        const stmt = try p.parse();
+        const sel = stmt.select;
+        try std.testing.expectEqual(@as(usize, 2), sel.columns.len);
+        try std.testing.expectEqualStrings("dept", sel.columns[0].named);
+        try std.testing.expectEqual(ast.AggregateFunc.count, sel.columns[1].aggregate.func);
+        const gb = sel.group_by.?;
+        try std.testing.expectEqual(@as(usize, 1), gb.len);
+        try std.testing.expectEqualStrings("dept", gb[0]);
+    }
+    {
+        // GROUP BY with HAVING (simple column comparison)
+        var p = Parser.init(std.testing.allocator, "SELECT dept, COUNT(*) FROM emp GROUP BY dept HAVING dept = 'Sales'");
+        defer p.deinit();
+        const stmt = try p.parse();
+        const sel = stmt.select;
+        try std.testing.expect(sel.group_by != null);
+        try std.testing.expect(sel.having_clause != null);
+    }
+    {
+        // GROUP BY multiple columns + ORDER BY
+        var p = Parser.init(std.testing.allocator, "SELECT dept, role, COUNT(*) FROM emp GROUP BY dept, role ORDER BY dept");
+        defer p.deinit();
+        const stmt = try p.parse();
+        const sel = stmt.select;
+        const gb = sel.group_by.?;
+        try std.testing.expectEqual(@as(usize, 2), gb.len);
+        try std.testing.expectEqualStrings("dept", gb[0]);
+        try std.testing.expectEqualStrings("role", gb[1]);
+        try std.testing.expect(sel.order_by != null);
     }
 }
 
