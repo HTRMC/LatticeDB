@@ -97,7 +97,7 @@ pub const Executor = struct {
             .select => |sel| self.execSelect(sel),
             .update => |upd| self.execUpdate(upd),
             .delete => |del| self.execDelete(del),
-            .drop_table => ExecError.StorageError, // TODO
+            .drop_table => |dt| self.execDropTable(dt),
             .begin_txn => self.execBegin(),
             .commit_txn => self.execCommit(),
             .rollback_txn => self.execRollback(),
@@ -270,6 +270,24 @@ pub const Executor = struct {
         };
 
         const msg = std.fmt.allocPrint(self.allocator, "CREATE TABLE", .{}) catch {
+            return ExecError.OutOfMemory;
+        };
+        return .{ .message = msg };
+    }
+
+    // ============================================================
+    // DROP TABLE
+    // ============================================================
+    fn execDropTable(self: *Self, dt: ast.DropTable) ExecError!ExecResult {
+        self.catalog.dropTable(dt.table_name) catch |err| {
+            return switch (err) {
+                catalog_mod.CatalogError.TableNotFound => ExecError.TableNotFound,
+                catalog_mod.CatalogError.SystemTableError => ExecError.StorageError,
+                else => ExecError.StorageError,
+            };
+        };
+
+        const msg = std.fmt.allocPrint(self.allocator, "DROP TABLE", .{}) catch {
             return ExecError.OutOfMemory;
         };
         return .{ .message = msg };
@@ -2919,4 +2937,51 @@ test "executor SELECT COUNT on empty table" {
     defer exec.freeResult(sel);
     try std.testing.expectEqual(@as(usize, 1), sel.rows.rows.len);
     try std.testing.expectEqualStrings("0", sel.rows.rows[0].values[0]);
+}
+
+test "executor DROP TABLE" {
+    const test_file = "test_exec_drop.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE users (id INT, name TEXT)");
+    exec.freeResult(ct);
+
+    // Insert a row to confirm table works
+    const ins = try exec.execute("INSERT INTO users VALUES (1, 'Alice')");
+    exec.freeResult(ins);
+
+    // DROP TABLE
+    const drop = try exec.execute("DROP TABLE users");
+    defer exec.freeResult(drop);
+    try std.testing.expectEqualStrings("DROP TABLE", drop.message);
+
+    // Table should no longer exist
+    const result = exec.execute("SELECT * FROM users");
+    try std.testing.expectError(ExecError.TableNotFound, result);
+}
+
+test "executor DROP TABLE nonexistent fails" {
+    const test_file = "test_exec_drop_noent.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const result = exec.execute("DROP TABLE nonexistent");
+    try std.testing.expectError(ExecError.TableNotFound, result);
 }

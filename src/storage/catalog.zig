@@ -16,6 +16,7 @@ const Table = table_mod.Table;
 pub const CatalogError = error{
     TableAlreadyExists,
     TableNotFound,
+    SystemTableError,
     OutOfMemory,
     BufferPoolError,
     SerializationError,
@@ -235,6 +236,61 @@ pub const Catalog = struct {
         }
 
         return table_id;
+    }
+
+    /// Drop a user table by name. Removes entries from gp_tables and gp_columns.
+    /// System tables (gp_tables, gp_columns) cannot be dropped.
+    pub fn dropTable(self: *Self, name: []const u8) CatalogError!void {
+        // Block dropping system tables
+        if (std.mem.eql(u8, name, "gp_tables") or std.mem.eql(u8, name, "gp_columns")) {
+            return CatalogError.SystemTableError;
+        }
+
+        // Find table_id from gp_tables and delete matching row
+        var table_id: ?PageId = null;
+        {
+            var iter = self.tables_table.scan() catch {
+                return CatalogError.StorageError;
+            };
+
+            while (iter.next() catch { return CatalogError.StorageError; }) |row| {
+                defer iter.freeValues(row.values);
+                if (std.mem.eql(u8, row.values[1].bytes, name)) {
+                    table_id = @bitCast(row.values[0].integer);
+                    _ = self.tables_table.deleteTuple(null, row.tid) catch {
+                        return CatalogError.StorageError;
+                    };
+                    break;
+                }
+            }
+        }
+
+        const tid = table_id orelse return CatalogError.TableNotFound;
+
+        // Delete all matching rows from gp_columns
+        var to_delete: std.ArrayList(page_mod.TupleId) = .empty;
+        defer to_delete.deinit(self.allocator);
+        {
+            var iter = self.columns_table.scan() catch {
+                return CatalogError.StorageError;
+            };
+
+            while (iter.next() catch { return CatalogError.StorageError; }) |row| {
+                defer iter.freeValues(row.values);
+                const col_tid: PageId = @bitCast(row.values[0].integer);
+                if (col_tid == tid) {
+                    to_delete.append(self.allocator, row.tid) catch {
+                        return CatalogError.OutOfMemory;
+                    };
+                }
+            }
+        }
+
+        for (to_delete.items) |del_tid| {
+            _ = self.columns_table.deleteTuple(null, del_tid) catch {
+                return CatalogError.StorageError;
+            };
+        }
     }
 
     /// Find a table's PageId by name. Returns null if not found.
@@ -589,4 +645,36 @@ test "catalog list tables" {
     try std.testing.expect(found_alpha);
     try std.testing.expect(found_beta);
     try std.testing.expect(found_gamma);
+}
+
+test "catalog drop table" {
+    const test_file = "test_catalog_drop.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    const col = [_]Column{
+        .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+    };
+
+    _ = try catalog.createTable("mytable", &col);
+    try std.testing.expect((try catalog.findTableId("mytable")) != null);
+
+    // Drop the table
+    try catalog.dropTable("mytable");
+
+    // Should no longer be found
+    try std.testing.expect((try catalog.findTableId("mytable")) == null);
+
+    // Drop nonexistent should fail
+    try std.testing.expectError(CatalogError.TableNotFound, catalog.dropTable("mytable"));
+
+    // Drop system table should fail
+    try std.testing.expectError(CatalogError.SystemTableError, catalog.dropTable("gp_tables"));
 }
