@@ -32,6 +32,7 @@ pub const TableError = error{
     SerializationError,
     OutOfMemory,
     UndoLogError,
+    WriteConflict,
 };
 
 /// Table metadata header stored at the beginning of the first page
@@ -298,6 +299,13 @@ pub const Table = struct {
             if (raw.len < TupleHeader.SIZE) {
                 self.buffer_pool.unpinPage(tid.page_id, false) catch {};
                 return false;
+            }
+
+            // Write-write conflict detection: check if another txn already set xmax
+            const existing_header = std.mem.bytesToValue(TupleHeader, raw[0..TupleHeader.SIZE]);
+            if (existing_header.xmax != 0 and existing_header.xmax != txn.?.txn_id) {
+                self.buffer_pool.unpinPage(tid.page_id, false) catch {};
+                return TableError.WriteConflict;
             }
 
             // Write delete undo record before modifying
@@ -919,4 +927,300 @@ test "MVCC rollback restores delete" {
     try std.testing.expectEqual(@as(usize, 1), count);
 
     try tm.commit(txn3);
+}
+
+test "MVCC write-write conflict detection" {
+    const test_file = "test_table_ww_conflict.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+
+    // Insert and commit a row
+    const txn1 = try tm.begin();
+    const vals = [_]Value{.{ .integer = 1 }};
+    const tid = try table.insertTuple(txn1, &vals);
+    try tm.commit(txn1);
+
+    // txn2 deletes the row (sets xmax)
+    const txn2 = try tm.begin();
+    _ = try table.deleteTuple(txn2, tid);
+
+    // txn3 tries to delete the same row — should get WriteConflict
+    const txn3 = try tm.begin();
+    const result = table.deleteTuple(txn3, tid);
+    try std.testing.expectError(TableError.WriteConflict, result);
+
+    try tm.commit(txn2);
+    tm.abort(txn3);
+}
+
+test "MVCC same-txn double delete no conflict" {
+    const test_file = "test_table_same_txn_delete.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+
+    // Insert and commit a row
+    const txn1 = try tm.begin();
+    const vals = [_]Value{.{ .integer = 1 }};
+    const tid = try table.insertTuple(txn1, &vals);
+    try tm.commit(txn1);
+
+    // Same txn deletes twice — should not conflict
+    const txn2 = try tm.begin();
+    const del1 = try table.deleteTuple(txn2, tid);
+    try std.testing.expect(del1);
+
+    // Second delete on same tuple by same txn — xmax already set to our id, no conflict
+    const del2 = try table.deleteTuple(txn2, tid);
+    try std.testing.expect(del2);
+
+    try tm.commit(txn2);
+}
+
+test "MVCC insert-delete same txn then rollback" {
+    const test_file = "test_table_ins_del_rollback.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+
+    // Insert a row, delete it, all in one txn, then rollback
+    const txn1 = try tm.begin();
+    const vals = [_]Value{.{ .integer = 77 }};
+    const tid = try table.insertTuple(txn1, &vals);
+    _ = try table.deleteTuple(txn1, tid);
+
+    // Rollback: undo delete (restore xmax=0), undo insert (zero slot)
+    try table.rollback(txn1);
+    tm.abort(txn1);
+
+    // New txn should see nothing — the row never existed
+    const txn2 = try tm.begin();
+    var iter = try table.scanWithTxn(txn2);
+    var count: usize = 0;
+    while (try iter.next()) |row| {
+        defer iter.freeValues(row.values);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), count);
+    try tm.commit(txn2);
+}
+
+test "MVCC insert-delete same txn commit makes row invisible" {
+    const test_file = "test_table_ins_del_commit.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+
+    // Insert + delete in same txn, then commit
+    const txn1 = try tm.begin();
+    const vals = [_]Value{.{ .integer = 88 }};
+    const tid = try table.insertTuple(txn1, &vals);
+    _ = try table.deleteTuple(txn1, tid);
+    try tm.commit(txn1);
+
+    // Next txn: xmin committed, xmax committed (same txn) → invisible
+    const txn2 = try tm.begin();
+    var iter = try table.scanWithTxn(txn2);
+    var count: usize = 0;
+    while (try iter.next()) |row| {
+        defer iter.freeValues(row.values);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), count);
+    try tm.commit(txn2);
+}
+
+test "MVCC scan empty table" {
+    const test_file = "test_table_scan_empty.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+
+    // Scan with active txn on empty table — should return nothing, not crash
+    const txn = try tm.begin();
+    var iter = try table.scanWithTxn(txn);
+    var count: usize = 0;
+    while (try iter.next()) |row| {
+        defer iter.freeValues(row.values);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), count);
+    try tm.commit(txn);
+}
+
+test "MVCC large batch insert then rollback" {
+    const test_file = "test_table_batch_rollback.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 40);
+    defer bp.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+
+    // Insert 50 rows in one txn
+    const txn1 = try tm.begin();
+    var i: i32 = 0;
+    while (i < 50) : (i += 1) {
+        const vals = [_]Value{.{ .integer = i }};
+        _ = try table.insertTuple(txn1, &vals);
+    }
+
+    // Verify they're visible within the txn
+    var iter1 = try table.scanWithTxn(txn1);
+    var count1: usize = 0;
+    while (try iter1.next()) |row| {
+        defer iter1.freeValues(row.values);
+        count1 += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 50), count1);
+
+    // Rollback all 50
+    try table.rollback(txn1);
+    tm.abort(txn1);
+
+    // New txn should see nothing
+    const txn2 = try tm.begin();
+    var iter2 = try table.scanWithTxn(txn2);
+    var count2: usize = 0;
+    while (try iter2.next()) |row| {
+        defer iter2.freeValues(row.values);
+        count2 += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), count2);
+    try tm.commit(txn2);
+}
+
+test "MVCC write conflict after first txn commits" {
+    const test_file = "test_table_ww_after_commit.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+
+    // Insert and commit a row
+    const txn1 = try tm.begin();
+    const vals = [_]Value{.{ .integer = 1 }};
+    const tid = try table.insertTuple(txn1, &vals);
+    try tm.commit(txn1);
+
+    // txn2 deletes and commits — xmax is now set to a committed txn
+    const txn2 = try tm.begin();
+    _ = try table.deleteTuple(txn2, tid);
+    try tm.commit(txn2);
+
+    // txn3 tries to delete the same row — xmax is set to committed txn2
+    // This is still a conflict because xmax != 0 and xmax != txn3.txn_id
+    const txn3 = try tm.begin();
+    const result = table.deleteTuple(txn3, tid);
+    try std.testing.expectError(TableError.WriteConflict, result);
+    tm.abort(txn3);
 }

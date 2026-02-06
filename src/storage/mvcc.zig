@@ -1,4 +1,5 @@
 const std = @import("std");
+const wal_mod = @import("wal.zig");
 
 /// Transaction ID type
 pub const TxnId = u32;
@@ -42,6 +43,12 @@ pub const TxnState = enum {
     aborted,
 };
 
+/// Isolation level
+pub const IsolationLevel = enum {
+    snapshot_isolation,
+    read_committed,
+};
+
 /// A point-in-time snapshot for snapshot isolation
 pub const Snapshot = struct {
     /// All transactions below this are completed
@@ -59,8 +66,8 @@ pub const Snapshot = struct {
         // If txn_id >= xmax, it started after our snapshot — invisible
         if (txn_id >= self.xmax) return false;
 
-        // If txn_id < xmin, it completed before our snapshot
-        if (txn_id < self.xmin) return true;
+        // If txn_id < xmin, it completed before our snapshot — check commit status
+        if (txn_id < self.xmin) return txn_manager.isCommitted(txn_id);
 
         // In the range [xmin, xmax): check if it was active at snapshot time
         for (self.active) |active_id| {
@@ -115,6 +122,10 @@ pub const Transaction = struct {
     snapshot: Snapshot,
     /// Head of this transaction's undo chain (for rollback)
     undo_chain_head: u64,
+    /// Isolation level for this transaction
+    isolation_level: IsolationLevel,
+    /// Last WAL LSN written by this transaction (for WAL chain)
+    last_lsn: u64,
 
     pub fn isActive(self: *const Transaction) bool {
         return self.state == .active;
@@ -130,15 +141,22 @@ pub const TransactionManager = struct {
     active_txns: std.AutoHashMap(TxnId, *Transaction),
     /// Set of committed transaction IDs (for visibility checks)
     committed_txns: std.AutoHashMap(TxnId, void),
+    /// Optional WAL for durability (null = no WAL, for tests)
+    wal: ?*wal_mod.Wal,
 
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator) Self {
+        return initWithWal(allocator, null);
+    }
+
+    pub fn initWithWal(allocator: std.mem.Allocator, wal: ?*wal_mod.Wal) Self {
         return .{
             .allocator = allocator,
             .next_txn_id = FIRST_TXN_ID,
             .active_txns = std.AutoHashMap(TxnId, *Transaction).init(allocator),
             .committed_txns = std.AutoHashMap(TxnId, void).init(allocator),
+            .wal = wal,
         };
     }
 
@@ -157,11 +175,22 @@ pub const TransactionManager = struct {
 
     /// Begin a new transaction
     pub fn begin(self: *Self) !*Transaction {
+        return self.beginWithIsolation(.snapshot_isolation);
+    }
+
+    /// Begin a new transaction with a specific isolation level
+    pub fn beginWithIsolation(self: *Self, isolation_level: IsolationLevel) !*Transaction {
         const txn_id = self.next_txn_id;
         self.next_txn_id += 1;
 
         // Take a snapshot of currently active transactions
         const snapshot = try self.takeSnapshot(txn_id);
+
+        // Log BEGIN to WAL
+        var begin_lsn: u64 = 0;
+        if (self.wal) |w| {
+            begin_lsn = w.logBegin(txn_id) catch 0;
+        }
 
         const txn = try self.allocator.create(Transaction);
         txn.* = .{
@@ -169,14 +198,31 @@ pub const TransactionManager = struct {
             .state = .active,
             .snapshot = snapshot,
             .undo_chain_head = NO_UNDO_PTR,
+            .isolation_level = isolation_level,
+            .last_lsn = begin_lsn,
         };
 
         try self.active_txns.put(txn_id, txn);
         return txn;
     }
 
+    /// Refresh a transaction's snapshot (for READ COMMITTED isolation)
+    pub fn refreshSnapshot(self: *Self, txn: *Transaction) !void {
+        // Free old snapshot active list
+        if (txn.snapshot.active.len > 0) {
+            self.allocator.free(txn.snapshot.active);
+        }
+        // Take a fresh snapshot
+        txn.snapshot = try self.takeSnapshot(txn.txn_id);
+    }
+
     /// Commit a transaction
     pub fn commit(self: *Self, txn: *Transaction) !void {
+        // Log COMMIT to WAL (must be durable before we acknowledge)
+        if (self.wal) |w| {
+            _ = w.logCommit(txn.txn_id, txn.last_lsn) catch {};
+        }
+
         txn.state = .committed;
         try self.committed_txns.put(txn.txn_id, {});
         _ = self.active_txns.remove(txn.txn_id);
@@ -189,6 +235,11 @@ pub const TransactionManager = struct {
 
     /// Abort a transaction (caller must handle undo log rollback separately)
     pub fn abort(self: *Self, txn: *Transaction) void {
+        // Log ABORT to WAL
+        if (self.wal) |w| {
+            _ = w.logAbort(txn.txn_id, txn.last_lsn) catch {};
+        }
+
         txn.state = .aborted;
         _ = self.active_txns.remove(txn.txn_id);
         if (txn.snapshot.active.len > 0) {
@@ -435,4 +486,311 @@ test "Snapshot excludes own transaction from active list" {
     }
 
     try tm.commit(txn1);
+}
+
+test "refreshSnapshot sees new commits" {
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+
+    // txn1 starts and commits
+    const txn1 = try tm.begin();
+    try tm.commit(txn1);
+
+    // txn2 starts — takes snapshot *before* txn3
+    const txn2 = try tm.beginWithIsolation(.read_committed);
+
+    // txn3 starts and commits
+    const txn3 = try tm.begin();
+    try tm.commit(txn3);
+
+    // Before refresh: txn3 was NOT in txn2's original snapshot (started after)
+    // but since txn3.txn_id >= txn2.snapshot.xmax, it's invisible
+    try std.testing.expect(!txn2.snapshot.isCommitted(txn3.txn_id, &tm));
+
+    // After refresh: txn2 should now see txn3's commit
+    try tm.refreshSnapshot(txn2);
+    try std.testing.expect(txn2.snapshot.isCommitted(txn3.txn_id, &tm));
+
+    try tm.commit(txn2);
+}
+
+test "default isolation is snapshot" {
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+
+    const txn = try tm.begin();
+    try std.testing.expectEqual(IsolationLevel.snapshot_isolation, txn.isolation_level);
+    try tm.commit(txn);
+}
+
+test "WAL records written on commit" {
+    const Wal = wal_mod.Wal;
+    const test_file = "test_mvcc_wal_commit.log";
+
+    var wal = Wal.init(std.testing.allocator, test_file);
+    defer wal.deleteFile();
+    defer wal.deinit();
+    try wal.open();
+
+    var tm = TransactionManager.initWithWal(std.testing.allocator, &wal);
+    defer tm.deinit();
+
+    const txn = try tm.begin();
+    try tm.commit(txn);
+
+    // Should have BEGIN + COMMIT records in WAL
+    var iter = try wal.iterator();
+    var count: usize = 0;
+    var types: [2]wal_mod.LogRecordType = undefined;
+    while (try iter.next()) |record| {
+        defer iter.freeData(record.data);
+        if (count < 2) types[count] = record.header.record_type;
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(wal_mod.LogRecordType.begin, types[0]);
+    try std.testing.expectEqual(wal_mod.LogRecordType.commit, types[1]);
+}
+
+test "WAL abort record on rollback" {
+    const Wal = wal_mod.Wal;
+    const test_file = "test_mvcc_wal_abort.log";
+
+    var wal = Wal.init(std.testing.allocator, test_file);
+    defer wal.deleteFile();
+    defer wal.deinit();
+    try wal.open();
+
+    var tm = TransactionManager.initWithWal(std.testing.allocator, &wal);
+    defer tm.deinit();
+
+    const txn = try tm.begin();
+    tm.abort(txn);
+
+    // Flush remaining buffered records
+    try wal.flush();
+
+    // Should have BEGIN + ABORT records in WAL
+    var iter = try wal.iterator();
+    var count: usize = 0;
+    var types: [2]wal_mod.LogRecordType = undefined;
+    while (try iter.next()) |record| {
+        defer iter.freeData(record.data);
+        if (count < 2) types[count] = record.header.record_type;
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(wal_mod.LogRecordType.begin, types[0]);
+    try std.testing.expectEqual(wal_mod.LogRecordType.abort, types[1]);
+}
+
+test "isVisible — xmin == xmax same txn insert-delete" {
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+
+    const txn1 = try tm.begin();
+    const txn1_id = txn1.txn_id;
+
+    // Tuple where same txn created and deleted it
+    const header = TupleHeader{ .xmin = txn1_id, .xmax = txn1_id, .undo_ptr = NO_UNDO_PTR };
+
+    // From own txn's view: xmin visible (own insert), xmax visible (own delete) → invisible
+    try std.testing.expectEqual(Visibility.invisible, isVisible(&header, &txn1.snapshot, &tm, txn1_id));
+
+    try tm.commit(txn1);
+
+    // From a new txn's view: both committed → invisible
+    const txn2 = try tm.begin();
+    try std.testing.expectEqual(Visibility.invisible, isVisible(&header, &txn2.snapshot, &tm, txn2.txn_id));
+    try tm.commit(txn2);
+}
+
+test "refreshSnapshot idempotency" {
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+
+    const txn = try tm.beginWithIsolation(.read_committed);
+
+    // Refresh multiple times — should not leak or crash
+    try tm.refreshSnapshot(txn);
+    try tm.refreshSnapshot(txn);
+    try tm.refreshSnapshot(txn);
+
+    // xmax should reflect the current next_txn_id each time
+    try std.testing.expectEqual(tm.next_txn_id, txn.snapshot.xmax);
+
+    try tm.commit(txn);
+}
+
+test "oldestActiveTxnId with no active txns" {
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+
+    // No active txns — should return next_txn_id
+    try std.testing.expectEqual(tm.next_txn_id, tm.oldestActiveTxnId());
+
+    // Begin and commit — still no active txns
+    const txn = try tm.begin();
+    try tm.commit(txn);
+    try std.testing.expectEqual(tm.next_txn_id, tm.oldestActiveTxnId());
+}
+
+test "isCommitted on INVALID_TXN_ID" {
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+
+    // Txn 0 should never be committed
+    try std.testing.expect(!tm.isCommitted(INVALID_TXN_ID));
+
+    // A real txn that committed
+    const txn = try tm.begin();
+    try tm.commit(txn);
+    try std.testing.expect(tm.isCommitted(1));
+
+    // Non-existent txn ID
+    try std.testing.expect(!tm.isCommitted(999));
+}
+
+test "snapshot with many concurrent active txns" {
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+
+    // Start 10 txns without committing
+    var txns: [10]*Transaction = undefined;
+    for (&txns, 0..) |*t, i| {
+        t.* = try tm.begin();
+        _ = i;
+    }
+
+    // txn 11 starts — its active list should contain all 10
+    const txn11 = try tm.begin();
+    try std.testing.expectEqual(@as(usize, 10), txn11.snapshot.active.len);
+    try std.testing.expectEqual(@as(TxnId, 1), txn11.snapshot.xmin);
+    try std.testing.expectEqual(@as(TxnId, 12), txn11.snapshot.xmax);
+
+    // None of the 10 should be visible to txn11
+    for (txns) |t| {
+        try std.testing.expect(!txn11.snapshot.isCommitted(t.txn_id, &tm));
+    }
+
+    // Commit them all and clean up
+    for (txns) |t| {
+        try tm.commit(t);
+    }
+    try tm.commit(txn11);
+}
+
+test "isVisible — aborted xmin is invisible" {
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+
+    // txn1 inserts but then aborts
+    const txn1 = try tm.begin();
+    const txn1_id = txn1.txn_id;
+    tm.abort(txn1);
+
+    // txn2 checks visibility — aborted txn1's insert should be invisible
+    const txn2 = try tm.begin();
+    const header = TupleHeader{ .xmin = txn1_id, .xmax = 0, .undo_ptr = NO_UNDO_PTR };
+    try std.testing.expectEqual(Visibility.invisible, isVisible(&header, &txn2.snapshot, &tm, txn2.txn_id));
+    try tm.commit(txn2);
+}
+
+test "snapshot boundary — txn committed between begin and check" {
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+
+    // txn1 and txn2 start concurrently
+    const txn1 = try tm.begin();
+    const txn2 = try tm.begin();
+
+    // txn1 commits after txn2's snapshot was taken
+    try tm.commit(txn1);
+
+    // txn2's snapshot should NOT see txn1 as committed (was active at snapshot time)
+    // Because txn1 was in txn2's active list
+    try std.testing.expect(!txn2.snapshot.isCommitted(txn1.txn_id, &tm));
+
+    // But a NEW txn should see txn1
+    const txn3 = try tm.begin();
+    try std.testing.expect(txn3.snapshot.isCommitted(txn1.txn_id, &tm));
+
+    try tm.commit(txn2);
+    try tm.commit(txn3);
+}
+
+test "isVisible — insert then delete in same txn is invisible to self" {
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+
+    const txn = try tm.begin();
+
+    // Tuple inserted then deleted by same txn (xmin == xmax == own)
+    const header = TupleHeader{ .xmin = txn.txn_id, .xmax = txn.txn_id, .undo_ptr = NO_UNDO_PTR };
+    // Own insert + own delete → invisible (deleted from our perspective)
+    try std.testing.expectEqual(Visibility.invisible, isVisible(&header, &txn.snapshot, &tm, txn.txn_id));
+
+    try tm.commit(txn);
+}
+
+test "isVisible — future xmin is invisible" {
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+
+    const txn1 = try tm.begin();
+
+    // Simulate a tuple created by a future txn (txn_id > snapshot.xmax)
+    const future_txn_id = tm.next_txn_id + 10;
+    const header = TupleHeader{ .xmin = future_txn_id, .xmax = 0, .undo_ptr = NO_UNDO_PTR };
+    try std.testing.expectEqual(Visibility.invisible, isVisible(&header, &txn1.snapshot, &tm, txn1.txn_id));
+
+    try tm.commit(txn1);
+}
+
+test "snapshot empty active list" {
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+
+    // Start and commit txn1 before txn2 starts
+    const txn1 = try tm.begin();
+    try tm.commit(txn1);
+
+    // txn2's snapshot should have empty active list
+    const txn2 = try tm.begin();
+    try std.testing.expectEqual(@as(usize, 0), txn2.snapshot.active.len);
+
+    // txn1 should be visible (committed before snapshot)
+    try std.testing.expect(txn2.snapshot.isCommitted(txn1.txn_id, &tm));
+
+    try tm.commit(txn2);
+}
+
+test "transaction ids are monotonically increasing" {
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+
+    const txn1 = try tm.begin();
+    const txn2 = try tm.begin();
+    const txn3 = try tm.begin();
+
+    try std.testing.expect(txn2.txn_id > txn1.txn_id);
+    try std.testing.expect(txn3.txn_id > txn2.txn_id);
+
+    try tm.commit(txn1);
+    try tm.commit(txn2);
+    try tm.commit(txn3);
+}
+
+test "abort then begin reuses no ids" {
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+
+    const txn1 = try tm.begin();
+    const id1 = txn1.txn_id;
+    tm.abort(txn1);
+
+    // Next txn should get a higher id, not reuse aborted one
+    const txn2 = try tm.begin();
+    try std.testing.expect(txn2.txn_id > id1);
+    try tm.commit(txn2);
 }

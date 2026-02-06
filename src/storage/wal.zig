@@ -1,9 +1,12 @@
 const std = @import("std");
 const page_mod = @import("page.zig");
+const mvcc_mod = @import("mvcc.zig");
+const buffer_pool_mod = @import("buffer_pool.zig");
 
 const PageId = page_mod.PageId;
 const PAGE_SIZE = page_mod.PAGE_SIZE;
 const INVALID_PAGE_ID = page_mod.INVALID_PAGE_ID;
+const BufferPool = buffer_pool_mod.BufferPool;
 
 const Io = std.Io;
 const File = Io.File;
@@ -25,9 +28,9 @@ pub const WalError = error{
 pub const Lsn = u64;
 pub const INVALID_LSN: Lsn = 0;
 
-/// Transaction ID
-pub const TxnId = u32;
-pub const INVALID_TXN_ID: TxnId = 0;
+/// Transaction ID (imported from mvcc)
+pub const TxnId = mvcc_mod.TxnId;
+pub const INVALID_TXN_ID: TxnId = mvcc_mod.INVALID_TXN_ID;
 
 /// Log record types
 pub const LogRecordType = enum(u8) {
@@ -499,6 +502,116 @@ pub const Wal = struct {
         };
     }
 
+    /// Recovery result
+    pub const RecoveryResult = struct {
+        committed_count: u32,
+        aborted_count: u32,
+    };
+
+    /// Crash recovery: replay WAL to restore consistent state.
+    ///
+    /// 1. Analysis pass: scan forward, build committed_txns and active_txns sets
+    /// 2. Redo pass: for committed txns' update records, apply new_data to page
+    /// 3. Undo pass: for active (uncommitted) txns' update records, apply old_data
+    pub fn recover(self: *Self, buffer_pool: *BufferPool) WalError!RecoveryResult {
+        // Flush any buffered records to disk first
+        try self.flush();
+
+        // === Analysis pass ===
+        var committed_txns = std.AutoHashMap(TxnId, void).init(self.allocator);
+        defer committed_txns.deinit();
+        var active_txns = std.AutoHashMap(TxnId, void).init(self.allocator);
+        defer active_txns.deinit();
+
+        var iter = try self.iterator();
+        while (try iter.next()) |record| {
+            defer iter.freeData(record.data);
+            switch (record.header.record_type) {
+                .begin => {
+                    active_txns.put(record.header.txn_id, {}) catch return WalError.OutOfMemory;
+                },
+                .commit => {
+                    _ = active_txns.remove(record.header.txn_id);
+                    committed_txns.put(record.header.txn_id, {}) catch return WalError.OutOfMemory;
+                },
+                .abort => {
+                    _ = active_txns.remove(record.header.txn_id);
+                },
+                else => {},
+            }
+        }
+
+        // === Redo pass: apply committed txns' updates ===
+        var redo_iter = try self.iterator();
+        while (try redo_iter.next()) |record| {
+            defer redo_iter.freeData(record.data);
+            if (record.header.record_type == .update and committed_txns.contains(record.header.txn_id)) {
+                const update_info = UpdateRecordData.deserialize(record.data) catch continue;
+                var pg = buffer_pool.fetchPage(update_info.header.page_id) catch continue;
+                const off: usize = update_info.header.offset;
+                const len: usize = update_info.header.length;
+                if (off + len <= PAGE_SIZE) {
+                    @memcpy(pg.data[off..][0..len], update_info.new_data);
+                }
+                buffer_pool.unpinPage(update_info.header.page_id, true) catch {};
+            }
+        }
+
+        // === Undo pass: reverse active (uncommitted) txns' updates ===
+        // Collect update records for active txns, then apply in reverse
+        const UndoEntry = struct { page_id: PageId, offset: u16, old_data: []const u8 };
+        var undo_records: std.ArrayList(UndoEntry) = .empty;
+        defer {
+            for (undo_records.items) |rec| {
+                self.allocator.free(@constCast(rec.old_data));
+            }
+            undo_records.deinit(self.allocator);
+        }
+
+        var undo_scan = try self.iterator();
+        while (try undo_scan.next()) |record| {
+            if (record.header.record_type == .update and active_txns.contains(record.header.txn_id)) {
+                const update_info = UpdateRecordData.deserialize(record.data) catch {
+                    undo_scan.freeData(record.data);
+                    continue;
+                };
+                const old_data_copy = self.allocator.dupe(u8, update_info.old_data) catch {
+                    undo_scan.freeData(record.data);
+                    return WalError.OutOfMemory;
+                };
+                undo_records.append(self.allocator, .{
+                    .page_id = update_info.header.page_id,
+                    .offset = update_info.header.offset,
+                    .old_data = old_data_copy,
+                }) catch {
+                    self.allocator.free(old_data_copy);
+                    undo_scan.freeData(record.data);
+                    return WalError.OutOfMemory;
+                };
+            }
+            undo_scan.freeData(record.data);
+        }
+
+        // Apply undo records in reverse order
+        var i: usize = undo_records.items.len;
+        while (i > 0) {
+            i -= 1;
+            const rec = undo_records.items[i];
+            var pg = buffer_pool.fetchPage(rec.page_id) catch continue;
+            const off: usize = rec.offset;
+            const len = rec.old_data.len;
+            if (off + len <= PAGE_SIZE) {
+                @memcpy(pg.data[off..][0..len], rec.old_data);
+            }
+            buffer_pool.unpinPage(rec.page_id, true) catch {};
+        }
+
+        return .{
+            .committed_count = @intCast(committed_txns.count()),
+            .aborted_count = @intCast(active_txns.count()),
+        };
+    }
+
     /// Delete the WAL file (for testing)
     pub fn deleteFile(self: *Self) void {
         self.close();
@@ -507,6 +620,9 @@ pub const Wal = struct {
 };
 
 // Tests
+const disk_manager_mod = @import("disk_manager.zig");
+const DiskManager = disk_manager_mod.DiskManager;
+
 test "wal basic operations" {
     const test_file = "test_wal_basic.log";
 
@@ -665,4 +781,338 @@ test "wal multiple transactions" {
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 6), count);
+}
+
+test "recovery redo committed" {
+    const db_file = "test_recovery_redo.db";
+    const wal_file = "test_recovery_redo.log";
+
+    var dm = DiskManager.init(std.testing.allocator, db_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    // Allocate a page and write initial data
+    const result = bp.newPage() catch unreachable;
+    const page_id = result.page_id;
+
+    // Write "AAAA" at offset 100 in the page
+    const old_data = "AAAA";
+    const new_data = "BBBB";
+    @memcpy(result.page.data[100..104], old_data);
+    bp.unpinPage(page_id, true) catch {};
+
+    // Create WAL and log a committed update: old_data → new_data at offset 100
+    var wal = Wal.init(std.testing.allocator, wal_file);
+    defer wal.deleteFile();
+    defer wal.deinit();
+    try wal.open();
+
+    const begin_lsn = try wal.logBegin(1);
+    const update_lsn = try wal.logUpdate(1, begin_lsn, page_id, 100, old_data, new_data);
+    _ = try wal.logCommit(1, update_lsn);
+
+    // Simulate crash: reset the page data back to old value
+    var pg = bp.fetchPage(page_id) catch unreachable;
+    @memcpy(pg.data[100..104], old_data);
+    bp.unpinPage(page_id, true) catch {};
+
+    // Run recovery — should redo the committed update
+    const recovery_result = try wal.recover(&bp);
+    try std.testing.expectEqual(@as(u32, 1), recovery_result.committed_count);
+    try std.testing.expectEqual(@as(u32, 0), recovery_result.aborted_count);
+
+    // Verify the page has the new data
+    var pg2 = bp.fetchPage(page_id) catch unreachable;
+    try std.testing.expectEqualSlices(u8, new_data, pg2.data[100..104]);
+    bp.unpinPage(page_id, false) catch {};
+}
+
+test "recovery undo active" {
+    const db_file = "test_recovery_undo.db";
+    const wal_file = "test_recovery_undo.log";
+
+    var dm = DiskManager.init(std.testing.allocator, db_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    // Allocate a page and write initial data
+    const result = bp.newPage() catch unreachable;
+    const page_id = result.page_id;
+
+    const old_data = "XXXX";
+    const new_data = "YYYY";
+    @memcpy(result.page.data[200..204], old_data);
+    bp.unpinPage(page_id, true) catch {};
+
+    // Create WAL: BEGIN + UPDATE but NO COMMIT (active/uncommitted txn)
+    var wal = Wal.init(std.testing.allocator, wal_file);
+    defer wal.deleteFile();
+    defer wal.deinit();
+    try wal.open();
+
+    const begin_lsn = try wal.logBegin(1);
+    _ = try wal.logUpdate(1, begin_lsn, page_id, 200, old_data, new_data);
+    // No commit! Txn 1 is still active.
+
+    // Simulate the uncommitted change being applied to the page
+    var pg = bp.fetchPage(page_id) catch unreachable;
+    @memcpy(pg.data[200..204], new_data);
+    bp.unpinPage(page_id, true) catch {};
+
+    // Run recovery — should undo the active txn's update
+    const recovery_result = try wal.recover(&bp);
+    try std.testing.expectEqual(@as(u32, 0), recovery_result.committed_count);
+    try std.testing.expectEqual(@as(u32, 1), recovery_result.aborted_count);
+
+    // Verify the page has been restored to old data
+    var pg2 = bp.fetchPage(page_id) catch unreachable;
+    try std.testing.expectEqualSlices(u8, old_data, pg2.data[200..204]);
+    bp.unpinPage(page_id, false) catch {};
+}
+
+test "recovery mixed committed and active" {
+    const db_file = "test_recovery_mixed.db";
+    const wal_file = "test_recovery_mixed.log";
+
+    var dm = DiskManager.init(std.testing.allocator, db_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    const result = bp.newPage() catch unreachable;
+    const page_id = result.page_id;
+
+    // Initial state: "1111" at offset 100, "aaaa" at offset 200
+    @memcpy(result.page.data[100..104], "1111");
+    @memcpy(result.page.data[200..204], "aaaa");
+    bp.unpinPage(page_id, true) catch {};
+
+    var wal = Wal.init(std.testing.allocator, wal_file);
+    defer wal.deleteFile();
+    defer wal.deinit();
+    try wal.open();
+
+    // Txn 1: committed — updates offset 100 from "1111" to "2222"
+    const t1_begin = try wal.logBegin(1);
+    const t1_update = try wal.logUpdate(1, t1_begin, page_id, 100, "1111", "2222");
+    _ = try wal.logCommit(1, t1_update);
+
+    // Txn 2: active (no commit) — updates offset 200 from "aaaa" to "bbbb"
+    const t2_begin = try wal.logBegin(2);
+    _ = try wal.logUpdate(2, t2_begin, page_id, 200, "aaaa", "bbbb");
+    // No commit for txn 2
+
+    // Simulate crash: page has old values (committed change lost, uncommitted applied)
+    var pg = bp.fetchPage(page_id) catch unreachable;
+    @memcpy(pg.data[100..104], "1111"); // committed change lost
+    @memcpy(pg.data[200..204], "bbbb"); // uncommitted change applied
+    bp.unpinPage(page_id, true) catch {};
+
+    // Run recovery
+    const recovery_result = try wal.recover(&bp);
+    try std.testing.expectEqual(@as(u32, 1), recovery_result.committed_count);
+    try std.testing.expectEqual(@as(u32, 1), recovery_result.aborted_count);
+
+    // Verify: offset 100 should be "2222" (redone), offset 200 should be "aaaa" (undone)
+    var pg2 = bp.fetchPage(page_id) catch unreachable;
+    try std.testing.expectEqualSlices(u8, "2222", pg2.data[100..104]);
+    try std.testing.expectEqualSlices(u8, "aaaa", pg2.data[200..204]);
+    bp.unpinPage(page_id, false) catch {};
+}
+
+test "recovery empty WAL" {
+    const db_file = "test_recovery_empty.db";
+    const wal_file = "test_recovery_empty.log";
+
+    var dm = DiskManager.init(std.testing.allocator, db_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    var wal = Wal.init(std.testing.allocator, wal_file);
+    defer wal.deleteFile();
+    defer wal.deinit();
+    try wal.open();
+
+    // Recovery on empty WAL should succeed with zero counts
+    const result = try wal.recover(&bp);
+    try std.testing.expectEqual(@as(u32, 0), result.committed_count);
+    try std.testing.expectEqual(@as(u32, 0), result.aborted_count);
+}
+
+test "recovery idempotent run twice" {
+    const db_file = "test_recovery_idempotent.db";
+    const wal_file = "test_recovery_idempotent.log";
+
+    var dm = DiskManager.init(std.testing.allocator, db_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    const new_page = bp.newPage() catch unreachable;
+    const page_id = new_page.page_id;
+    @memcpy(new_page.page.data[50..54], "AAAA");
+    bp.unpinPage(page_id, true) catch {};
+
+    var wal = Wal.init(std.testing.allocator, wal_file);
+    defer wal.deleteFile();
+    defer wal.deinit();
+    try wal.open();
+
+    const begin_lsn = try wal.logBegin(1);
+    const update_lsn = try wal.logUpdate(1, begin_lsn, page_id, 50, "AAAA", "BBBB");
+    _ = try wal.logCommit(1, update_lsn);
+
+    // First recovery
+    const r1 = try wal.recover(&bp);
+    try std.testing.expectEqual(@as(u32, 1), r1.committed_count);
+
+    // Verify data after first recovery
+    var pg1 = bp.fetchPage(page_id) catch unreachable;
+    try std.testing.expectEqualSlices(u8, "BBBB", pg1.data[50..54]);
+    bp.unpinPage(page_id, false) catch {};
+
+    // Second recovery — should be idempotent, data still "BBBB"
+    const r2 = try wal.recover(&bp);
+    try std.testing.expectEqual(@as(u32, 1), r2.committed_count);
+
+    var pg2 = bp.fetchPage(page_id) catch unreachable;
+    try std.testing.expectEqualSlices(u8, "BBBB", pg2.data[50..54]);
+    bp.unpinPage(page_id, false) catch {};
+}
+
+test "recovery all active no commits" {
+    const db_file = "test_recovery_all_active.db";
+    const wal_file = "test_recovery_all_active.log";
+
+    var dm = DiskManager.init(std.testing.allocator, db_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    const new_page = bp.newPage() catch unreachable;
+    const page_id = new_page.page_id;
+    @memcpy(new_page.page.data[0..4], "ORIG");
+    bp.unpinPage(page_id, true) catch {};
+
+    var wal = Wal.init(std.testing.allocator, wal_file);
+    defer wal.deleteFile();
+    defer wal.deinit();
+    try wal.open();
+
+    // Two BEGINs with updates, no commits
+    const b1 = try wal.logBegin(1);
+    _ = try wal.logUpdate(1, b1, page_id, 0, "ORIG", "AAA1");
+    const b2 = try wal.logBegin(2);
+    _ = try wal.logUpdate(2, b2, page_id, 4, "ORIG", "BBB2");
+
+    // Simulate the uncommitted writes being applied
+    var pg = bp.fetchPage(page_id) catch unreachable;
+    @memcpy(pg.data[0..4], "AAA1");
+    @memcpy(pg.data[4..8], "BBB2");
+    bp.unpinPage(page_id, true) catch {};
+
+    // Recovery should undo both
+    const result = try wal.recover(&bp);
+    try std.testing.expectEqual(@as(u32, 0), result.committed_count);
+    try std.testing.expectEqual(@as(u32, 2), result.aborted_count);
+
+    // Verify both restored
+    var pg2 = bp.fetchPage(page_id) catch unreachable;
+    try std.testing.expectEqualSlices(u8, "ORIG", pg2.data[0..4]);
+    try std.testing.expectEqualSlices(u8, "ORIG", pg2.data[4..8]);
+    bp.unpinPage(page_id, false) catch {};
+}
+
+test "recovery multiple updates same page" {
+    const db_file = "test_recovery_multi_update.db";
+    const wal_file = "test_recovery_multi_update.log";
+
+    var dm = DiskManager.init(std.testing.allocator, db_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    const new_page = bp.newPage() catch unreachable;
+    const page_id = new_page.page_id;
+    @memcpy(new_page.page.data[100..104], "AAAA");
+    bp.unpinPage(page_id, true) catch {};
+
+    var wal = Wal.init(std.testing.allocator, wal_file);
+    defer wal.deleteFile();
+    defer wal.deinit();
+    try wal.open();
+
+    // Chain of updates: AAAA → BBBB → CCCC → DDDD (all committed)
+    const b = try wal.logBegin(1);
+    const upd1 = try wal.logUpdate(1, b, page_id, 100, "AAAA", "BBBB");
+    const upd2 = try wal.logUpdate(1, upd1, page_id, 100, "BBBB", "CCCC");
+    const upd3 = try wal.logUpdate(1, upd2, page_id, 100, "CCCC", "DDDD");
+    _ = try wal.logCommit(1, upd3);
+
+    // Simulate crash: page still has AAAA
+    var pg = bp.fetchPage(page_id) catch unreachable;
+    @memcpy(pg.data[100..104], "AAAA");
+    bp.unpinPage(page_id, true) catch {};
+
+    // Recovery should replay all 3 updates, ending with DDDD
+    const result = try wal.recover(&bp);
+    try std.testing.expectEqual(@as(u32, 1), result.committed_count);
+
+    var pg2 = bp.fetchPage(page_id) catch unreachable;
+    try std.testing.expectEqualSlices(u8, "DDDD", pg2.data[100..104]);
+    bp.unpinPage(page_id, false) catch {};
+}
+
+test "recovery abort with no updates" {
+    const db_file = "test_recovery_abort_noop.db";
+    const wal_file = "test_recovery_abort_noop.log";
+
+    var dm = DiskManager.init(std.testing.allocator, db_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    var wal = Wal.init(std.testing.allocator, wal_file);
+    defer wal.deleteFile();
+    defer wal.deinit();
+    try wal.open();
+
+    // BEGIN with no updates, then abort
+    _ = try wal.logBegin(1);
+    // txn 1 is active (no commit, no abort logged before crash)
+
+    // BEGIN + COMMIT with no updates
+    _ = try wal.logBegin(2);
+    _ = try wal.logCommit(2, 0);
+
+    const result = try wal.recover(&bp);
+    try std.testing.expectEqual(@as(u32, 1), result.committed_count);
+    try std.testing.expectEqual(@as(u32, 1), result.aborted_count);
 }

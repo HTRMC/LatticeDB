@@ -472,3 +472,95 @@ test "stripHeader too small buffer" {
     const small = [_]u8{ 0, 1, 2 };
     try std.testing.expectError(error.BufferTooSmall, Tuple.stripHeader(&small));
 }
+
+test "tuple all null values" {
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "a", .col_type = .integer, .max_length = 0, .nullable = true },
+            .{ .name = "b", .col_type = .varchar, .max_length = 255, .nullable = true },
+            .{ .name = "c", .col_type = .float, .max_length = 0, .nullable = true },
+        },
+    };
+
+    const values = [_]Value{ .null_value, .null_value, .null_value };
+
+    var buf: [256]u8 = undefined;
+    const written = try Tuple.serialize(&schema, &values, &buf);
+    try std.testing.expect(written > 0);
+
+    const result = try Tuple.deserialize(std.testing.allocator, &schema, buf[0..written]);
+    defer std.testing.allocator.free(result);
+
+    try std.testing.expect(result[0] == .null_value);
+    try std.testing.expect(result[1] == .null_value);
+    try std.testing.expect(result[2] == .null_value);
+}
+
+test "tuple single boolean column" {
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "flag", .col_type = .boolean, .max_length = 0, .nullable = false },
+        },
+    };
+
+    const values_true = [_]Value{.{ .boolean = true }};
+    const values_false = [_]Value{.{ .boolean = false }};
+
+    var buf: [64]u8 = undefined;
+
+    const written_t = try Tuple.serialize(&schema, &values_true, &buf);
+    const res_t = try Tuple.deserialize(std.testing.allocator, &schema, buf[0..written_t]);
+    defer std.testing.allocator.free(res_t);
+    try std.testing.expectEqual(true, res_t[0].boolean);
+
+    const written_f = try Tuple.serialize(&schema, &values_false, &buf);
+    const res_f = try Tuple.deserialize(std.testing.allocator, &schema, buf[0..written_f]);
+    defer std.testing.allocator.free(res_f);
+    try std.testing.expectEqual(false, res_f[0].boolean);
+}
+
+test "tuple negative integer and bigint" {
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "small", .col_type = .integer, .max_length = 0, .nullable = false },
+            .{ .name = "big", .col_type = .bigint, .max_length = 0, .nullable = false },
+        },
+    };
+
+    const values = [_]Value{
+        .{ .integer = -2147483648 }, // i32 min
+        .{ .bigint = -9223372036854775808 }, // i64 min
+    };
+
+    var buf: [256]u8 = undefined;
+    const written = try Tuple.serialize(&schema, &values, &buf);
+    const result = try Tuple.deserialize(std.testing.allocator, &schema, buf[0..written]);
+    defer std.testing.allocator.free(result);
+
+    try std.testing.expectEqual(@as(i32, -2147483648), result[0].integer);
+    try std.testing.expectEqual(@as(i64, -9223372036854775808), result[1].bigint);
+}
+
+test "tuple empty string varchar" {
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "name", .col_type = .varchar, .max_length = 255, .nullable = false },
+        },
+    };
+
+    const values = [_]Value{.{ .bytes = "" }};
+
+    var buf: [64]u8 = undefined;
+    const written = try Tuple.serialize(&schema, &values, &buf);
+    const result = try Tuple.deserialize(std.testing.allocator, &schema, buf[0..written]);
+    defer std.testing.allocator.free(result);
+
+    try std.testing.expectEqualStrings("", result[0].bytes);
+}
+
+test "value encode null_value" {
+    var buf: [16]u8 = undefined;
+    const null_val = Value{ .null_value = {} };
+    const len = try null_val.encode(&buf);
+    try std.testing.expectEqual(@as(usize, 0), len);
+}

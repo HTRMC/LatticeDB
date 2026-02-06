@@ -30,6 +30,7 @@ pub const ExecError = error{
     StorageError,
     OutOfMemory,
     TransactionError,
+    WriteConflict,
 };
 
 /// A result row — an array of string-formatted values
@@ -373,6 +374,15 @@ pub const Executor = struct {
 
         // Use explicit txn or begin implicit for read
         const txn = self.current_txn orelse self.beginImplicitTxn();
+
+        // READ COMMITTED: refresh snapshot before each statement
+        if (txn) |t| {
+            if (t.isolation_level == .read_committed) {
+                if (self.txn_manager) |tm| {
+                    tm.refreshSnapshot(t) catch {};
+                }
+            }
+        }
 
         // Scan and filter
         var rows: std.ArrayList(ResultRow) = .empty;
@@ -1233,6 +1243,15 @@ pub const Executor = struct {
         // Use explicit txn or auto-commit
         const txn = self.current_txn orelse self.beginImplicitTxn();
 
+        // READ COMMITTED: refresh snapshot before each statement
+        if (txn) |t| {
+            if (t.isolation_level == .read_committed) {
+                if (self.txn_manager) |tm| {
+                    tm.refreshSnapshot(t) catch {};
+                }
+            }
+        }
+
         // Collect TIDs to delete (can't delete while scanning)
         var to_delete: std.ArrayList(page_mod.TupleId) = .empty;
         defer to_delete.deinit(self.allocator);
@@ -1264,7 +1283,11 @@ pub const Executor = struct {
         // Now delete collected tuples
         var deleted: u64 = 0;
         for (to_delete.items) |tid| {
-            if (table.deleteTuple(txn, tid) catch {
+            if (table.deleteTuple(txn, tid) catch |err| {
+                if (err == table_mod.TableError.WriteConflict) {
+                    self.abortImplicitTxn(txn);
+                    return ExecError.WriteConflict;
+                }
                 self.abortImplicitTxn(txn);
                 return ExecError.StorageError;
             }) {
@@ -1313,6 +1336,15 @@ pub const Executor = struct {
 
         // Use explicit txn or auto-commit
         const txn = self.current_txn orelse self.beginImplicitTxn();
+
+        // READ COMMITTED: refresh snapshot before each statement
+        if (txn) |t| {
+            if (t.isolation_level == .read_committed) {
+                if (self.txn_manager) |tm| {
+                    tm.refreshSnapshot(t) catch {};
+                }
+            }
+        }
 
         // Scan and collect rows to update (TID + current values)
         const UpdateEntry = struct { tid: page_mod.TupleId, values: []Value };
@@ -1371,7 +1403,11 @@ pub const Executor = struct {
             }
 
             // Delete old tuple (MVCC: sets xmax)
-            _ = table.deleteTuple(txn, entry.tid) catch {
+            _ = table.deleteTuple(txn, entry.tid) catch |err| {
+                if (err == table_mod.TableError.WriteConflict) {
+                    self.abortImplicitTxn(txn);
+                    return ExecError.WriteConflict;
+                }
                 self.abortImplicitTxn(txn);
                 return ExecError.StorageError;
             };
@@ -2492,4 +2528,395 @@ test "executor LEFT JOIN" {
             try std.testing.expectEqualStrings("100", row.values[1]);
         }
     }
+}
+
+test "executor ROLLBACK without BEGIN returns error" {
+    const test_file = "test_exec_rollback_nobegin.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const result = exec.execute("ROLLBACK");
+    try std.testing.expectError(ExecError.TransactionError, result);
+}
+
+test "executor COMMIT without BEGIN returns error" {
+    const test_file = "test_exec_commit_nobegin.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const result = exec.execute("COMMIT");
+    try std.testing.expectError(ExecError.TransactionError, result);
+}
+
+test "executor nested BEGIN returns error" {
+    const test_file = "test_exec_nested_begin.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const b1 = try exec.execute("BEGIN");
+    exec.freeResult(b1);
+
+    // Second BEGIN should fail
+    const b2 = exec.execute("BEGIN");
+    try std.testing.expectError(ExecError.TransactionError, b2);
+
+    // Clean up — rollback the first txn
+    const rb = try exec.execute("ROLLBACK");
+    exec.freeResult(rb);
+}
+
+test "executor SELECT on empty table returns no rows" {
+    const test_file = "test_exec_empty_select.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const ct = try exec.execute("CREATE TABLE empty_t (id INT, name TEXT)");
+    exec.freeResult(ct);
+
+    const sel = try exec.execute("SELECT * FROM empty_t");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 0), sel.rows.rows.len);
+    try std.testing.expectEqual(@as(usize, 2), sel.rows.columns.len);
+}
+
+test "executor DELETE on empty table returns zero" {
+    const test_file = "test_exec_empty_delete.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const ct = try exec.execute("CREATE TABLE empty_t (id INT)");
+    exec.freeResult(ct);
+
+    const del = try exec.execute("DELETE FROM empty_t WHERE id = 1");
+    defer exec.freeResult(del);
+    try std.testing.expectEqual(@as(u64, 0), del.row_count);
+}
+
+test "executor UPDATE on empty table returns zero" {
+    const test_file = "test_exec_empty_update.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const ct = try exec.execute("CREATE TABLE empty_t (id INT, val INT)");
+    exec.freeResult(ct);
+
+    const upd = try exec.execute("UPDATE empty_t SET val = 99");
+    defer exec.freeResult(upd);
+    try std.testing.expectEqual(@as(u64, 0), upd.row_count);
+}
+
+test "executor insert then delete then rollback restores row" {
+    const test_file = "test_exec_ins_del_rollback.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    // Create table and insert a committed row
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (1, 'Alice')");
+    exec.freeResult(ins);
+
+    // BEGIN, DELETE, ROLLBACK — row should reappear
+    const b = try exec.execute("BEGIN");
+    exec.freeResult(b);
+    const del = try exec.execute("DELETE FROM t WHERE id = 1");
+    exec.freeResult(del);
+
+    // Within txn, row should be gone
+    const sel1 = try exec.execute("SELECT * FROM t");
+    defer exec.freeResult(sel1);
+    try std.testing.expectEqual(@as(usize, 0), sel1.rows.rows.len);
+
+    const rb = try exec.execute("ROLLBACK");
+    exec.freeResult(rb);
+
+    // After rollback, row should be back
+    const sel2 = try exec.execute("SELECT * FROM t");
+    defer exec.freeResult(sel2);
+    try std.testing.expectEqual(@as(usize, 1), sel2.rows.rows.len);
+    try std.testing.expectEqualStrings("Alice", sel2.rows.rows[0].values[1]);
+}
+
+test "executor CREATE TABLE duplicate name fails" {
+    const test_file = "test_exec_dup_table.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct1 = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct1);
+
+    const ct2 = exec.execute("CREATE TABLE t (id INT)");
+    try std.testing.expectError(ExecError.TableAlreadyExists, ct2);
+}
+
+test "executor INSERT column count mismatch" {
+    const test_file = "test_exec_col_mismatch.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+
+    // Too few values
+    const result = exec.execute("INSERT INTO t VALUES (1)");
+    try std.testing.expectError(ExecError.ColumnCountMismatch, result);
+}
+
+test "executor UPDATE WHERE matches zero rows" {
+    const test_file = "test_exec_update_zero.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (1, 'Alice')");
+    exec.freeResult(ins);
+
+    // UPDATE with WHERE that matches nothing
+    const upd = try exec.execute("UPDATE t SET name = 'Bob' WHERE id = 999");
+    defer exec.freeResult(upd);
+    try std.testing.expectEqual(@as(u64, 0), upd.row_count);
+
+    // Original should be unchanged
+    const sel = try exec.execute("SELECT name FROM t WHERE id = 1");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqualStrings("Alice", sel.rows.rows[0].values[0]);
+}
+
+test "executor multiple inserts then delete all" {
+    const test_file = "test_exec_delete_all.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        const sql = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d})", .{i + 1}) catch unreachable;
+        defer std.testing.allocator.free(sql);
+        const r = try exec.execute(sql);
+        exec.freeResult(r);
+    }
+
+    // DELETE all (no WHERE)
+    const del = try exec.execute("DELETE FROM t");
+    defer exec.freeResult(del);
+    try std.testing.expectEqual(@as(u64, 10), del.row_count);
+
+    // Table should be empty
+    const sel = try exec.execute("SELECT * FROM t");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 0), sel.rows.rows.len);
+}
+
+test "executor INSERT into nonexistent table" {
+    const test_file = "test_exec_ins_noent.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const result = exec.execute("INSERT INTO nonexistent VALUES (1)");
+    try std.testing.expectError(ExecError.TableNotFound, result);
+}
+
+test "executor DELETE from nonexistent table" {
+    const test_file = "test_exec_del_noent.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const result = exec.execute("DELETE FROM nonexistent WHERE id = 1");
+    try std.testing.expectError(ExecError.TableNotFound, result);
+}
+
+test "executor parse error" {
+    const test_file = "test_exec_parse_err.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const result = exec.execute("THIS IS NOT SQL");
+    try std.testing.expectError(ExecError.ParseError, result);
+}
+
+test "executor SELECT COUNT on empty table" {
+    const test_file = "test_exec_count_empty.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    const sel = try exec.execute("SELECT COUNT(*) FROM t");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 1), sel.rows.rows.len);
+    try std.testing.expectEqualStrings("0", sel.rows.rows[0].values[0]);
 }

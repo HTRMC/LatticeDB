@@ -53,6 +53,8 @@ pub const UndoLog = struct {
     buffer: std.ArrayListUnmanaged(u8),
     /// Current write position (= logical file size)
     write_pos: u64,
+    /// GC watermark: records before this offset are logically dead
+    gc_watermark: u64,
 
     const Self = @This();
 
@@ -61,6 +63,7 @@ pub const UndoLog = struct {
             .allocator = allocator,
             .buffer = .empty,
             .write_pos = 0,
+            .gc_watermark = 0,
         };
     }
 
@@ -118,15 +121,30 @@ pub const UndoLog = struct {
         return self.write_pos;
     }
 
-    /// GC: Truncate undo entries before the safe offset.
-    /// In this in-memory implementation, we just note the safe offset
-    /// but don't actually reclaim memory (a real implementation would
-    /// use a circular buffer or file truncation).
-    pub fn gc(self: *Self, safe_offset: u64) void {
-        _ = safe_offset;
-        // In a production implementation, we'd reclaim space before safe_offset.
-        // For now this is a no-op marker for the GC boundary.
-        _ = self;
+    /// GC: Advance watermark past records whose txn_id < oldest_visible_txn_id.
+    /// Records before the watermark are logically dead (offsets remain stable).
+    pub fn gc(self: *Self, oldest_visible_txn_id: TxnId) void {
+        var offset = self.gc_watermark;
+
+        while (offset < self.write_pos) {
+            const pos: usize = @intCast(offset);
+            if (pos + UndoRecordHeader.SIZE > self.buffer.items.len) break;
+
+            const header = std.mem.bytesToValue(UndoRecordHeader, self.buffer.items[pos..][0..UndoRecordHeader.SIZE]);
+            const record_size = UndoRecordHeader.SIZE + header.data_len;
+
+            // Stop at the first record that might still be visible
+            if (header.txn_id >= oldest_visible_txn_id) break;
+
+            offset += @intCast(record_size);
+        }
+
+        self.gc_watermark = offset;
+    }
+
+    /// Returns the number of bytes that are logically dead (before watermark)
+    pub fn reclaimableBytes(self: *const Self) u64 {
+        return self.gc_watermark;
     }
 };
 
@@ -263,4 +281,241 @@ test "UndoLog invalid offset returns error" {
 
     // Reading from beyond buffer should error
     try std.testing.expectError(error.InvalidOffset, log.readRecord(9999));
+}
+
+test "UndoLog GC advances after all committed" {
+    var log = UndoLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    // Txn 1: insert record
+    const h1 = UndoRecordHeader{
+        .record_type = .insert,
+        .slot_id = 1,
+        .txn_id = 1,
+        .prev_undo_ptr = NO_UNDO_PTR,
+        .txn_prev_undo = NO_UNDO_PTR,
+        .table_page_id = 5,
+        .data_len = 0,
+    };
+    _ = try log.appendRecord(h1, &.{});
+
+    // Txn 2: insert record
+    const h2 = UndoRecordHeader{
+        .record_type = .insert,
+        .slot_id = 2,
+        .txn_id = 2,
+        .prev_undo_ptr = NO_UNDO_PTR,
+        .txn_prev_undo = NO_UNDO_PTR,
+        .table_page_id = 5,
+        .data_len = 0,
+    };
+    _ = try log.appendRecord(h2, &.{});
+
+    try std.testing.expectEqual(@as(u64, 0), log.reclaimableBytes());
+
+    // GC with oldest_visible = 3 (both txns 1 and 2 are old)
+    log.gc(3);
+    try std.testing.expectEqual(log.write_pos, log.reclaimableBytes());
+}
+
+test "UndoLog GC stops at active txn boundary" {
+    var log = UndoLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    // Txn 1: insert
+    const h1 = UndoRecordHeader{
+        .record_type = .insert,
+        .slot_id = 1,
+        .txn_id = 1,
+        .prev_undo_ptr = NO_UNDO_PTR,
+        .txn_prev_undo = NO_UNDO_PTR,
+        .table_page_id = 5,
+        .data_len = 0,
+    };
+    const offset1 = try log.appendRecord(h1, &.{});
+    _ = offset1;
+
+    // Txn 5: insert (still active)
+    const h2 = UndoRecordHeader{
+        .record_type = .insert,
+        .slot_id = 2,
+        .txn_id = 5,
+        .prev_undo_ptr = NO_UNDO_PTR,
+        .txn_prev_undo = NO_UNDO_PTR,
+        .table_page_id = 5,
+        .data_len = 0,
+    };
+    _ = try log.appendRecord(h2, &.{});
+
+    // GC with oldest_visible = 3 — should advance past txn 1 but stop at txn 5
+    log.gc(3);
+    const expected_watermark = UndoRecordHeader.SIZE; // just past first record
+    try std.testing.expectEqual(@as(u64, expected_watermark), log.reclaimableBytes());
+}
+
+test "UndoLog GC multiple txns progressive" {
+    var log = UndoLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    // Txn 1, 2, 3 each write a record
+    var i: u32 = 1;
+    while (i <= 3) : (i += 1) {
+        const h = UndoRecordHeader{
+            .record_type = .insert,
+            .slot_id = @intCast(i),
+            .txn_id = i,
+            .prev_undo_ptr = NO_UNDO_PTR,
+            .txn_prev_undo = NO_UNDO_PTR,
+            .table_page_id = 5,
+            .data_len = 0,
+        };
+        _ = try log.appendRecord(h, &.{});
+    }
+
+    // GC with oldest_visible = 2 — should advance past txn 1 only
+    log.gc(2);
+    try std.testing.expectEqual(@as(u64, UndoRecordHeader.SIZE), log.reclaimableBytes());
+
+    // GC with oldest_visible = 4 — should advance past all
+    log.gc(4);
+    try std.testing.expectEqual(log.write_pos, log.reclaimableBytes());
+}
+
+test "UndoLog GC on empty log" {
+    var log = UndoLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    // GC on empty log should be a no-op
+    log.gc(100);
+    try std.testing.expectEqual(@as(u64, 0), log.reclaimableBytes());
+    try std.testing.expectEqual(@as(u64, 0), log.write_pos);
+}
+
+test "UndoLog GC idempotent double call" {
+    var log = UndoLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    const h = UndoRecordHeader{
+        .record_type = .insert,
+        .slot_id = 1,
+        .txn_id = 1,
+        .prev_undo_ptr = NO_UNDO_PTR,
+        .txn_prev_undo = NO_UNDO_PTR,
+        .table_page_id = 5,
+        .data_len = 0,
+    };
+    _ = try log.appendRecord(h, &.{});
+
+    log.gc(2);
+    const first = log.reclaimableBytes();
+    // Second call with same boundary should not change anything
+    log.gc(2);
+    try std.testing.expectEqual(first, log.reclaimableBytes());
+}
+
+test "UndoLog GC with oldest_visible 0 reclaims nothing" {
+    var log = UndoLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    const h = UndoRecordHeader{
+        .record_type = .insert,
+        .slot_id = 1,
+        .txn_id = 1,
+        .prev_undo_ptr = NO_UNDO_PTR,
+        .txn_prev_undo = NO_UNDO_PTR,
+        .table_page_id = 5,
+        .data_len = 0,
+    };
+    _ = try log.appendRecord(h, &.{});
+
+    // oldest_visible == 0 means nothing is old enough to reclaim
+    log.gc(0);
+    try std.testing.expectEqual(@as(u64, 0), log.reclaimableBytes());
+}
+
+test "UndoLog read record at watermark still works" {
+    var log = UndoLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    const h1 = UndoRecordHeader{
+        .record_type = .insert,
+        .slot_id = 1,
+        .txn_id = 1,
+        .prev_undo_ptr = NO_UNDO_PTR,
+        .txn_prev_undo = NO_UNDO_PTR,
+        .table_page_id = 5,
+        .data_len = 0,
+    };
+    const offset1 = try log.appendRecord(h1, &.{});
+
+    const h2 = UndoRecordHeader{
+        .record_type = .delete,
+        .slot_id = 2,
+        .txn_id = 2,
+        .prev_undo_ptr = NO_UNDO_PTR,
+        .txn_prev_undo = NO_UNDO_PTR,
+        .table_page_id = 5,
+        .data_len = 0,
+    };
+    _ = try log.appendRecord(h2, &.{});
+
+    // GC past first record
+    log.gc(2);
+    try std.testing.expectEqual(@as(u64, UndoRecordHeader.SIZE), log.reclaimableBytes());
+
+    // Reading the GC'd record should still work (offsets remain stable)
+    const rec = try log.readRecord(offset1);
+    try std.testing.expectEqual(UndoRecordType.insert, rec.header.record_type);
+    try std.testing.expectEqual(@as(TxnId, 1), rec.header.txn_id);
+}
+
+test "UndoLog mixed record types with data then GC" {
+    var log = UndoLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    // Insert record (no data)
+    const h1 = UndoRecordHeader{
+        .record_type = .insert,
+        .slot_id = 1,
+        .txn_id = 1,
+        .prev_undo_ptr = NO_UNDO_PTR,
+        .txn_prev_undo = NO_UNDO_PTR,
+        .table_page_id = 5,
+        .data_len = 0,
+    };
+    _ = try log.appendRecord(h1, &.{});
+
+    // Update record (with 8 bytes data)
+    const data = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const h2 = UndoRecordHeader{
+        .record_type = .update,
+        .slot_id = 1,
+        .txn_id = 2,
+        .prev_undo_ptr = NO_UNDO_PTR,
+        .txn_prev_undo = NO_UNDO_PTR,
+        .table_page_id = 5,
+        .data_len = 8,
+    };
+    _ = try log.appendRecord(h2, &data);
+
+    // Delete record (no data)
+    const h3 = UndoRecordHeader{
+        .record_type = .delete,
+        .slot_id = 2,
+        .txn_id = 3,
+        .prev_undo_ptr = NO_UNDO_PTR,
+        .txn_prev_undo = NO_UNDO_PTR,
+        .table_page_id = 5,
+        .data_len = 0,
+    };
+    _ = try log.appendRecord(h3, &.{});
+
+    // GC past txn 1 only — should skip 32 bytes (header only, no data)
+    log.gc(2);
+    try std.testing.expectEqual(@as(u64, UndoRecordHeader.SIZE), log.reclaimableBytes());
+
+    // GC past txn 2 — should skip 32+8=40 more bytes (header + 8 bytes data)
+    log.gc(3);
+    const expected = UndoRecordHeader.SIZE + UndoRecordHeader.SIZE + 8;
+    try std.testing.expectEqual(@as(u64, expected), log.reclaimableBytes());
 }

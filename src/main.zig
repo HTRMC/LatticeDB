@@ -242,7 +242,11 @@ fn runServer(allocator: std.mem.Allocator, out: *std.Io.Writer, port: u16, tls_c
     var catalog = try Catalog.init(allocator, &bp);
     defer catalog.deinit();
 
-    var txn_manager = TransactionManager.init(allocator);
+    var wal = storage.wal.Wal.init(allocator, "graphenedb.wal");
+    try wal.open();
+    defer wal.deinit();
+
+    var txn_manager = TransactionManager.initWithWal(allocator, &wal);
     defer txn_manager.deinit();
 
     var undo_log = UndoLog.init(allocator);
@@ -407,7 +411,11 @@ fn runRepl(allocator: std.mem.Allocator, out: *std.Io.Writer, in: *std.Io.Reader
     var catalog = try Catalog.init(allocator, &bp);
     defer catalog.deinit();
 
-    var txn_manager = TransactionManager.init(allocator);
+    var wal = storage.wal.Wal.init(allocator, "graphenedb.wal");
+    try wal.open();
+    defer wal.deinit();
+
+    var txn_manager = TransactionManager.initWithWal(allocator, &wal);
     defer txn_manager.deinit();
 
     var undo_log = UndoLog.init(allocator);

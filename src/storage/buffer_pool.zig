@@ -638,3 +638,108 @@ test "lru replacer ordering" {
     try std.testing.expect(bp.getPinCount(r0.page_id) != null); // still in pool
     try std.testing.expect(bp.getPinCount(r2.page_id) != null); // still in pool
 }
+
+test "buffer pool double fetch increments pin count" {
+    const test_file = "test_buffer_pool_double_pin.db";
+
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 10);
+    defer bp.deinit();
+
+    const result = try bp.newPage();
+    const page_id = result.page_id;
+    try std.testing.expectEqual(@as(?u32, 1), bp.getPinCount(page_id));
+
+    // Fetch same page again — pin count should go to 2
+    _ = try bp.fetchPage(page_id);
+    try std.testing.expectEqual(@as(?u32, 2), bp.getPinCount(page_id));
+
+    // Must unpin twice
+    try bp.unpinPage(page_id, false);
+    try std.testing.expectEqual(@as(?u32, 1), bp.getPinCount(page_id));
+
+    try bp.unpinPage(page_id, false);
+    try std.testing.expectEqual(@as(?u32, 0), bp.getPinCount(page_id));
+}
+
+test "buffer pool new page ids are sequential" {
+    const test_file = "test_buffer_pool_seq_ids.db";
+
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 10);
+    defer bp.deinit();
+
+    const r0 = try bp.newPage();
+    const r1 = try bp.newPage();
+    const r2 = try bp.newPage();
+
+    try std.testing.expectEqual(@as(PageId, 0), r0.page_id);
+    try std.testing.expectEqual(@as(PageId, 1), r1.page_id);
+    try std.testing.expectEqual(@as(PageId, 2), r2.page_id);
+
+    try bp.unpinPage(r0.page_id, false);
+    try bp.unpinPage(r1.page_id, false);
+    try bp.unpinPage(r2.page_id, false);
+}
+
+test "buffer pool dirty flag survives re-fetch" {
+    const test_file = "test_buffer_pool_dirty_refetch.db";
+
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 10);
+    defer bp.deinit();
+
+    const result = try bp.newPage();
+    const page_id = result.page_id;
+
+    // Unpin as dirty
+    try bp.unpinPage(page_id, true);
+    try std.testing.expectEqual(@as(?bool, true), bp.isDirty(page_id));
+
+    // Re-fetch — dirty flag should still be true
+    _ = try bp.fetchPage(page_id);
+    try std.testing.expectEqual(@as(?bool, true), bp.isDirty(page_id));
+
+    try bp.unpinPage(page_id, false);
+}
+
+test "buffer pool single frame pool" {
+    const test_file = "test_buffer_pool_single.db";
+
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+
+    // Minimum viable pool: 1 frame
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 1);
+    defer bp.deinit();
+
+    const r0 = try bp.newPage();
+    var pg0 = r0.page;
+    _ = pg0.insertTuple("data-on-page-0");
+    try bp.unpinPage(r0.page_id, true);
+
+    // Creating a second page should evict the first
+    const r1 = try bp.newPage();
+    try std.testing.expectEqual(@as(?u32, null), bp.getPinCount(r0.page_id));
+    try bp.unpinPage(r1.page_id, false);
+
+    // Re-fetch page 0 (evicts page 1, loads from disk)
+    var pg0_refetch = try bp.fetchPage(r0.page_id);
+    const refetched_data = pg0_refetch.getTuple(0) orelse unreachable;
+    try std.testing.expectEqualStrings("data-on-page-0", refetched_data);
+    try bp.unpinPage(r0.page_id, false);
+}

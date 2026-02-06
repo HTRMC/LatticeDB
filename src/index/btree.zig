@@ -603,3 +603,123 @@ test "btree large insert with random order" {
     // All keys in [0, count) should be reachable since 997 is coprime with 2000
     try std.testing.expectEqual(count, found_count);
 }
+
+test "btree delete from empty tree" {
+    const test_file = "test_btree_del_empty.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+
+    var btree = try BTree.create(&bp);
+
+    // Delete from empty tree should return false (not crash)
+    const deleted = try btree.delete(42);
+    try std.testing.expect(!deleted);
+}
+
+test "btree min and max key values" {
+    const test_file = "test_btree_minmax.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+
+    var btree = try BTree.create(&bp);
+
+    const min_key: i32 = std.math.minInt(i32);
+    const max_key: i32 = std.math.maxInt(i32);
+
+    try btree.insert(min_key, .{ .page_id = 1, .slot_id = 0 });
+    try btree.insert(max_key, .{ .page_id = 2, .slot_id = 0 });
+    try btree.insert(0, .{ .page_id = 3, .slot_id = 0 });
+
+    const r_min = (try btree.search(min_key)).?;
+    try std.testing.expectEqual(@as(PageId, 1), r_min.page_id);
+
+    const r_max = (try btree.search(max_key)).?;
+    try std.testing.expectEqual(@as(PageId, 2), r_max.page_id);
+
+    const r_zero = (try btree.search(0)).?;
+    try std.testing.expectEqual(@as(PageId, 3), r_zero.page_id);
+}
+
+test "btree range scan no results" {
+    const test_file = "test_btree_range_empty.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+
+    var btree = try BTree.create(&bp);
+
+    // Insert keys 100, 200, 300
+    try btree.insert(100, .{ .page_id = 1, .slot_id = 0 });
+    try btree.insert(200, .{ .page_id = 2, .slot_id = 0 });
+    try btree.insert(300, .{ .page_id = 3, .slot_id = 0 });
+
+    // Range scan [50, 99] — no keys in range
+    var iter = try btree.rangeScan(50, 99);
+    var count: usize = 0;
+    while (try iter.next()) |_| {
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), count);
+}
+
+test "btree insert delete then reinsert same key" {
+    const test_file = "test_btree_reinsert.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+
+    var btree = try BTree.create(&bp);
+
+    try btree.insert(42, .{ .page_id = 1, .slot_id = 0 });
+    try std.testing.expect((try btree.search(42)) != null);
+
+    const deleted = try btree.delete(42);
+    try std.testing.expect(deleted);
+    try std.testing.expect((try btree.search(42)) == null);
+
+    // Reinsert same key with different value
+    try btree.insert(42, .{ .page_id = 9, .slot_id = 5 });
+    const result = (try btree.search(42)).?;
+    try std.testing.expectEqual(@as(PageId, 9), result.page_id);
+    try std.testing.expectEqual(@as(u16, 5), result.slot_id);
+}
+
+test "btree range scan entire range" {
+    const test_file = "test_btree_range_all.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+
+    var btree = try BTree.create(&bp);
+
+    // Insert 50 keys
+    var i: i32 = 0;
+    while (i < 50) : (i += 1) {
+        try btree.insert(i, .{ .page_id = @intCast(i), .slot_id = 0 });
+    }
+
+    // Range scan [0, 49] should return all 50
+    var iter = try btree.rangeScan(0, 49);
+    var count: usize = 0;
+    while (try iter.next()) |_| {
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 50), count);
+}

@@ -849,3 +849,72 @@ test "parse BEGIN, COMMIT, ROLLBACK" {
         try std.testing.expect(stmt == .rollback_txn);
     }
 }
+
+test "parse empty input" {
+    var p = Parser.init(std.testing.allocator, "");
+    defer p.deinit();
+    try std.testing.expectError(ParseError.UnexpectedEof, p.parse());
+}
+
+test "parse whitespace only" {
+    var p = Parser.init(std.testing.allocator, "   \t\n  ");
+    defer p.deinit();
+    try std.testing.expectError(ParseError.UnexpectedEof, p.parse());
+}
+
+test "parse SELECT without FROM" {
+    var p = Parser.init(std.testing.allocator, "SELECT *");
+    defer p.deinit();
+    try std.testing.expectError(ParseError.UnexpectedToken, p.parse());
+}
+
+test "parse INSERT missing VALUES" {
+    var p = Parser.init(std.testing.allocator, "INSERT INTO t");
+    defer p.deinit();
+    try std.testing.expectError(ParseError.UnexpectedToken, p.parse());
+}
+
+test "parse gibberish" {
+    var p = Parser.init(std.testing.allocator, "GOBBLEDYGOOK");
+    defer p.deinit();
+    try std.testing.expectError(ParseError.UnexpectedToken, p.parse());
+}
+
+test "parse SELECT with GROUP BY no aggregates" {
+    // Valid syntax — GROUP BY without aggregates is syntactically valid
+    var p = Parser.init(std.testing.allocator, "SELECT name FROM t GROUP BY name");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    try std.testing.expect(sel.group_by != null);
+    try std.testing.expectEqual(@as(usize, 1), sel.group_by.?.len);
+    try std.testing.expectEqualStrings("name", sel.group_by.?[0]);
+}
+
+test "parse CREATE TABLE single column" {
+    var p = Parser.init(std.testing.allocator, "CREATE TABLE t (id INT)");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const ct = stmt.create_table;
+    try std.testing.expectEqualStrings("t", ct.table_name);
+    try std.testing.expectEqual(@as(usize, 1), ct.columns.len);
+}
+
+test "parse DELETE without WHERE" {
+    var p = Parser.init(std.testing.allocator, "DELETE FROM users");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const del = stmt.delete;
+    try std.testing.expectEqualStrings("users", del.table_name);
+    try std.testing.expect(del.where_clause == null);
+}
+
+test "parse UPDATE without WHERE" {
+    var p = Parser.init(std.testing.allocator, "UPDATE t SET val = 42");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const upd = stmt.update;
+    try std.testing.expectEqualStrings("t", upd.table_name);
+    try std.testing.expect(upd.where_clause == null);
+    try std.testing.expectEqual(@as(usize, 1), upd.assignments.len);
+}

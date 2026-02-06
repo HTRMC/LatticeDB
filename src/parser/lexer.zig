@@ -447,3 +447,80 @@ test "lexer transaction keywords" {
     try std.testing.expectEqual(TokenType.semicolon, lexer.nextToken().type);
     try std.testing.expectEqual(TokenType.eof, lexer.nextToken().type);
 }
+
+test "lexer unterminated string" {
+    var lexer = Lexer.init("'hello");
+    const tok = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.invalid, tok.type);
+}
+
+test "lexer escaped quotes in string" {
+    var lexer = Lexer.init("'it''s a test'");
+    const tok = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.string_literal, tok.type);
+    // Text includes the escaped quote as raw ''
+    try std.testing.expectEqualStrings("it''s a test", tok.text);
+}
+
+test "lexer underscore identifier" {
+    var lexer = Lexer.init("_col_name _123");
+    const t1 = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.identifier, t1.type);
+    try std.testing.expectEqualStrings("_col_name", t1.text);
+
+    const t2 = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.identifier, t2.type);
+    try std.testing.expectEqualStrings("_123", t2.text);
+}
+
+test "lexer empty input" {
+    var lexer = Lexer.init("");
+    const tok = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.eof, tok.type);
+}
+
+test "lexer whitespace only" {
+    var lexer = Lexer.init("   \t\n  ");
+    const tok = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.eof, tok.type);
+}
+
+test "lexer unknown character" {
+    var lexer = Lexer.init("@");
+    const tok = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.invalid, tok.type);
+}
+
+test "lexer bang without equals" {
+    var lexer = Lexer.init("! 42");
+    const t1 = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.invalid, t1.type);
+    try std.testing.expectEqualStrings("!", t1.text);
+
+    // Should still parse the 42
+    const t2 = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.integer_literal, t2.type);
+}
+
+test "lexer dot operator" {
+    var lexer = Lexer.init("users.id");
+    const t1 = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.identifier, t1.type);
+    try std.testing.expectEqualStrings("users", t1.text);
+
+    const t2 = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.dot, t2.type);
+
+    const t3 = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.identifier, t3.type);
+    try std.testing.expectEqualStrings("id", t3.text);
+}
+
+test "lexer negative number as minus then integer" {
+    var lexer = Lexer.init("-42");
+    const t1 = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.op_minus, t1.type);
+    const t2 = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.integer_literal, t2.type);
+    try std.testing.expectEqualStrings("42", t2.text);
+}

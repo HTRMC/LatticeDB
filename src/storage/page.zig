@@ -363,3 +363,98 @@ test "page updateTupleData" {
     // Invalid slot should fail
     try std.testing.expect(!pg.updateTupleData(99, 0, &new_xmax));
 }
+
+test "page insert zero-length tuple" {
+    var data: [PAGE_SIZE]u8 align(8) = undefined;
+    var page = Page.init(&data, 1);
+
+    const slot = page.insertTuple(&.{});
+    // Zero-length tuple gets a slot, but getTuple returns null (length == 0 means empty)
+    try std.testing.expect(slot != null);
+    try std.testing.expect(page.getTuple(slot.?) == null);
+}
+
+test "page delete invalid slot_id" {
+    var data: [PAGE_SIZE]u8 align(8) = undefined;
+    var page = Page.init(&data, 1);
+
+    // Deleting from empty page (slot_count = 0) should return false
+    try std.testing.expect(!page.deleteTuple(0));
+    try std.testing.expect(!page.deleteTuple(100));
+
+    // Insert one, then try deleting out-of-bounds
+    _ = page.insertTuple("test") orelse unreachable;
+    try std.testing.expect(!page.deleteTuple(1)); // only slot 0 exists
+    try std.testing.expect(page.deleteTuple(0)); // this one should work
+}
+
+test "page iterator skips deleted slots" {
+    var data: [PAGE_SIZE]u8 align(8) = undefined;
+    var page = Page.init(&data, 1);
+
+    _ = page.insertTuple("zero") orelse unreachable;
+    _ = page.insertTuple("one") orelse unreachable;
+    _ = page.insertTuple("two") orelse unreachable;
+    _ = page.insertTuple("three") orelse unreachable;
+    _ = page.insertTuple("four") orelse unreachable;
+
+    // Delete slots 1 and 3
+    try std.testing.expect(page.deleteTuple(1));
+    try std.testing.expect(page.deleteTuple(3));
+
+    // Iterator should return only 0, 2, 4
+    var iter = page.tupleIterator();
+    var count: usize = 0;
+    var slot_ids: [5]SlotId = undefined;
+    while (iter.next()) |entry| {
+        slot_ids[count] = entry.slot_id;
+        count += 1;
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqual(@as(SlotId, 0), slot_ids[0]);
+    try std.testing.expectEqual(@as(SlotId, 2), slot_ids[1]);
+    try std.testing.expectEqual(@as(SlotId, 4), slot_ids[2]);
+}
+
+test "page getTuple on non-existent slot returns null" {
+    var data: [PAGE_SIZE]u8 align(8) = undefined;
+    const page = Page.init(&data, 1);
+
+    // No tuples at all
+    try std.testing.expect(page.getTuple(0) == null);
+    try std.testing.expect(page.getTuple(65535) == null);
+}
+
+test "page updateTupleData exact boundary write" {
+    var data: [PAGE_SIZE]u8 align(8) = undefined;
+    var pg = Page.init(&data, 1);
+
+    const original = [_]u8{ 1, 2, 3, 4 };
+    const slot_id = pg.insertTuple(&original) orelse unreachable;
+
+    // Write exactly at the end boundary (offset + data.len == slot.length)
+    const new_bytes = [_]u8{ 0xFF, 0xFF };
+    try std.testing.expect(pg.updateTupleData(slot_id, 2, &new_bytes));
+
+    const retrieved = pg.getTuple(slot_id) orelse unreachable;
+    try std.testing.expectEqual(@as(u8, 1), retrieved[0]);
+    try std.testing.expectEqual(@as(u8, 2), retrieved[1]);
+    try std.testing.expectEqual(@as(u8, 0xFF), retrieved[2]);
+    try std.testing.expectEqual(@as(u8, 0xFF), retrieved[3]);
+
+    // One byte past the end should fail
+    try std.testing.expect(!pg.updateTupleData(slot_id, 3, &new_bytes));
+}
+
+test "page double delete same slot" {
+    var data: [PAGE_SIZE]u8 align(8) = undefined;
+    var page = Page.init(&data, 1);
+
+    _ = page.insertTuple("test") orelse unreachable;
+    try std.testing.expect(page.deleteTuple(0));
+    // Second delete on already-empty slot should still return true (slot exists, just zeroed)
+    try std.testing.expect(page.deleteTuple(0));
+    // But tuple should still be null
+    try std.testing.expect(page.getTuple(0) == null);
+}
