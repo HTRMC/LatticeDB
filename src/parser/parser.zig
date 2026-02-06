@@ -105,10 +105,36 @@ pub const Parser = struct {
             where = try self.parseExpression();
         }
 
+        // Optional ORDER BY col [ASC|DESC] [, ...]
+        var order_by: ?[]const ast.OrderByClause = null;
+        if (self.current.type == .kw_order) {
+            self.advance();
+            try self.expect(.kw_by);
+
+            var order_cols: std.ArrayList(ast.OrderByClause) = .empty;
+            order_cols.append(alloc, try self.parseOrderByColumn()) catch return ParseError.OutOfMemory;
+            while (self.current.type == .comma) {
+                self.advance();
+                order_cols.append(alloc, try self.parseOrderByColumn()) catch return ParseError.OutOfMemory;
+            }
+            order_by = order_cols.toOwnedSlice(alloc) catch return ParseError.OutOfMemory;
+        }
+
+        // Optional LIMIT n
+        var limit: ?u64 = null;
+        if (self.current.type == .kw_limit) {
+            self.advance();
+            if (self.current.type != .integer_literal) return ParseError.UnexpectedToken;
+            limit = std.fmt.parseInt(u64, self.current.text, 10) catch return ParseError.InvalidSyntax;
+            self.advance();
+        }
+
         return .{
             .columns = cols.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
             .table_name = table_name,
             .where_clause = where,
+            .order_by = order_by,
+            .limit = limit,
         };
     }
 
@@ -185,6 +211,18 @@ pub const Parser = struct {
             .assignments = assignments.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
             .where_clause = where,
         };
+    }
+
+    fn parseOrderByColumn(self: *Self) ParseError!ast.OrderByClause {
+        const column = try self.expectIdentifier();
+        var ascending = true;
+        if (self.current.type == .kw_asc) {
+            self.advance();
+        } else if (self.current.type == .kw_desc) {
+            ascending = false;
+            self.advance();
+        }
+        return .{ .column = column, .ascending = ascending };
     }
 
     fn parseSetClause(self: *Self) ParseError!ast.SetClause {
@@ -542,6 +580,33 @@ test "parse DELETE with compound WHERE" {
     try std.testing.expectEqual(ast.CompOp.eq, right.comparison.op);
     try std.testing.expectEqualStrings("name", right.comparison.left.column_ref);
     try std.testing.expectEqualStrings("bob", right.comparison.right.literal.string);
+}
+
+test "parse SELECT with ORDER BY and LIMIT" {
+    {
+        var p = Parser.init(std.testing.allocator, "SELECT * FROM users ORDER BY name DESC LIMIT 10");
+        defer p.deinit();
+        const stmt = try p.parse();
+        const sel = stmt.select;
+        try std.testing.expectEqualStrings("users", sel.table_name);
+        const ob = sel.order_by.?;
+        try std.testing.expectEqual(@as(usize, 1), ob.len);
+        try std.testing.expectEqualStrings("name", ob[0].column);
+        try std.testing.expect(!ob[0].ascending);
+        try std.testing.expectEqual(@as(u64, 10), sel.limit.?);
+    }
+    {
+        // ORDER BY multiple columns, default ASC
+        var p = Parser.init(std.testing.allocator, "SELECT id, name FROM t ORDER BY id, name ASC");
+        defer p.deinit();
+        const stmt = try p.parse();
+        const sel = stmt.select;
+        const ob = sel.order_by.?;
+        try std.testing.expectEqual(@as(usize, 2), ob.len);
+        try std.testing.expect(ob[0].ascending);
+        try std.testing.expect(ob[1].ascending);
+        try std.testing.expect(sel.limit == null);
+    }
 }
 
 test "parse UPDATE" {

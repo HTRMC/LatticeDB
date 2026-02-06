@@ -23,6 +23,13 @@ pub const TokenType = enum {
     kw_primary,
     kw_key,
 
+    // Query modifiers
+    kw_order,
+    kw_by,
+    kw_asc,
+    kw_desc,
+    kw_limit,
+
     // Transaction keywords
     kw_begin,
     kw_commit,
@@ -93,6 +100,11 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "false", .kw_false },
     .{ "primary", .kw_primary },
     .{ "key", .kw_key },
+    .{ "order", .kw_order },
+    .{ "by", .kw_by },
+    .{ "asc", .kw_asc },
+    .{ "desc", .kw_desc },
+    .{ "limit", .kw_limit },
     .{ "begin", .kw_begin },
     .{ "commit", .kw_commit },
     .{ "rollback", .kw_rollback },

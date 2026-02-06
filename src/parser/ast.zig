@@ -98,10 +98,17 @@ pub const Insert = struct {
     values: []const LiteralValue,
 };
 
+pub const OrderByClause = struct {
+    column: []const u8,
+    ascending: bool, // true = ASC (default), false = DESC
+};
+
 pub const Select = struct {
     columns: []const SelectColumn,
     table_name: []const u8,
     where_clause: ?*const Expression,
+    order_by: ?[]const OrderByClause,
+    limit: ?u64,
 };
 
 pub const Delete = struct {

@@ -414,6 +414,59 @@ pub const Executor = struct {
 
         self.commitImplicitTxn(txn);
 
+        // ORDER BY: sort result rows
+        if (sel.order_by) |order_clauses| {
+            // Resolve ORDER BY column indices within the selected columns
+            const order_indices = self.allocator.alloc(usize, order_clauses.len) catch {
+                for (col_names) |cn| self.allocator.free(cn);
+                self.allocator.free(col_names);
+                return ExecError.OutOfMemory;
+            };
+            defer self.allocator.free(order_indices);
+
+            for (order_clauses, 0..) |oc, oi| {
+                var found = false;
+                for (col_names, 0..) |cn, ci| {
+                    if (std.ascii.eqlIgnoreCase(cn, oc.column)) {
+                        order_indices[oi] = ci;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    for (col_names) |cn| self.allocator.free(cn);
+                    self.allocator.free(col_names);
+                    return ExecError.ColumnNotFound;
+                }
+            }
+
+            // Insertion sort on result rows
+            const items = rows.items;
+            var si: usize = 1;
+            while (si < items.len) : (si += 1) {
+                var j = si;
+                while (j > 0) {
+                    if (orderCompareRows(items[j - 1], items[j], order_clauses, order_indices) == .gt) {
+                        const tmp = items[j];
+                        items[j] = items[j - 1];
+                        items[j - 1] = tmp;
+                        j -= 1;
+                    } else break;
+                }
+            }
+        }
+
+        // LIMIT: truncate
+        if (sel.limit) |limit_val| {
+            const limit: usize = @intCast(@min(limit_val, rows.items.len));
+            // Free excess rows
+            for (rows.items[limit..]) |row| {
+                for (row.values) |v| self.allocator.free(v);
+                self.allocator.free(row.values);
+            }
+            rows.shrinkRetainingCapacity(limit);
+        }
+
         return .{ .rows = .{
             .columns = col_names,
             .rows = rows.toOwnedSlice(self.allocator) catch {
@@ -422,6 +475,32 @@ pub const Executor = struct {
                 return ExecError.OutOfMemory;
             },
         } };
+    }
+
+    fn orderCompareRows(
+        a: ResultRow,
+        b: ResultRow,
+        clauses: []const ast.OrderByClause,
+        indices: []const usize,
+    ) std.math.Order {
+        for (clauses, indices) |clause, ci| {
+            const cmp = std.mem.order(u8, a.values[ci], b.values[ci]);
+            if (cmp != .eq) {
+                // Try numeric comparison first
+                const a_num = std.fmt.parseFloat(f64, a.values[ci]) catch {
+                    return if (clause.ascending) cmp else cmp.invert();
+                };
+                const b_num = std.fmt.parseFloat(f64, b.values[ci]) catch {
+                    return if (clause.ascending) cmp else cmp.invert();
+                };
+                const num_cmp = std.math.order(a_num, b_num);
+                if (num_cmp != .eq) {
+                    return if (clause.ascending) num_cmp else num_cmp.invert();
+                }
+                return if (clause.ascending) cmp else cmp.invert();
+            }
+        }
+        return .eq;
     }
 
     // ============================================================
@@ -1215,4 +1294,97 @@ test "executor UPDATE rollback" {
     defer exec.freeResult(sel);
     try std.testing.expectEqual(@as(usize, 1), sel.rows.rows.len);
     try std.testing.expectEqualStrings("original", sel.rows.rows[0].values[0]);
+}
+
+test "executor ORDER BY" {
+    const test_file = "test_exec_orderby.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+
+    const r1 = try exec.execute("INSERT INTO t VALUES (3, 'Charlie')");
+    exec.freeResult(r1);
+    const r2 = try exec.execute("INSERT INTO t VALUES (1, 'Alice')");
+    exec.freeResult(r2);
+    const r3 = try exec.execute("INSERT INTO t VALUES (2, 'Bob')");
+    exec.freeResult(r3);
+
+    // ORDER BY id ASC
+    const sel = try exec.execute("SELECT * FROM t ORDER BY id");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 3), sel.rows.rows.len);
+    try std.testing.expectEqualStrings("1", sel.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("2", sel.rows.rows[1].values[0]);
+    try std.testing.expectEqualStrings("3", sel.rows.rows[2].values[0]);
+
+    // ORDER BY id DESC
+    const sel2 = try exec.execute("SELECT * FROM t ORDER BY id DESC");
+    defer exec.freeResult(sel2);
+    try std.testing.expectEqualStrings("3", sel2.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("2", sel2.rows.rows[1].values[0]);
+    try std.testing.expectEqualStrings("1", sel2.rows.rows[2].values[0]);
+
+    // ORDER BY name ASC
+    const sel3 = try exec.execute("SELECT * FROM t ORDER BY name");
+    defer exec.freeResult(sel3);
+    try std.testing.expectEqualStrings("Alice", sel3.rows.rows[0].values[1]);
+    try std.testing.expectEqualStrings("Bob", sel3.rows.rows[1].values[1]);
+    try std.testing.expectEqualStrings("Charlie", sel3.rows.rows[2].values[1]);
+}
+
+test "executor LIMIT" {
+    const test_file = "test_exec_limit.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    var idx: usize = 0;
+    while (idx < 5) : (idx += 1) {
+        const sql = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d})", .{idx + 1}) catch unreachable;
+        defer std.testing.allocator.free(sql);
+        const r = try exec.execute(sql);
+        exec.freeResult(r);
+    }
+
+    // LIMIT 3
+    const sel = try exec.execute("SELECT * FROM t LIMIT 3");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 3), sel.rows.rows.len);
+
+    // ORDER BY + LIMIT
+    const sel2 = try exec.execute("SELECT * FROM t ORDER BY id DESC LIMIT 2");
+    defer exec.freeResult(sel2);
+    try std.testing.expectEqual(@as(usize, 2), sel2.rows.rows.len);
+    try std.testing.expectEqualStrings("5", sel2.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("4", sel2.rows.rows[1].values[0]);
 }
