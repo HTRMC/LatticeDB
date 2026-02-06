@@ -188,6 +188,19 @@ pub const Page = struct {
         return self.data[slot.offset..][0..slot.length];
     }
 
+    /// Update bytes within an existing tuple at the given offset.
+    /// Used for in-place modifications like setting xmax in MVCC headers.
+    /// Returns false if the slot is invalid or the write would exceed tuple bounds.
+    pub fn updateTupleData(self: *Self, slot_id: SlotId, offset: u16, data: []const u8) bool {
+        const slot = self.getSlot(slot_id) orelse return false;
+        if (slot.isEmpty()) return false;
+        if (offset + data.len > slot.length) return false;
+
+        const dest_start = slot.offset + offset;
+        @memcpy(self.data[dest_start..][0..data.len], data);
+        return true;
+    }
+
     /// Delete a tuple by slot ID (marks slot as empty, doesn't reclaim space yet)
     pub fn deleteTuple(self: *Self, slot_id: SlotId) bool {
         const header = self.getHeader();
@@ -322,4 +335,31 @@ test "page full detection" {
     // Should have inserted some but eventually failed
     try std.testing.expect(count > 0);
     try std.testing.expect(count < 20); // Can't fit too many 512-byte tuples in 8KB
+}
+
+test "page updateTupleData" {
+    var data: [PAGE_SIZE]u8 align(8) = undefined;
+    var pg = Page.init(&data, 1);
+
+    // Insert a tuple with known content
+    const original = [_]u8{ 0x00, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xDD };
+    const slot_id = pg.insertTuple(&original) orelse unreachable;
+
+    // Update the first 4 bytes (simulating setting xmax in a TupleHeader)
+    const new_xmax = [_]u8{ 0x05, 0x00, 0x00, 0x00 };
+    try std.testing.expect(pg.updateTupleData(slot_id, 0, &new_xmax));
+
+    // Verify the update
+    const retrieved = pg.getTuple(slot_id) orelse unreachable;
+    try std.testing.expectEqual(@as(u8, 0x05), retrieved[0]);
+    try std.testing.expectEqual(@as(u8, 0x00), retrieved[1]);
+    // Original bytes after offset 4 should be unchanged
+    try std.testing.expectEqual(@as(u8, 0xAA), retrieved[4]);
+    try std.testing.expectEqual(@as(u8, 0xDD), retrieved[7]);
+
+    // Out-of-bounds update should fail
+    try std.testing.expect(!pg.updateTupleData(slot_id, 6, &new_xmax));
+
+    // Invalid slot should fail
+    try std.testing.expect(!pg.updateTupleData(99, 0, &new_xmax));
 }

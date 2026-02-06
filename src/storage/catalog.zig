@@ -99,7 +99,7 @@ pub const Catalog = struct {
             .{ .bytes = "gp_tables" },
             .{ .integer = @intCast(tables_schema.columns.len) },
         };
-        _ = tables_table.insertTuple(&tables_vals) catch {
+        _ = tables_table.insertTuple(null, &tables_vals) catch {
             return CatalogError.StorageError;
         };
 
@@ -108,7 +108,7 @@ pub const Catalog = struct {
             .{ .bytes = "gp_columns" },
             .{ .integer = @intCast(columns_schema.columns.len) },
         };
-        _ = tables_table.insertTuple(&columns_vals) catch {
+        _ = tables_table.insertTuple(null, &columns_vals) catch {
             return CatalogError.StorageError;
         };
 
@@ -215,7 +215,7 @@ pub const Catalog = struct {
             .{ .bytes = name },
             .{ .integer = @intCast(columns.len) },
         };
-        _ = self.tables_table.insertTuple(&table_vals) catch {
+        _ = self.tables_table.insertTuple(null, &table_vals) catch {
             return CatalogError.StorageError;
         };
 
@@ -229,7 +229,7 @@ pub const Catalog = struct {
                 .{ .integer = @intCast(col.max_length) },
                 .{ .integer = if (col.nullable) @as(i32, 1) else @as(i32, 0) },
             };
-            _ = self.columns_table.insertTuple(&col_vals) catch {
+            _ = self.columns_table.insertTuple(null, &col_vals) catch {
                 return CatalogError.StorageError;
             };
         }
@@ -541,10 +541,10 @@ test "catalog open table and use it" {
 
     // Insert a row
     const vals = [_]Value{ .{ .integer = 1 }, .{ .bytes = "Widget" } };
-    const tid = table.insertTuple(&vals) catch unreachable;
+    const tid = table.insertTuple(null, &vals) catch unreachable;
 
     // Read it back
-    const row = (table.getTuple(tid) catch unreachable).?;
+    const row = (table.getTuple(tid, null) catch unreachable).?;
     defer std.testing.allocator.free(row);
 
     try std.testing.expectEqual(@as(i32, 1), row[0].integer);

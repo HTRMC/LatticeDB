@@ -50,6 +50,18 @@ pub const Parser = struct {
             .kw_delete => ast.Statement{ .delete = try self.parseDelete() },
             .kw_create => ast.Statement{ .create_table = try self.parseCreateTable() },
             .kw_drop => ast.Statement{ .drop_table = try self.parseDropTable() },
+            .kw_begin => blk: {
+                self.advance();
+                break :blk ast.Statement{ .begin_txn = {} };
+            },
+            .kw_commit => blk: {
+                self.advance();
+                break :blk ast.Statement{ .commit_txn = {} };
+            },
+            .kw_rollback => blk: {
+                self.advance();
+                break :blk ast.Statement{ .rollback_txn = {} };
+            },
             .eof => return ParseError.UnexpectedEof,
             else => return ParseError.UnexpectedToken,
         };
@@ -493,4 +505,25 @@ test "parse DELETE with compound WHERE" {
     try std.testing.expectEqual(ast.CompOp.eq, right.comparison.op);
     try std.testing.expectEqualStrings("name", right.comparison.left.column_ref);
     try std.testing.expectEqualStrings("bob", right.comparison.right.literal.string);
+}
+
+test "parse BEGIN, COMMIT, ROLLBACK" {
+    {
+        var p = Parser.init(std.testing.allocator, "BEGIN;");
+        defer p.deinit();
+        const stmt = try p.parse();
+        try std.testing.expect(stmt == .begin_txn);
+    }
+    {
+        var p = Parser.init(std.testing.allocator, "COMMIT");
+        defer p.deinit();
+        const stmt = try p.parse();
+        try std.testing.expect(stmt == .commit_txn);
+    }
+    {
+        var p = Parser.init(std.testing.allocator, "rollback;");
+        defer p.deinit();
+        const stmt = try p.parse();
+        try std.testing.expect(stmt == .rollback_txn);
+    }
 }

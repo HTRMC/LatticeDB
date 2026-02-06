@@ -1,4 +1,7 @@
 const std = @import("std");
+const mvcc = @import("mvcc.zig");
+
+const TupleHeader = mvcc.TupleHeader;
 
 /// Supported column data types
 pub const ColumnType = enum(u8) {
@@ -257,6 +260,35 @@ pub const Tuple = struct {
 
         return size;
     }
+
+    /// Serialize a row with a TupleHeader prepended.
+    /// On-disk format: [TupleHeader 16B][null_bitmap][col_data...]
+    pub fn serializeWithHeader(header: TupleHeader, schema: *const Schema, values: []const Value, buf: []u8) !usize {
+        if (buf.len < TupleHeader.SIZE) return error.BufferTooSmall;
+
+        // Write TupleHeader
+        @memcpy(buf[0..TupleHeader.SIZE], std.mem.asBytes(&header));
+
+        // Serialize user data after the header
+        const user_written = try serialize(schema, values, buf[TupleHeader.SIZE..]);
+
+        return TupleHeader.SIZE + user_written;
+    }
+
+    /// Strip the TupleHeader from raw tuple data, returning the header and user data portion.
+    pub fn stripHeader(data: []const u8) !struct { header: TupleHeader, user_data: []const u8 } {
+        if (data.len < TupleHeader.SIZE) return error.BufferTooSmall;
+
+        return .{
+            .header = std.mem.bytesToValue(TupleHeader, data[0..TupleHeader.SIZE]),
+            .user_data = data[TupleHeader.SIZE..],
+        };
+    }
+
+    /// Calculate the serialized size including the TupleHeader.
+    pub fn serializedSizeWithHeader(schema: *const Schema, values: []const Value) !usize {
+        return TupleHeader.SIZE + try serializedSize(schema, values);
+    }
 };
 
 // Tests
@@ -385,4 +417,58 @@ test "schema find column" {
     try std.testing.expectEqual(@as(?usize, 2), schema.findColumn("email"));
     try std.testing.expectEqual(@as(?usize, null), schema.findColumn("missing"));
     try std.testing.expectEqual(@as(usize, 3), schema.columnCount());
+}
+
+test "serializeWithHeader and stripHeader" {
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+            .{ .name = "name", .col_type = .varchar, .max_length = 255, .nullable = false },
+        },
+    };
+
+    const values = [_]Value{
+        .{ .integer = 42 },
+        .{ .bytes = "Alice" },
+    };
+
+    const header = TupleHeader.init(7);
+
+    var buf: [256]u8 = undefined;
+    const written = try Tuple.serializeWithHeader(header, &schema, &values, &buf);
+
+    // Should be 16 (header) + 1 (bitmap) + 4 (int) + 2 (len) + 5 (data) = 28
+    try std.testing.expectEqual(@as(usize, 28), written);
+
+    // Strip and verify
+    const stripped = try Tuple.stripHeader(buf[0..written]);
+    try std.testing.expectEqual(@as(u32, 7), stripped.header.xmin);
+    try std.testing.expectEqual(@as(u32, 0), stripped.header.xmax);
+    try std.testing.expect(stripped.header.isLive());
+
+    // Deserialize user data
+    const result = try Tuple.deserialize(std.testing.allocator, &schema, stripped.user_data);
+    defer std.testing.allocator.free(result);
+
+    try std.testing.expectEqual(@as(i32, 42), result[0].integer);
+    try std.testing.expectEqualStrings("Alice", result[1].bytes);
+}
+
+test "serializedSizeWithHeader" {
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "a", .col_type = .integer, .max_length = 0, .nullable = false },
+        },
+    };
+
+    const values = [_]Value{.{ .integer = 1 }};
+
+    const size = try Tuple.serializedSizeWithHeader(&schema, &values);
+    // 16 (header) + 1 (bitmap) + 4 (int) = 21
+    try std.testing.expectEqual(@as(usize, 21), size);
+}
+
+test "stripHeader too small buffer" {
+    const small = [_]u8{ 0, 1, 2 };
+    try std.testing.expectError(error.BufferTooSmall, Tuple.stripHeader(&small));
 }

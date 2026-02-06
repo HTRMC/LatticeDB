@@ -3,13 +3,13 @@ const msquic = @import("msquic.zig");
 const protocol = @import("protocol.zig");
 const executor_mod = @import("../executor/executor.zig");
 const catalog_mod = @import("../storage/catalog.zig");
-const disk_manager_mod = @import("../storage/disk_manager.zig");
-const buffer_pool_mod = @import("../storage/buffer_pool.zig");
+const mvcc_mod = @import("../storage/mvcc.zig");
+const undo_log_mod = @import("../storage/undo_log.zig");
 
 const Executor = executor_mod.Executor;
 const Catalog = catalog_mod.Catalog;
-const DiskManager = disk_manager_mod.DiskManager;
-const BufferPool = buffer_pool_mod.BufferPool;
+const TransactionManager = mvcc_mod.TransactionManager;
+const UndoLog = undo_log_mod.UndoLog;
 
 const ALPN = "graphenedb";
 
@@ -20,8 +20,10 @@ pub const Server = struct {
     configuration: msquic.HQUIC,
     listener: msquic.HQUIC,
 
-    // Database engine (shared across connections)
-    executor: *Executor,
+    // Shared database components (each connection gets its own Executor)
+    catalog: *Catalog,
+    txn_manager: ?*TransactionManager,
+    undo_log: ?*UndoLog,
     exec_mutex: std.Thread.Mutex,
 
     pub const TlsCert = union(enum) {
@@ -33,7 +35,9 @@ pub const Server = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        executor: *Executor,
+        catalog: *Catalog,
+        txn_manager: ?*TransactionManager,
+        undo_log: ?*UndoLog,
         tls_cert: TlsCert,
     ) !Server {
         // Open msquic API
@@ -129,7 +133,9 @@ pub const Server = struct {
             .registration = registration,
             .configuration = configuration,
             .listener = null,
-            .executor = executor,
+            .catalog = catalog,
+            .txn_manager = txn_manager,
+            .undo_log = undo_log,
             .exec_mutex = .{},
         };
     }
@@ -172,15 +178,15 @@ pub const Server = struct {
         msquic.MsQuicClose(self.api);
     }
 
-    /// Execute a query through the shared executor (thread-safe)
-    fn executeQuery(self: *Server, sql: []const u8) ![]u8 {
+    /// Execute a query through a connection's executor (thread-safe)
+    fn executeQuery(self: *Server, conn_ctx: *ConnectionContext, sql: []const u8) ![]u8 {
         self.exec_mutex.lock();
         defer self.exec_mutex.unlock();
 
-        const result = self.executor.execute(sql) catch |err| {
+        const result = conn_ctx.executor.execute(sql) catch |err| {
             return protocol.makeError(@errorName(err), self.allocator);
         };
-        defer self.executor.freeResult(result);
+        defer conn_ctx.executor.freeResult(result);
 
         return switch (result) {
             .message => |msg| protocol.makeOkMessage(msg, self.allocator),
@@ -212,13 +218,21 @@ pub const Server = struct {
         switch (event.event_type) {
             .new_connection => {
                 const conn = event.payload.new_connection.connection;
+
+                // Each connection gets its own executor (own transaction state)
+                const conn_ctx = self.allocator.create(ConnectionContext) catch {
+                    return @bitCast(@as(u32, 0x80004005)); // E_FAIL
+                };
+                conn_ctx.* = ConnectionContext.init(self);
+
                 self.api.set_callback_handler(
                     conn,
                     @constCast(@ptrCast(&connectionCallback)),
-                    @ptrCast(self),
+                    @ptrCast(conn_ctx),
                 );
                 const status = self.api.connection_set_configuration(conn, self.configuration);
                 if (!msquic.statusSucceeded(status)) {
+                    self.allocator.destroy(conn_ctx);
                     return status;
                 }
             },
@@ -232,7 +246,8 @@ pub const Server = struct {
         context: ?*anyopaque,
         event: *msquic.QUIC_CONNECTION_EVENT,
     ) callconv(.c) msquic.QUIC_STATUS {
-        const self: *Server = @ptrCast(@alignCast(context));
+        const conn_ctx: *ConnectionContext = @ptrCast(@alignCast(context));
+        const self = conn_ctx.server;
 
         switch (event.event_type) {
             .connected => {
@@ -245,7 +260,7 @@ pub const Server = struct {
                 const stream_ctx = self.allocator.create(StreamContext) catch {
                     return @bitCast(@as(u32, 0x80004005)); // E_FAIL
                 };
-                stream_ctx.* = StreamContext.init(self);
+                stream_ctx.* = StreamContext.init(conn_ctx);
 
                 self.api.set_callback_handler(
                     stream,
@@ -254,6 +269,12 @@ pub const Server = struct {
                 );
             },
             .shutdown_complete => {
+                // Auto-rollback any open transaction on disconnect
+                self.exec_mutex.lock();
+                conn_ctx.executor.abortCurrentTxn();
+                self.exec_mutex.unlock();
+
+                self.allocator.destroy(conn_ctx);
                 self.api.connection_close(connection);
             },
             else => {},
@@ -267,7 +288,8 @@ pub const Server = struct {
         event: *msquic.QUIC_STREAM_EVENT,
     ) callconv(.c) msquic.QUIC_STATUS {
         const stream_ctx: *StreamContext = @ptrCast(@alignCast(context));
-        const self = stream_ctx.server;
+        const conn_ctx = stream_ctx.conn_ctx;
+        const self = conn_ctx.server;
 
         switch (event.event_type) {
             .receive => {
@@ -284,7 +306,7 @@ pub const Server = struct {
             .peer_send_shutdown => {
                 // Client finished sending — process the request
                 const data = stream_ctx.recv_buf.items;
-                const response = self.processMessage(data) catch {
+                const response = self.processMessage(conn_ctx, data) catch {
                     const err_resp = protocol.makeError("InternalError", self.allocator) catch {
                         return @bitCast(@as(u32, 0x80004005));
                     };
@@ -319,27 +341,47 @@ pub const Server = struct {
         );
     }
 
-    fn processMessage(self: *Server, data: []const u8) ![]u8 {
+    fn processMessage(self: *Server, conn_ctx: *ConnectionContext, data: []const u8) ![]u8 {
         const decoded = protocol.decode(data) catch {
             return protocol.makeError("InvalidMessage", self.allocator);
         };
 
         return switch (decoded.msg.msg_type) {
-            .query => self.executeQuery(decoded.msg.payload),
+            .query => self.executeQuery(conn_ctx, decoded.msg.payload),
             .disconnect => protocol.makeOkMessage("Goodbye", self.allocator),
             else => protocol.makeError("UnexpectedMessageType", self.allocator),
         };
     }
 };
 
-const StreamContext = struct {
+/// Per-connection context — each connection gets its own Executor
+/// with independent transaction state, sharing the server's catalog,
+/// transaction manager, and undo log.
+const ConnectionContext = struct {
     server: *Server,
+    executor: Executor,
+
+    fn init(server: *Server) ConnectionContext {
+        return .{
+            .server = server,
+            .executor = Executor.initWithMvcc(
+                server.allocator,
+                server.catalog,
+                server.txn_manager,
+                server.undo_log,
+            ),
+        };
+    }
+};
+
+const StreamContext = struct {
+    conn_ctx: *ConnectionContext,
     recv_buf: std.ArrayListUnmanaged(u8),
     send_buf: ?[]u8,
 
-    fn init(server: *Server) StreamContext {
+    fn init(conn_ctx: *ConnectionContext) StreamContext {
         return .{
-            .server = server,
+            .conn_ctx = conn_ctx,
             .recv_buf = .empty,
             .send_buf = null,
         };

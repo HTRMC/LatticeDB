@@ -23,6 +23,11 @@ pub const TokenType = enum {
     kw_primary,
     kw_key,
 
+    // Transaction keywords
+    kw_begin,
+    kw_commit,
+    kw_rollback,
+
     // Data types
     kw_int,
     kw_integer,
@@ -88,6 +93,9 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "false", .kw_false },
     .{ "primary", .kw_primary },
     .{ "key", .kw_key },
+    .{ "begin", .kw_begin },
+    .{ "commit", .kw_commit },
+    .{ "rollback", .kw_rollback },
     .{ "int", .kw_int },
     .{ "integer", .kw_integer },
     .{ "bigint", .kw_bigint },
@@ -381,4 +389,16 @@ test "lexer case insensitive keywords" {
     try std.testing.expectEqual(TokenType.kw_select, lexer.nextToken().type);
     try std.testing.expectEqual(TokenType.kw_from, lexer.nextToken().type);
     try std.testing.expectEqual(TokenType.kw_where, lexer.nextToken().type);
+}
+
+test "lexer transaction keywords" {
+    var lexer = Lexer.init("BEGIN; COMMIT; ROLLBACK;");
+
+    try std.testing.expectEqual(TokenType.kw_begin, lexer.nextToken().type);
+    try std.testing.expectEqual(TokenType.semicolon, lexer.nextToken().type);
+    try std.testing.expectEqual(TokenType.kw_commit, lexer.nextToken().type);
+    try std.testing.expectEqual(TokenType.semicolon, lexer.nextToken().type);
+    try std.testing.expectEqual(TokenType.kw_rollback, lexer.nextToken().type);
+    try std.testing.expectEqual(TokenType.semicolon, lexer.nextToken().type);
+    try std.testing.expectEqual(TokenType.eof, lexer.nextToken().type);
 }

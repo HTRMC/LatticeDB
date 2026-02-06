@@ -5,6 +5,8 @@ const tuple_mod = @import("../storage/tuple.zig");
 const catalog_mod = @import("../storage/catalog.zig");
 const table_mod = @import("../storage/table.zig");
 const page_mod = @import("../storage/page.zig");
+const mvcc_mod = @import("../storage/mvcc.zig");
+const undo_log_mod = @import("../storage/undo_log.zig");
 
 const Value = tuple_mod.Value;
 const Column = tuple_mod.Column;
@@ -14,6 +16,9 @@ const Catalog = catalog_mod.Catalog;
 const Table = table_mod.Table;
 const PageId = page_mod.PageId;
 const Parser = parser_mod.Parser;
+const TransactionManager = mvcc_mod.TransactionManager;
+const Transaction = mvcc_mod.Transaction;
+const UndoLog = undo_log_mod.UndoLog;
 
 pub const ExecError = error{
     ParseError,
@@ -24,6 +29,7 @@ pub const ExecError = error{
     ColumnNotFound,
     StorageError,
     OutOfMemory,
+    TransactionError,
 };
 
 /// A result row — an array of string-formatted values
@@ -47,13 +53,31 @@ pub const ExecResult = union(enum) {
 pub const Executor = struct {
     allocator: std.mem.Allocator,
     catalog: *Catalog,
+    /// Transaction manager (null = legacy mode, no MVCC)
+    txn_manager: ?*TransactionManager,
+    /// Undo log (null = legacy mode)
+    undo_log: ?*UndoLog,
+    /// Current explicit transaction (null = auto-commit mode)
+    current_txn: ?*Transaction,
 
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, catalog: *Catalog) Self {
+        return initWithMvcc(allocator, catalog, null, null);
+    }
+
+    pub fn initWithMvcc(
+        allocator: std.mem.Allocator,
+        catalog: *Catalog,
+        txn_manager: ?*TransactionManager,
+        undo_log: ?*UndoLog,
+    ) Self {
         return .{
             .allocator = allocator,
             .catalog = catalog,
+            .txn_manager = txn_manager,
+            .undo_log = undo_log,
+            .current_txn = null,
         };
     }
 
@@ -72,6 +96,9 @@ pub const Executor = struct {
             .select => |sel| self.execSelect(sel),
             .delete => |del| self.execDelete(del),
             .drop_table => ExecError.StorageError, // TODO
+            .begin_txn => self.execBegin(),
+            .commit_txn => self.execCommit(),
+            .rollback_txn => self.execRollback(),
         };
     }
 
@@ -94,6 +121,124 @@ pub const Executor = struct {
                 self.allocator.free(r.columns);
             },
         }
+    }
+
+    // ============================================================
+    // Transaction control
+    // ============================================================
+
+    /// Abort the current transaction without returning a result.
+    /// Used for connection cleanup (e.g., client disconnect with open txn).
+    pub fn abortCurrentTxn(self: *Self) void {
+        const txn = self.current_txn orelse return;
+        if (self.undo_log) |undo| {
+            self.rollbackFromUndoLog(txn, undo) catch {};
+        }
+        if (self.txn_manager) |tm| {
+            tm.abort(txn);
+        }
+        self.current_txn = null;
+    }
+
+    fn execBegin(self: *Self) ExecError!ExecResult {
+        if (self.current_txn != null) {
+            return ExecError.TransactionError; // Already in a transaction
+        }
+        const tm = self.txn_manager orelse return ExecError.TransactionError;
+        self.current_txn = tm.begin() catch return ExecError.TransactionError;
+        const msg = std.fmt.allocPrint(self.allocator, "BEGIN", .{}) catch {
+            return ExecError.OutOfMemory;
+        };
+        return .{ .message = msg };
+    }
+
+    fn execCommit(self: *Self) ExecError!ExecResult {
+        const txn = self.current_txn orelse return ExecError.TransactionError;
+        const tm = self.txn_manager orelse return ExecError.TransactionError;
+        tm.commit(txn) catch return ExecError.TransactionError;
+        self.current_txn = null;
+        const msg = std.fmt.allocPrint(self.allocator, "COMMIT", .{}) catch {
+            return ExecError.OutOfMemory;
+        };
+        return .{ .message = msg };
+    }
+
+    fn execRollback(self: *Self) ExecError!ExecResult {
+        const txn = self.current_txn orelse return ExecError.TransactionError;
+        const tm = self.txn_manager orelse return ExecError.TransactionError;
+
+        // Walk undo chain and restore changes using the catalog's tables
+        // For now, we need to rollback all tables this txn touched.
+        // Since we don't track which tables were modified, we use a
+        // general-purpose rollback through the undo log directly.
+        if (self.undo_log) |undo| {
+            self.rollbackFromUndoLog(txn, undo) catch {};
+        }
+
+        tm.abort(txn);
+        self.current_txn = null;
+        const msg = std.fmt.allocPrint(self.allocator, "ROLLBACK", .{}) catch {
+            return ExecError.OutOfMemory;
+        };
+        return .{ .message = msg };
+    }
+
+    /// Walk the undo chain and apply rollback operations directly
+    fn rollbackFromUndoLog(self: *Self, txn: *Transaction, undo: *UndoLog) !void {
+        var undo_ptr = txn.undo_chain_head;
+        const buffer_pool = self.catalog.buffer_pool;
+
+        while (undo_ptr != mvcc_mod.NO_UNDO_PTR) {
+            const rec = undo.readRecord(undo_ptr) catch break;
+
+            switch (rec.header.record_type) {
+                .insert => {
+                    // Undo insert = zero the slot
+                    var pg = buffer_pool.fetchPage(rec.header.table_page_id) catch break;
+                    _ = pg.deleteTuple(rec.header.slot_id);
+                    buffer_pool.unpinPage(rec.header.table_page_id, true) catch {};
+                },
+                .delete => {
+                    // Undo delete = restore xmax to 0
+                    var pg = buffer_pool.fetchPage(rec.header.table_page_id) catch break;
+                    const zero_xmax = std.mem.asBytes(&@as(mvcc_mod.TxnId, 0));
+                    _ = pg.updateTupleData(rec.header.slot_id, 4, zero_xmax);
+                    buffer_pool.unpinPage(rec.header.table_page_id, true) catch {};
+                },
+                .update => {
+                    // Undo update = overwrite heap tuple with old data
+                    var pg = buffer_pool.fetchPage(rec.header.table_page_id) catch break;
+                    _ = pg.updateTupleData(rec.header.slot_id, 0, rec.data);
+                    buffer_pool.unpinPage(rec.header.table_page_id, true) catch {};
+                },
+            }
+
+            undo_ptr = rec.header.txn_prev_undo;
+        }
+    }
+
+    // ============================================================
+    // Auto-commit helper: wraps DML in implicit transaction if needed
+    // ============================================================
+
+    fn beginImplicitTxn(self: *Self) ?*Transaction {
+        if (self.current_txn != null) return self.current_txn;
+        const tm = self.txn_manager orelse return null;
+        return tm.begin() catch null;
+    }
+
+    fn commitImplicitTxn(self: *Self, txn: ?*Transaction) void {
+        if (txn == null) return;
+        if (self.current_txn != null) return; // Explicit transaction — don't auto-commit
+        const tm = self.txn_manager orelse return;
+        tm.commit(txn.?) catch {};
+    }
+
+    fn abortImplicitTxn(self: *Self, txn: ?*Transaction) void {
+        if (txn == null) return;
+        if (self.current_txn != null) return;
+        const tm = self.txn_manager orelse return;
+        tm.abort(txn.?);
     }
 
     // ============================================================
@@ -138,6 +283,10 @@ pub const Executor = struct {
         defer self.catalog.freeSchema(result.schema);
         var table = result.table;
 
+        // Attach MVCC components
+        table.txn_manager = self.txn_manager;
+        table.undo_log = self.undo_log;
+
         const schema = result.schema;
 
         // Check column count matches
@@ -157,10 +306,15 @@ pub const Executor = struct {
             };
         }
 
-        _ = table.insertTuple(values) catch {
+        // Use explicit txn or auto-commit
+        const txn = self.current_txn orelse self.beginImplicitTxn();
+
+        _ = table.insertTuple(txn, values) catch {
+            self.abortImplicitTxn(txn);
             return ExecError.StorageError;
         };
 
+        self.commitImplicitTxn(txn);
         return .{ .row_count = 1 };
     }
 
@@ -174,6 +328,10 @@ pub const Executor = struct {
         defer self.catalog.freeSchema(result.schema);
         var table = result.table;
 
+        // Attach MVCC components
+        table.txn_manager = self.txn_manager;
+        table.undo_log = self.undo_log;
+
         const schema = result.schema;
 
         // Determine which column indices to output
@@ -186,12 +344,14 @@ pub const Executor = struct {
         };
         for (col_indices, 0..) |ci, i| {
             col_names[i] = self.allocator.dupe(u8, schema.columns[ci].name) catch {
-                // Free already allocated
                 for (col_names[0..i]) |cn| self.allocator.free(cn);
                 self.allocator.free(col_names);
                 return ExecError.OutOfMemory;
             };
         }
+
+        // Use explicit txn or begin implicit for read
+        const txn = self.current_txn orelse self.beginImplicitTxn();
 
         // Scan and filter
         var rows: std.ArrayList(ResultRow) = .empty;
@@ -203,15 +363,17 @@ pub const Executor = struct {
             rows.deinit(self.allocator);
         }
 
-        var iter = table.scan() catch {
+        var iter = table.scanWithTxn(txn) catch {
             for (col_names) |cn| self.allocator.free(cn);
             self.allocator.free(col_names);
+            self.abortImplicitTxn(txn);
             return ExecError.StorageError;
         };
 
         while (iter.next() catch {
             for (col_names) |cn| self.allocator.free(cn);
             self.allocator.free(col_names);
+            self.abortImplicitTxn(txn);
             return ExecError.StorageError;
         }) |row| {
             defer iter.freeValues(row.values);
@@ -225,6 +387,7 @@ pub const Executor = struct {
             const formatted = self.allocator.alloc([]const u8, col_indices.len) catch {
                 for (col_names) |cn| self.allocator.free(cn);
                 self.allocator.free(col_names);
+                self.abortImplicitTxn(txn);
                 return ExecError.OutOfMemory;
             };
             for (col_indices, 0..) |ci, i| {
@@ -233,6 +396,7 @@ pub const Executor = struct {
                     self.allocator.free(formatted);
                     for (col_names) |cn| self.allocator.free(cn);
                     self.allocator.free(col_names);
+                    self.abortImplicitTxn(txn);
                     return ExecError.OutOfMemory;
                 };
             }
@@ -242,9 +406,12 @@ pub const Executor = struct {
                 self.allocator.free(formatted);
                 for (col_names) |cn| self.allocator.free(cn);
                 self.allocator.free(col_names);
+                self.abortImplicitTxn(txn);
                 return ExecError.OutOfMemory;
             };
         }
+
+        self.commitImplicitTxn(txn);
 
         return .{ .rows = .{
             .columns = col_names,
@@ -266,17 +433,28 @@ pub const Executor = struct {
         defer self.catalog.freeSchema(result.schema);
         var table = result.table;
 
+        // Attach MVCC components
+        table.txn_manager = self.txn_manager;
+        table.undo_log = self.undo_log;
+
         const schema = result.schema;
+
+        // Use explicit txn or auto-commit
+        const txn = self.current_txn orelse self.beginImplicitTxn();
 
         // Collect TIDs to delete (can't delete while scanning)
         var to_delete: std.ArrayList(page_mod.TupleId) = .empty;
         defer to_delete.deinit(self.allocator);
 
-        var iter = table.scan() catch {
+        var iter = table.scanWithTxn(txn) catch {
+            self.abortImplicitTxn(txn);
             return ExecError.StorageError;
         };
 
-        while (iter.next() catch { return ExecError.StorageError; }) |row| {
+        while (iter.next() catch {
+            self.abortImplicitTxn(txn);
+            return ExecError.StorageError;
+        }) |row| {
             defer iter.freeValues(row.values);
 
             const should_delete = if (del.where_clause) |where|
@@ -286,6 +464,7 @@ pub const Executor = struct {
 
             if (should_delete) {
                 to_delete.append(self.allocator, row.tid) catch {
+                    self.abortImplicitTxn(txn);
                     return ExecError.OutOfMemory;
                 };
             }
@@ -294,11 +473,15 @@ pub const Executor = struct {
         // Now delete collected tuples
         var deleted: u64 = 0;
         for (to_delete.items) |tid| {
-            if (table.deleteTuple(tid) catch { return ExecError.StorageError; }) {
+            if (table.deleteTuple(txn, tid) catch {
+                self.abortImplicitTxn(txn);
+                return ExecError.StorageError;
+            }) {
                 deleted += 1;
             }
         }
 
+        self.commitImplicitTxn(txn);
         return .{ .row_count = deleted };
     }
 
@@ -543,12 +726,6 @@ const buffer_pool_mod = @import("../storage/buffer_pool.zig");
 const DiskManager = disk_manager_mod.DiskManager;
 const BufferPool = buffer_pool_mod.BufferPool;
 
-fn setupTestEnv(dm: *DiskManager, bp: *BufferPool, catalog: *Catalog) !void {
-    _ = dm;
-    _ = bp;
-    _ = catalog;
-}
-
 test "executor create table and insert" {
     const test_file = "test_exec_basic.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
@@ -597,11 +774,11 @@ test "executor select all" {
     const r3 = try exec.execute("SELECT * FROM users");
     defer exec.freeResult(r3);
 
-    const rows = r3.rows;
-    try std.testing.expectEqual(@as(usize, 2), rows.columns.len);
-    try std.testing.expectEqualStrings("id", rows.columns[0]);
-    try std.testing.expectEqualStrings("name", rows.columns[1]);
-    try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
+    const row_result = r3.rows;
+    try std.testing.expectEqual(@as(usize, 2), row_result.columns.len);
+    try std.testing.expectEqualStrings("id", row_result.columns[0]);
+    try std.testing.expectEqualStrings("name", row_result.columns[1]);
+    try std.testing.expectEqual(@as(usize, 2), row_result.rows.len);
 }
 
 test "executor select with where" {
@@ -687,4 +864,119 @@ test "executor table not found" {
 
     const result = exec.execute("SELECT * FROM nonexistent");
     try std.testing.expectError(ExecError.TableNotFound, result);
+}
+
+test "executor MVCC begin commit rollback" {
+    const test_file = "test_exec_mvcc.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    // Create table (auto-commit)
+    const ct = try exec.execute("CREATE TABLE users (id INT, name TEXT)");
+    exec.freeResult(ct);
+
+    // Begin explicit transaction
+    const begin_r = try exec.execute("BEGIN");
+    exec.freeResult(begin_r);
+    try std.testing.expect(exec.current_txn != null);
+
+    // Insert within transaction
+    const ins = try exec.execute("INSERT INTO users VALUES (1, 'Alice')");
+    exec.freeResult(ins);
+
+    // Should see the row within the same transaction
+    const sel1 = try exec.execute("SELECT * FROM users");
+    defer exec.freeResult(sel1);
+    try std.testing.expectEqual(@as(usize, 1), sel1.rows.rows.len);
+
+    // Rollback
+    const rb = try exec.execute("ROLLBACK");
+    exec.freeResult(rb);
+    try std.testing.expect(exec.current_txn == null);
+
+    // Row should be gone after rollback
+    const sel2 = try exec.execute("SELECT * FROM users");
+    defer exec.freeResult(sel2);
+    try std.testing.expectEqual(@as(usize, 0), sel2.rows.rows.len);
+}
+
+test "executor MVCC auto-commit" {
+    const test_file = "test_exec_autocommit.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    // Create table (auto-commit)
+    const ct = try exec.execute("CREATE TABLE items (id INT)");
+    exec.freeResult(ct);
+
+    // Insert without explicit BEGIN — should auto-commit
+    const ins = try exec.execute("INSERT INTO items VALUES (42)");
+    exec.freeResult(ins);
+
+    // Should be visible in next query (also auto-commit)
+    const sel = try exec.execute("SELECT * FROM items");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 1), sel.rows.rows.len);
+    try std.testing.expectEqualStrings("42", sel.rows.rows[0].values[0]);
+}
+
+test "executor MVCC commit persists" {
+    const test_file = "test_exec_mvcc_commit.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    // BEGIN, INSERT, COMMIT
+    const b = try exec.execute("BEGIN");
+    exec.freeResult(b);
+    const ins = try exec.execute("INSERT INTO t VALUES (1)");
+    exec.freeResult(ins);
+    const c = try exec.execute("COMMIT");
+    exec.freeResult(c);
+
+    // Row should be visible after commit
+    const sel = try exec.execute("SELECT * FROM t");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 1), sel.rows.rows.len);
 }

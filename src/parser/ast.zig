@@ -82,6 +82,9 @@ pub const Statement = union(enum) {
     select: Select,
     delete: Delete,
     drop_table: DropTable,
+    begin_txn: void,
+    commit_txn: void,
+    rollback_txn: void,
 };
 
 pub const CreateTable = struct {

@@ -2,6 +2,8 @@ const std = @import("std");
 const page_mod = @import("page.zig");
 const buffer_pool_mod = @import("buffer_pool.zig");
 const tuple_mod = @import("tuple.zig");
+const mvcc_mod = @import("mvcc.zig");
+const undo_log_mod = @import("undo_log.zig");
 
 const Page = page_mod.Page;
 const PageId = page_mod.PageId;
@@ -13,6 +15,14 @@ const BufferPool = buffer_pool_mod.BufferPool;
 const Schema = tuple_mod.Schema;
 const Tuple = tuple_mod.Tuple;
 const Value = tuple_mod.Value;
+const TupleHeader = mvcc_mod.TupleHeader;
+const TxnId = mvcc_mod.TxnId;
+const NO_UNDO_PTR = mvcc_mod.NO_UNDO_PTR;
+const Transaction = mvcc_mod.Transaction;
+const TransactionManager = mvcc_mod.TransactionManager;
+const Snapshot = mvcc_mod.Snapshot;
+const UndoLog = undo_log_mod.UndoLog;
+const UndoRecordHeader = undo_log_mod.UndoRecordHeader;
 
 pub const TableError = error{
     BufferPoolError,
@@ -21,6 +31,7 @@ pub const TableError = error{
     TupleNotFound,
     SerializationError,
     OutOfMemory,
+    UndoLogError,
 };
 
 /// Table metadata header stored at the beginning of the first page
@@ -35,14 +46,18 @@ const TableMeta = extern struct {
     pub const SIZE: usize = @sizeOf(TableMeta);
 };
 
-/// Heap-organized table
-/// Data is stored in an unordered collection of pages
+/// Heap-organized table with MVCC support.
+/// All tuples are stored with a TupleHeader prefix for versioning.
 pub const Table = struct {
     allocator: std.mem.Allocator,
     buffer_pool: *BufferPool,
     schema: *const Schema,
     /// Table ID (page ID of the first/meta page)
     table_id: PageId,
+    /// Transaction manager for visibility checks (null = legacy mode, all visible)
+    txn_manager: ?*TransactionManager,
+    /// Undo log for version chain (null = legacy mode, no undo)
+    undo_log: ?*UndoLog,
 
     const Self = @This();
 
@@ -50,7 +65,22 @@ pub const Table = struct {
     pub const MAX_TUPLE_SIZE = PAGE_SIZE - page_mod.PageHeader.SIZE - page_mod.Slot.SIZE - TableMeta.SIZE - 64;
 
     /// Create a new table - allocates the first page
-    pub fn create(allocator: std.mem.Allocator, buffer_pool: *BufferPool, schema: *const Schema) TableError!Self {
+    pub fn create(
+        allocator: std.mem.Allocator,
+        buffer_pool: *BufferPool,
+        schema: *const Schema,
+    ) TableError!Self {
+        return createWithMvcc(allocator, buffer_pool, schema, null, null);
+    }
+
+    /// Create a new table with MVCC support
+    pub fn createWithMvcc(
+        allocator: std.mem.Allocator,
+        buffer_pool: *BufferPool,
+        schema: *const Schema,
+        txn_manager: ?*TransactionManager,
+        undo_log: ?*UndoLog,
+    ) TableError!Self {
         // Allocate the first page for this table
         const result = buffer_pool.newPage() catch {
             return TableError.BufferPoolError;
@@ -61,6 +91,8 @@ pub const Table = struct {
             .buffer_pool = buffer_pool,
             .schema = schema,
             .table_id = result.page_id,
+            .txn_manager = txn_manager,
+            .undo_log = undo_log,
         };
 
         // Initialize meta in first page
@@ -81,22 +113,47 @@ pub const Table = struct {
 
     /// Open an existing table by its table ID
     pub fn open(allocator: std.mem.Allocator, buffer_pool: *BufferPool, schema: *const Schema, table_id: PageId) Self {
+        return openWithMvcc(allocator, buffer_pool, schema, table_id, null, null);
+    }
+
+    /// Open an existing table with MVCC support
+    pub fn openWithMvcc(
+        allocator: std.mem.Allocator,
+        buffer_pool: *BufferPool,
+        schema: *const Schema,
+        table_id: PageId,
+        txn_manager: ?*TransactionManager,
+        undo_log: ?*UndoLog,
+    ) Self {
         return .{
             .allocator = allocator,
             .buffer_pool = buffer_pool,
             .schema = schema,
             .table_id = table_id,
+            .txn_manager = txn_manager,
+            .undo_log = undo_log,
         };
     }
 
-    /// Insert a tuple into the table
-    /// Returns the TupleId where the tuple was stored
-    pub fn insertTuple(self: *Self, values: []const Value) TableError!TupleId {
-        // Serialize the tuple
+    /// Insert a tuple into the table.
+    /// If txn is provided, the tuple gets a TupleHeader with xmin=txn.txn_id.
+    /// If txn is null, falls back to legacy mode (no header).
+    pub fn insertTuple(self: *Self, txn: ?*Transaction, values: []const Value) TableError!TupleId {
         var buf: [PAGE_SIZE]u8 = undefined;
-        const size = Tuple.serialize(self.schema, values, &buf) catch {
-            return TableError.SerializationError;
-        };
+        var size: usize = undefined;
+
+        if (txn) |t| {
+            // MVCC mode: serialize with TupleHeader
+            const header = TupleHeader.init(t.txn_id);
+            size = Tuple.serializeWithHeader(header, self.schema, values, &buf) catch {
+                return TableError.SerializationError;
+            };
+        } else {
+            // Legacy mode: no header
+            size = Tuple.serialize(self.schema, values, &buf) catch {
+                return TableError.SerializationError;
+            };
+        }
 
         if (size > MAX_TUPLE_SIZE) {
             return TableError.TupleTooBig;
@@ -104,32 +161,34 @@ pub const Table = struct {
 
         const tuple_data = buf[0..size];
 
-        // Try to find a page with space, starting from the meta hint
+        // Find a page with space
         const meta = try self.readMeta();
         var page_id = meta.first_free_page;
 
-        // Try the hinted page first, then scan
         while (page_id != INVALID_PAGE_ID) {
             var pg = self.buffer_pool.fetchPage(page_id) catch {
                 return TableError.BufferPoolError;
             };
 
-            // Skip slot 0 on the meta page (it holds TableMeta)
             const slot_id = pg.insertTuple(tuple_data);
             if (slot_id) |sid| {
                 self.buffer_pool.unpinPage(page_id, true) catch {};
                 try self.incrementTupleCount();
-                return .{ .page_id = page_id, .slot_id = sid };
+
+                const tid = TupleId{ .page_id = page_id, .slot_id = sid };
+
+                // Write insert undo record
+                if (txn != null and self.undo_log != null) {
+                    try self.writeInsertUndo(txn.?, tid);
+                }
+
+                return tid;
             }
 
             self.buffer_pool.unpinPage(page_id, false) catch {};
 
-            // This page is full, try the next one
             if (page_id == self.table_id) {
-                // We were on the meta page, check if other pages exist
                 if (meta.page_count > 1) {
-                    // Simple scan: try pages after meta page
-                    // In a real DB we'd maintain a free page list
                     page_id = self.table_id + 1;
                 } else {
                     break;
@@ -161,12 +220,19 @@ pub const Table = struct {
             .tuple_count = meta.tuple_count + 1,
         });
 
-        return .{ .page_id = new_result.page_id, .slot_id = slot_id };
+        const tid = TupleId{ .page_id = new_result.page_id, .slot_id = slot_id };
+
+        // Write insert undo record
+        if (txn != null and self.undo_log != null) {
+            try self.writeInsertUndo(txn.?, tid);
+        }
+
+        return tid;
     }
 
-    /// Get a tuple by its TupleId
-    /// Caller must free the returned values slice
-    pub fn getTuple(self: *Self, tid: TupleId) TableError!?[]Value {
+    /// Get a tuple by its TupleId, with optional visibility check.
+    /// Caller must free the returned values slice.
+    pub fn getTuple(self: *Self, tid: TupleId, snapshot: ?*const Snapshot) TableError!?[]Value {
         var pg = self.buffer_pool.fetchPage(tid.page_id) catch {
             return TableError.BufferPoolError;
         };
@@ -174,32 +240,97 @@ pub const Table = struct {
 
         const raw = pg.getTuple(tid.slot_id) orelse return null;
 
+        // MVCC visibility check
+        if (snapshot != null and self.txn_manager != null) {
+            if (raw.len < TupleHeader.SIZE) return TableError.SerializationError;
+            const stripped = Tuple.stripHeader(raw) catch return TableError.SerializationError;
+            const vis = mvcc_mod.isVisible(&stripped.header, snapshot.?, self.txn_manager.?, snapshot.?.xmax - 1);
+            if (vis == .invisible) return null;
+
+            return Tuple.deserialize(self.allocator, self.schema, stripped.user_data) catch {
+                return TableError.SerializationError;
+            };
+        }
+
+        // Legacy mode: no header
         return Tuple.deserialize(self.allocator, self.schema, raw) catch {
             return TableError.SerializationError;
         };
     }
 
-    /// Delete a tuple by its TupleId
-    pub fn deleteTuple(self: *Self, tid: TupleId) TableError!bool {
+    /// Get a tuple with visibility check using the transaction's own ID and snapshot
+    pub fn getTupleTxn(self: *Self, tid: TupleId, txn: *const Transaction) TableError!?[]Value {
+        var pg = self.buffer_pool.fetchPage(tid.page_id) catch {
+            return TableError.BufferPoolError;
+        };
+        defer self.buffer_pool.unpinPage(tid.page_id, false) catch {};
+
+        const raw = pg.getTuple(tid.slot_id) orelse return null;
+
+        if (self.txn_manager) |tm| {
+            if (raw.len < TupleHeader.SIZE) return TableError.SerializationError;
+            const stripped = Tuple.stripHeader(raw) catch return TableError.SerializationError;
+            const vis = mvcc_mod.isVisible(&stripped.header, &txn.snapshot, tm, txn.txn_id);
+            if (vis == .invisible) return null;
+
+            return Tuple.deserialize(self.allocator, self.schema, stripped.user_data) catch {
+                return TableError.SerializationError;
+            };
+        }
+
+        return Tuple.deserialize(self.allocator, self.schema, raw) catch {
+            return TableError.SerializationError;
+        };
+    }
+
+    /// Delete a tuple by setting xmax (MVCC) or zeroing the slot (legacy).
+    pub fn deleteTuple(self: *Self, txn: ?*Transaction, tid: TupleId) TableError!bool {
         var pg = self.buffer_pool.fetchPage(tid.page_id) catch {
             return TableError.BufferPoolError;
         };
 
-        const result = pg.deleteTuple(tid.slot_id);
+        if (txn != null and self.txn_manager != null) {
+            // MVCC mode: set xmax in-place
+            const raw = pg.getTuple(tid.slot_id) orelse {
+                self.buffer_pool.unpinPage(tid.page_id, false) catch {};
+                return false;
+            };
+            if (raw.len < TupleHeader.SIZE) {
+                self.buffer_pool.unpinPage(tid.page_id, false) catch {};
+                return false;
+            }
 
-        self.buffer_pool.unpinPage(tid.page_id, result) catch {};
-        return result;
+            // Write delete undo record before modifying
+            if (self.undo_log != null) {
+                try self.writeDeleteUndo(txn.?, tid, raw[0..TupleHeader.SIZE]);
+            }
+
+            // Set xmax to the deleting transaction's ID
+            const xmax_bytes = std.mem.asBytes(&txn.?.txn_id);
+            // xmax is at offset 4 in TupleHeader (after xmin)
+            const updated = pg.updateTupleData(tid.slot_id, 4, xmax_bytes);
+
+            self.buffer_pool.unpinPage(tid.page_id, updated) catch {};
+            return updated;
+        } else {
+            // Legacy mode: zero the slot
+            const result = pg.deleteTuple(tid.slot_id);
+            self.buffer_pool.unpinPage(tid.page_id, result) catch {};
+            return result;
+        }
     }
 
-    /// Sequential scan - iterates over all tuples in the table
+    /// Sequential scan with optional MVCC visibility filtering
     pub const ScanIterator = struct {
         table: *Self,
         current_page: PageId,
         current_slot: SlotId,
         page_count: u32,
+        /// Transaction for visibility checks (null = all visible)
+        txn: ?*const Transaction,
 
-        /// Returns the next tuple ID and deserialized values
-        /// Caller must free the returned values slice
+        /// Returns the next visible tuple ID and deserialized values.
+        /// Caller must free the returned values slice.
         pub fn next(self: *ScanIterator) TableError!?struct { tid: TupleId, values: []Value } {
             while (self.current_page < self.table.table_id + self.page_count) {
                 var pg = self.table.buffer_pool.fetchPage(self.current_page) catch {
@@ -213,15 +344,37 @@ pub const Table = struct {
                 while (slot < header.slot_count) : (slot += 1) {
                     if (pg.getTuple(slot)) |raw| {
                         const tid = TupleId{ .page_id = self.current_page, .slot_id = slot };
-                        self.current_slot = slot + 1;
 
-                        const values = Tuple.deserialize(self.table.allocator, self.table.schema, raw) catch {
+                        // MVCC visibility check
+                        if (self.txn != null and self.table.txn_manager != null) {
+                            if (raw.len < TupleHeader.SIZE) {
+                                continue; // Skip malformed tuples
+                            }
+                            const stripped = Tuple.stripHeader(raw) catch continue;
+                            const vis = mvcc_mod.isVisible(&stripped.header, &self.txn.?.snapshot, self.table.txn_manager.?, self.txn.?.txn_id);
+                            if (vis == .invisible) continue;
+
+                            self.current_slot = slot + 1;
+
+                            const values = Tuple.deserialize(self.table.allocator, self.table.schema, stripped.user_data) catch {
+                                self.table.buffer_pool.unpinPage(self.current_page, false) catch {};
+                                return TableError.SerializationError;
+                            };
+
                             self.table.buffer_pool.unpinPage(self.current_page, false) catch {};
-                            return TableError.SerializationError;
-                        };
+                            return .{ .tid = tid, .values = values };
+                        } else {
+                            // Legacy mode: no header
+                            self.current_slot = slot + 1;
 
-                        self.table.buffer_pool.unpinPage(self.current_page, false) catch {};
-                        return .{ .tid = tid, .values = values };
+                            const values = Tuple.deserialize(self.table.allocator, self.table.schema, raw) catch {
+                                self.table.buffer_pool.unpinPage(self.current_page, false) catch {};
+                                return TableError.SerializationError;
+                            };
+
+                            self.table.buffer_pool.unpinPage(self.current_page, false) catch {};
+                            return .{ .tid = tid, .values = values };
+                        }
                     }
                 }
 
@@ -243,14 +396,104 @@ pub const Table = struct {
 
     /// Start a sequential scan of the table
     pub fn scan(self: *Self) TableError!ScanIterator {
+        return self.scanWithTxn(null);
+    }
+
+    /// Start a sequential scan with a transaction for MVCC visibility
+    pub fn scanWithTxn(self: *Self, txn: ?*const Transaction) TableError!ScanIterator {
         const meta = try self.readMeta();
         return .{
             .table = self,
             .current_page = self.table_id,
             .current_slot = 0,
             .page_count = meta.page_count,
+            .txn = txn,
         };
     }
+
+    // ── Undo record helpers ──────────────────────────────────────────
+
+    fn writeInsertUndo(self: *Self, txn: *Transaction, tid: TupleId) TableError!void {
+        const log = self.undo_log orelse return;
+        const undo_header = UndoRecordHeader{
+            .record_type = .insert,
+            .slot_id = tid.slot_id,
+            .txn_id = txn.txn_id,
+            .prev_undo_ptr = NO_UNDO_PTR,
+            .txn_prev_undo = txn.undo_chain_head,
+            .table_page_id = tid.page_id,
+            .data_len = 0,
+        };
+
+        const offset = log.appendRecord(undo_header, &.{}) catch {
+            return TableError.UndoLogError;
+        };
+        txn.undo_chain_head = offset;
+    }
+
+    fn writeDeleteUndo(self: *Self, txn: *Transaction, tid: TupleId, old_header_bytes: []const u8) TableError!void {
+        const log = self.undo_log orelse return;
+        const undo_header = UndoRecordHeader{
+            .record_type = .delete,
+            .slot_id = tid.slot_id,
+            .txn_id = txn.txn_id,
+            .prev_undo_ptr = NO_UNDO_PTR,
+            .txn_prev_undo = txn.undo_chain_head,
+            .table_page_id = tid.page_id,
+            .data_len = @intCast(old_header_bytes.len),
+        };
+
+        const offset = log.appendRecord(undo_header, old_header_bytes) catch {
+            return TableError.UndoLogError;
+        };
+        txn.undo_chain_head = offset;
+    }
+
+    // ── Rollback support ─────────────────────────────────────────────
+
+    /// Walk the transaction's undo chain and restore all changes.
+    pub fn rollback(self: *Self, txn: *Transaction) TableError!void {
+        const log = self.undo_log orelse return;
+        var undo_ptr = txn.undo_chain_head;
+
+        while (undo_ptr != NO_UNDO_PTR) {
+            const rec = log.readRecord(undo_ptr) catch {
+                return TableError.UndoLogError;
+            };
+
+            switch (rec.header.record_type) {
+                .insert => {
+                    // Undo insert = zero the slot
+                    var pg = self.buffer_pool.fetchPage(rec.header.table_page_id) catch {
+                        return TableError.BufferPoolError;
+                    };
+                    _ = pg.deleteTuple(rec.header.slot_id);
+                    self.buffer_pool.unpinPage(rec.header.table_page_id, true) catch {};
+                },
+                .delete => {
+                    // Undo delete = restore xmax to 0
+                    var pg = self.buffer_pool.fetchPage(rec.header.table_page_id) catch {
+                        return TableError.BufferPoolError;
+                    };
+                    const zero_xmax = std.mem.asBytes(&@as(TxnId, 0));
+                    _ = pg.updateTupleData(rec.header.slot_id, 4, zero_xmax);
+                    self.buffer_pool.unpinPage(rec.header.table_page_id, true) catch {};
+                },
+                .update => {
+                    // Undo update = overwrite heap tuple with old data
+                    var pg = self.buffer_pool.fetchPage(rec.header.table_page_id) catch {
+                        return TableError.BufferPoolError;
+                    };
+                    _ = pg.updateTupleData(rec.header.slot_id, 0, rec.data);
+                    self.buffer_pool.unpinPage(rec.header.table_page_id, true) catch {};
+                },
+            }
+
+            undo_ptr = rec.header.txn_prev_undo;
+        }
+    }
+
+    // ── Internal helpers ─────────────────────────────────────────────
 
     /// Read the table metadata from the first page
     fn readMeta(self: *Self) TableError!TableMeta {
@@ -294,11 +537,13 @@ pub const Table = struct {
     }
 };
 
+// ============================================================
 // Tests
+// ============================================================
 const disk_manager_mod = @import("disk_manager.zig");
 const DiskManager = disk_manager_mod.DiskManager;
 
-test "table create and insert" {
+test "table create and insert (legacy)" {
     const test_file = "test_table_basic.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
     defer dm.deleteFile();
@@ -316,15 +561,15 @@ test "table create and insert" {
 
     var table = try Table.create(std.testing.allocator, &bp, &schema);
 
-    // Insert a row
+    // Insert a row (legacy, no txn)
     const values = [_]Value{ .{ .integer = 1 }, .{ .bytes = "Alice" } };
-    const tid = try table.insertTuple(&values);
+    const tid = try table.insertTuple(null, &values);
 
     try std.testing.expectEqual(table.table_id, tid.page_id);
     try std.testing.expectEqual(@as(u64, 1), try table.tupleCount());
 }
 
-test "table insert and retrieve" {
+test "table insert and retrieve (legacy)" {
     const test_file = "test_table_get.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
     defer dm.deleteFile();
@@ -344,10 +589,10 @@ test "table insert and retrieve" {
     var table = try Table.create(std.testing.allocator, &bp, &schema);
 
     const values = [_]Value{ .{ .integer = 42 }, .{ .bytes = "Bob" }, .{ .boolean = true } };
-    const tid = try table.insertTuple(&values);
+    const tid = try table.insertTuple(null, &values);
 
-    // Retrieve
-    const result = try table.getTuple(tid) orelse unreachable;
+    // Retrieve (legacy, no snapshot)
+    const result = try table.getTuple(tid, null) orelse unreachable;
     defer std.testing.allocator.free(result);
 
     try std.testing.expectEqual(@as(i32, 42), result[0].integer);
@@ -355,7 +600,7 @@ test "table insert and retrieve" {
     try std.testing.expectEqual(true, result[2].boolean);
 }
 
-test "table sequential scan" {
+test "table sequential scan (legacy)" {
     const test_file = "test_table_scan.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
     defer dm.deleteFile();
@@ -379,7 +624,7 @@ test "table sequential scan" {
         var name_buf: [32]u8 = undefined;
         const name = std.fmt.bufPrint(&name_buf, "row_{}", .{i}) catch unreachable;
         const vals = [_]Value{ .{ .integer = i }, .{ .bytes = name } };
-        _ = try table.insertTuple(&vals);
+        _ = try table.insertTuple(null, &vals);
     }
 
     try std.testing.expectEqual(@as(u64, 5), try table.tupleCount());
@@ -395,7 +640,7 @@ test "table sequential scan" {
     try std.testing.expectEqual(@as(usize, 5), count);
 }
 
-test "table delete tuple" {
+test "table delete tuple (legacy)" {
     const test_file = "test_table_delete.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
     defer dm.deleteFile();
@@ -413,18 +658,18 @@ test "table delete tuple" {
     var table = try Table.create(std.testing.allocator, &bp, &schema);
 
     const vals = [_]Value{.{ .integer = 1 }};
-    const tid = try table.insertTuple(&vals);
+    const tid = try table.insertTuple(null, &vals);
 
-    // Delete it
-    const deleted = try table.deleteTuple(tid);
+    // Delete it (legacy)
+    const deleted = try table.deleteTuple(null, tid);
     try std.testing.expect(deleted);
 
     // Should not be retrievable
-    const result = try table.getTuple(tid);
+    const result = try table.getTuple(tid, null);
     try std.testing.expect(result == null);
 }
 
-test "table multiple pages" {
+test "table multiple pages (legacy)" {
     const test_file = "test_table_multi_page.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
     defer dm.deleteFile();
@@ -449,7 +694,7 @@ test "table multiple pages" {
     var i: i32 = 0;
     while (i < 20) : (i += 1) {
         const vals = [_]Value{ .{ .integer = i }, .{ .bytes = &large_buf } };
-        _ = try table.insertTuple(&vals);
+        _ = try table.insertTuple(null, &vals);
     }
 
     try std.testing.expectEqual(@as(u64, 20), try table.tupleCount());
@@ -462,4 +707,216 @@ test "table multiple pages" {
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 20), count);
+}
+
+test "MVCC insert and visibility" {
+    const test_file = "test_table_mvcc_insert.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+            .{ .name = "name", .col_type = .text, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+
+    // txn1 inserts a row
+    const txn1 = try tm.begin();
+    const vals = [_]Value{ .{ .integer = 1 }, .{ .bytes = "Alice" } };
+    _ = try table.insertTuple(txn1, &vals);
+
+    // txn1 can see its own insert
+    var iter1 = try table.scanWithTxn(txn1);
+    var count1: usize = 0;
+    while (try iter1.next()) |row| {
+        defer iter1.freeValues(row.values);
+        count1 += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count1);
+
+    // txn2 starts — should NOT see txn1's uncommitted insert
+    const txn2 = try tm.begin();
+    var iter2 = try table.scanWithTxn(txn2);
+    var count2: usize = 0;
+    while (try iter2.next()) |row| {
+        defer iter2.freeValues(row.values);
+        count2 += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), count2);
+
+    // Commit txn1
+    try tm.commit(txn1);
+
+    // txn3 starts after commit — should see the row
+    const txn3 = try tm.begin();
+    var iter3 = try table.scanWithTxn(txn3);
+    var count3: usize = 0;
+    while (try iter3.next()) |row| {
+        defer iter3.freeValues(row.values);
+        count3 += 1;
+        try std.testing.expectEqual(@as(i32, 1), row.values[0].integer);
+    }
+    try std.testing.expectEqual(@as(usize, 1), count3);
+
+    try tm.commit(txn2);
+    try tm.commit(txn3);
+}
+
+test "MVCC delete visibility" {
+    const test_file = "test_table_mvcc_delete.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+
+    // Insert and commit
+    const txn1 = try tm.begin();
+    const vals = [_]Value{.{ .integer = 42 }};
+    const tid = try table.insertTuple(txn1, &vals);
+    try tm.commit(txn1);
+
+    // Delete in txn2
+    const txn2 = try tm.begin();
+    _ = try table.deleteTuple(txn2, tid);
+
+    // txn2 should NOT see the deleted row
+    var iter2 = try table.scanWithTxn(txn2);
+    var count2: usize = 0;
+    while (try iter2.next()) |row| {
+        defer iter2.freeValues(row.values);
+        count2 += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), count2);
+
+    // txn3 (concurrent) should still see it (txn2 not committed)
+    const txn3 = try tm.begin();
+    var iter3 = try table.scanWithTxn(txn3);
+    var count3: usize = 0;
+    while (try iter3.next()) |row| {
+        defer iter3.freeValues(row.values);
+        count3 += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count3);
+
+    try tm.commit(txn2);
+    try tm.commit(txn3);
+}
+
+test "MVCC rollback restores insert" {
+    const test_file = "test_table_mvcc_rollback.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+
+    // Insert in a transaction
+    const txn1 = try tm.begin();
+    const vals = [_]Value{.{ .integer = 99 }};
+    _ = try table.insertTuple(txn1, &vals);
+
+    // Rollback
+    try table.rollback(txn1);
+    tm.abort(txn1);
+
+    // New transaction should see nothing
+    const txn2 = try tm.begin();
+    var iter = try table.scanWithTxn(txn2);
+    var count: usize = 0;
+    while (try iter.next()) |row| {
+        defer iter.freeValues(row.values);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), count);
+
+    try tm.commit(txn2);
+}
+
+test "MVCC rollback restores delete" {
+    const test_file = "test_table_mvcc_rollback_del.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+
+    // Insert and commit
+    const txn1 = try tm.begin();
+    const vals = [_]Value{.{ .integer = 42 }};
+    const tid = try table.insertTuple(txn1, &vals);
+    try tm.commit(txn1);
+
+    // Delete in txn2 then rollback
+    const txn2 = try tm.begin();
+    _ = try table.deleteTuple(txn2, tid);
+    try table.rollback(txn2);
+    tm.abort(txn2);
+
+    // Row should still be visible
+    const txn3 = try tm.begin();
+    var iter = try table.scanWithTxn(txn3);
+    var count: usize = 0;
+    while (try iter.next()) |row| {
+        defer iter.freeValues(row.values);
+        count += 1;
+        try std.testing.expectEqual(@as(i32, 42), row.values[0].integer);
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+
+    try tm.commit(txn3);
 }

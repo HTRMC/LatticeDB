@@ -9,6 +9,8 @@ pub const storage = struct {
     pub const tuple = @import("storage/tuple.zig");
     pub const table = @import("storage/table.zig");
     pub const catalog = @import("storage/catalog.zig");
+    pub const mvcc = @import("storage/mvcc.zig");
+    pub const undo_log = @import("storage/undo_log.zig");
 };
 
 // Index layer
@@ -41,6 +43,8 @@ pub const network = struct {
 const DiskManager = storage.disk_manager.DiskManager;
 const BufferPool = storage.buffer_pool.BufferPool;
 const Catalog = storage.catalog.Catalog;
+const TransactionManager = storage.mvcc.TransactionManager;
+const UndoLog = storage.undo_log.UndoLog;
 const Executor = executor_layer.executor_mod.Executor;
 const Server = network.server.Server;
 const Client = network.client.Client;
@@ -236,9 +240,13 @@ fn runServer(allocator: std.mem.Allocator, out: *std.Io.Writer, port: u16, tls_c
     var catalog = try Catalog.init(allocator, &bp);
     defer catalog.deinit();
 
-    var exec = Executor.init(allocator, &catalog);
+    var txn_manager = TransactionManager.init(allocator);
+    defer txn_manager.deinit();
 
-    var srv = try Server.init(allocator, &exec, tls_cert);
+    var undo_log = UndoLog.init(allocator);
+    defer undo_log.deinit();
+
+    var srv = try Server.init(allocator, &catalog, &txn_manager, &undo_log, tls_cert);
     defer srv.deinit();
 
     try srv.listen(port);
@@ -397,7 +405,13 @@ fn runRepl(allocator: std.mem.Allocator, out: *std.Io.Writer, in: *std.Io.Reader
     var catalog = try Catalog.init(allocator, &bp);
     defer catalog.deinit();
 
-    var exec = Executor.init(allocator, &catalog);
+    var txn_manager = TransactionManager.init(allocator);
+    defer txn_manager.deinit();
+
+    var undo_log = UndoLog.init(allocator);
+    defer undo_log.deinit();
+
+    var exec = Executor.initWithMvcc(allocator, &catalog, &txn_manager, &undo_log);
 
     // Banner
     try out.print("GrapheneDB v0.1.0\n", .{});
@@ -749,6 +763,8 @@ test {
     _ = storage.tuple;
     _ = storage.table;
     _ = storage.catalog;
+    _ = storage.mvcc;
+    _ = storage.undo_log;
     _ = index.btree_page;
     _ = index.btree;
     _ = parser.lexer;
