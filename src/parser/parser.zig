@@ -47,6 +47,7 @@ pub const Parser = struct {
         const stmt = switch (self.current.type) {
             .kw_select => ast.Statement{ .select = try self.parseSelect() },
             .kw_insert => ast.Statement{ .insert = try self.parseInsert() },
+            .kw_update => ast.Statement{ .update = try self.parseUpdate() },
             .kw_delete => ast.Statement{ .delete = try self.parseDelete() },
             .kw_create => ast.Statement{ .create_table = try self.parseCreateTable() },
             .kw_drop => ast.Statement{ .drop_table = try self.parseDropTable() },
@@ -155,6 +156,42 @@ pub const Parser = struct {
             .table_name = table_name,
             .where_clause = where,
         };
+    }
+
+    // ============================================================
+    // UPDATE table SET col = val [, col = val] [WHERE expr]
+    // ============================================================
+    fn parseUpdate(self: *Self) ParseError!ast.Update {
+        try self.expect(.kw_update);
+        const table_name = try self.expectIdentifier();
+        try self.expect(.kw_set);
+
+        const alloc = self.arena();
+        var assignments: std.ArrayList(ast.SetClause) = .empty;
+        assignments.append(alloc, try self.parseSetClause()) catch return ParseError.OutOfMemory;
+        while (self.current.type == .comma) {
+            self.advance();
+            assignments.append(alloc, try self.parseSetClause()) catch return ParseError.OutOfMemory;
+        }
+
+        var where: ?*const ast.Expression = null;
+        if (self.current.type == .kw_where) {
+            self.advance();
+            where = try self.parseExpression();
+        }
+
+        return .{
+            .table_name = table_name,
+            .assignments = assignments.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
+            .where_clause = where,
+        };
+    }
+
+    fn parseSetClause(self: *Self) ParseError!ast.SetClause {
+        const column = try self.expectIdentifier();
+        try self.expect(.op_eq);
+        const value = try self.parseLiteral();
+        return .{ .column = column, .value = value };
     }
 
     // ============================================================
@@ -505,6 +542,33 @@ test "parse DELETE with compound WHERE" {
     try std.testing.expectEqual(ast.CompOp.eq, right.comparison.op);
     try std.testing.expectEqualStrings("name", right.comparison.left.column_ref);
     try std.testing.expectEqualStrings("bob", right.comparison.right.literal.string);
+}
+
+test "parse UPDATE" {
+    {
+        // UPDATE with WHERE
+        var p = Parser.init(std.testing.allocator, "UPDATE users SET name = 'Bob' WHERE id = 1");
+        defer p.deinit();
+        const stmt = try p.parse();
+        const upd = stmt.update;
+        try std.testing.expectEqualStrings("users", upd.table_name);
+        try std.testing.expectEqual(@as(usize, 1), upd.assignments.len);
+        try std.testing.expectEqualStrings("name", upd.assignments[0].column);
+        try std.testing.expectEqualStrings("Bob", upd.assignments[0].value.string);
+        try std.testing.expect(upd.where_clause != null);
+    }
+    {
+        // UPDATE multiple columns, no WHERE
+        var p = Parser.init(std.testing.allocator, "UPDATE items SET price = 9.99, name = 'Widget'");
+        defer p.deinit();
+        const stmt = try p.parse();
+        const upd = stmt.update;
+        try std.testing.expectEqualStrings("items", upd.table_name);
+        try std.testing.expectEqual(@as(usize, 2), upd.assignments.len);
+        try std.testing.expectEqualStrings("price", upd.assignments[0].column);
+        try std.testing.expectEqualStrings("name", upd.assignments[1].column);
+        try std.testing.expect(upd.where_clause == null);
+    }
 }
 
 test "parse BEGIN, COMMIT, ROLLBACK" {

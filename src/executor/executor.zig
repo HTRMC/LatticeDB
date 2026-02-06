@@ -94,6 +94,7 @@ pub const Executor = struct {
             .create_table => |ct| self.execCreateTable(ct),
             .insert => |ins| self.execInsert(ins),
             .select => |sel| self.execSelect(sel),
+            .update => |upd| self.execUpdate(upd),
             .delete => |del| self.execDelete(del),
             .drop_table => ExecError.StorageError, // TODO
             .begin_txn => self.execBegin(),
@@ -483,6 +484,119 @@ pub const Executor = struct {
 
         self.commitImplicitTxn(txn);
         return .{ .row_count = deleted };
+    }
+
+    // ============================================================
+    // UPDATE table SET col = val [, ...] [WHERE expr]
+    // Implemented as delete + insert (reuses existing MVCC undo)
+    // ============================================================
+    fn execUpdate(self: *Self, upd: ast.Update) ExecError!ExecResult {
+        const result = self.catalog.openTable(upd.table_name) catch {
+            return ExecError.StorageError;
+        } orelse return ExecError.TableNotFound;
+        defer self.catalog.freeSchema(result.schema);
+        var table = result.table;
+
+        // Attach MVCC components
+        table.txn_manager = self.txn_manager;
+        table.undo_log = self.undo_log;
+
+        const schema = result.schema;
+
+        // Resolve SET column indices
+        const set_indices = self.allocator.alloc(usize, upd.assignments.len) catch {
+            return ExecError.OutOfMemory;
+        };
+        defer self.allocator.free(set_indices);
+
+        for (upd.assignments, 0..) |assign, i| {
+            var found = false;
+            for (schema.columns, 0..) |col, ci| {
+                if (std.ascii.eqlIgnoreCase(col.name, assign.column)) {
+                    set_indices[i] = ci;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return ExecError.ColumnNotFound;
+        }
+
+        // Use explicit txn or auto-commit
+        const txn = self.current_txn orelse self.beginImplicitTxn();
+
+        // Scan and collect rows to update (TID + current values)
+        const UpdateEntry = struct { tid: page_mod.TupleId, values: []Value };
+        var to_update: std.ArrayList(UpdateEntry) = .empty;
+        defer {
+            for (to_update.items) |entry| {
+                self.allocator.free(entry.values);
+            }
+            to_update.deinit(self.allocator);
+        }
+
+        var iter = table.scanWithTxn(txn) catch {
+            self.abortImplicitTxn(txn);
+            return ExecError.StorageError;
+        };
+
+        while (iter.next() catch {
+            self.abortImplicitTxn(txn);
+            return ExecError.StorageError;
+        }) |row| {
+            const matches = if (upd.where_clause) |where|
+                self.evalWhere(where, schema, row.values)
+            else
+                true;
+
+            if (matches) {
+                to_update.append(self.allocator, .{ .tid = row.tid, .values = row.values }) catch {
+                    iter.freeValues(row.values);
+                    self.abortImplicitTxn(txn);
+                    return ExecError.OutOfMemory;
+                };
+                // Don't free row.values — we're keeping them
+            } else {
+                iter.freeValues(row.values);
+            }
+        }
+
+        // Apply updates: delete old tuple, insert new one
+        var updated: u64 = 0;
+        for (to_update.items) |entry| {
+            // Build new values by copying old and applying SET
+            const new_values = self.allocator.alloc(Value, schema.columns.len) catch {
+                self.abortImplicitTxn(txn);
+                return ExecError.OutOfMemory;
+            };
+            defer self.allocator.free(new_values);
+
+            @memcpy(new_values, entry.values);
+
+            // Apply SET assignments
+            for (upd.assignments, set_indices) |assign, ci| {
+                new_values[ci] = litToValue(assign.value, schema.columns[ci].col_type) catch {
+                    self.abortImplicitTxn(txn);
+                    return ExecError.TypeMismatch;
+                };
+            }
+
+            // Delete old tuple (MVCC: sets xmax)
+            _ = table.deleteTuple(txn, entry.tid) catch {
+                self.abortImplicitTxn(txn);
+                return ExecError.StorageError;
+            };
+
+            // Insert new tuple (MVCC: new xmin)
+            _ = table.insertTuple(txn, new_values) catch {
+                self.abortImplicitTxn(txn);
+                return ExecError.StorageError;
+            };
+
+            updated += 1;
+        }
+
+        self.commitImplicitTxn(txn);
+        return .{ .row_count = updated };
     }
 
     // ============================================================
@@ -979,4 +1093,126 @@ test "executor MVCC commit persists" {
     const sel = try exec.execute("SELECT * FROM t");
     defer exec.freeResult(sel);
     try std.testing.expectEqual(@as(usize, 1), sel.rows.rows.len);
+}
+
+test "executor UPDATE with WHERE" {
+    const test_file = "test_exec_update.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const ct = try exec.execute("CREATE TABLE users (id INT, name TEXT)");
+    exec.freeResult(ct);
+
+    const ins1 = try exec.execute("INSERT INTO users VALUES (1, 'Alice')");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO users VALUES (2, 'Bob')");
+    exec.freeResult(ins2);
+
+    // UPDATE one row
+    const upd = try exec.execute("UPDATE users SET name = 'Alicia' WHERE id = 1");
+    defer exec.freeResult(upd);
+    try std.testing.expectEqual(@as(u64, 1), upd.row_count);
+
+    // Verify: Alice → Alicia, Bob unchanged
+    const sel = try exec.execute("SELECT name FROM users WHERE id = 1");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 1), sel.rows.rows.len);
+    try std.testing.expectEqualStrings("Alicia", sel.rows.rows[0].values[0]);
+
+    const sel2 = try exec.execute("SELECT name FROM users WHERE id = 2");
+    defer exec.freeResult(sel2);
+    try std.testing.expectEqual(@as(usize, 1), sel2.rows.rows.len);
+    try std.testing.expectEqualStrings("Bob", sel2.rows.rows[0].values[0]);
+}
+
+test "executor UPDATE all rows" {
+    const test_file = "test_exec_update_all.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const ct = try exec.execute("CREATE TABLE items (id INT, price INT)");
+    exec.freeResult(ct);
+
+    const ins1 = try exec.execute("INSERT INTO items VALUES (1, 10)");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO items VALUES (2, 20)");
+    exec.freeResult(ins2);
+
+    // UPDATE all rows (no WHERE)
+    const upd = try exec.execute("UPDATE items SET price = 99");
+    defer exec.freeResult(upd);
+    try std.testing.expectEqual(@as(u64, 2), upd.row_count);
+
+    // All prices should be 99
+    const sel = try exec.execute("SELECT * FROM items");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 2), sel.rows.rows.len);
+    for (sel.rows.rows) |row| {
+        try std.testing.expectEqualStrings("99", row.values[1]);
+    }
+}
+
+test "executor UPDATE rollback" {
+    const test_file = "test_exec_update_rollback.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, val TEXT)");
+    exec.freeResult(ct);
+
+    const ins = try exec.execute("INSERT INTO t VALUES (1, 'original')");
+    exec.freeResult(ins);
+
+    // BEGIN, UPDATE, ROLLBACK
+    const b = try exec.execute("BEGIN");
+    exec.freeResult(b);
+    const upd = try exec.execute("UPDATE t SET val = 'changed' WHERE id = 1");
+    exec.freeResult(upd);
+    const rb = try exec.execute("ROLLBACK");
+    exec.freeResult(rb);
+
+    // Value should be back to 'original'
+    const sel = try exec.execute("SELECT val FROM t WHERE id = 1");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 1), sel.rows.rows.len);
+    try std.testing.expectEqualStrings("original", sel.rows.rows[0].values[0]);
 }

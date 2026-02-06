@@ -80,6 +80,7 @@ pub const Statement = union(enum) {
     create_table: CreateTable,
     insert: Insert,
     select: Select,
+    update: Update,
     delete: Delete,
     drop_table: DropTable,
     begin_txn: void,
@@ -106,6 +107,17 @@ pub const Select = struct {
 pub const Delete = struct {
     table_name: []const u8,
     where_clause: ?*const Expression,
+};
+
+pub const Update = struct {
+    table_name: []const u8,
+    assignments: []const SetClause,
+    where_clause: ?*const Expression,
+};
+
+pub const SetClause = struct {
+    column: []const u8,
+    value: LiteralValue,
 };
 
 pub const DropTable = struct {
