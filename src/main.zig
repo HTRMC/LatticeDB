@@ -68,8 +68,10 @@ pub fn main(init: std.process.Init) !void {
     var stdout = std.Io.File.Writer.init(std.Io.File.stdout(), io, &write_buf);
     const out = &stdout.interface;
 
-    // Parse CLI arguments
-    const args = try init.minimal.args.toSlice(allocator);
+    // Parse CLI arguments (use arena so all arg allocations are freed together)
+    var args_arena: std.heap.ArenaAllocator = .init(allocator);
+    defer args_arena.deinit();
+    const args = try init.minimal.args.toSlice(args_arena.allocator());
 
     // Skip argv[0] (program name)
     const cli_args = if (args.len > 1) args[1..] else args[0..0];
