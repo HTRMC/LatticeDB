@@ -564,3 +564,39 @@ test "value encode null_value" {
     const len = try null_val.encode(&buf);
     try std.testing.expectEqual(@as(usize, 0), len);
 }
+
+test "value format" {
+    var buf: [64]u8 = undefined;
+
+    // null
+    const null_str = try (Value{ .null_value = {} }).format(&buf);
+    try std.testing.expectEqualStrings("NULL", null_str);
+
+    // boolean
+    const true_str = try (Value{ .boolean = true }).format(&buf);
+    try std.testing.expectEqualStrings("true", true_str);
+    const false_str = try (Value{ .boolean = false }).format(&buf);
+    try std.testing.expectEqualStrings("false", false_str);
+
+    // integer
+    const int_str = try (Value{ .integer = -42 }).format(&buf);
+    try std.testing.expectEqualStrings("-42", int_str);
+    const zero_str = try (Value{ .integer = 0 }).format(&buf);
+    try std.testing.expectEqualStrings("0", zero_str);
+
+    // bigint
+    const big_str = try (Value{ .bigint = 9999999999 }).format(&buf);
+    try std.testing.expectEqualStrings("9999999999", big_str);
+
+    // float
+    const float_str = try (Value{ .float = 3.14 }).format(&buf);
+    try std.testing.expectEqualStrings("3.140000", float_str);
+
+    // bytes (passthrough)
+    const bytes_str = try (Value{ .bytes = "hello" }).format(&buf);
+    try std.testing.expectEqualStrings("hello", bytes_str);
+
+    // bytes empty string
+    const empty_str = try (Value{ .bytes = "" }).format(&buf);
+    try std.testing.expectEqualStrings("", empty_str);
+}
