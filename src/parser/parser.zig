@@ -88,10 +88,10 @@ pub const Parser = struct {
             cols.append(alloc, .{ .all_columns = {} }) catch return ParseError.OutOfMemory;
             self.advance();
         } else {
-            cols.append(alloc, .{ .named = try self.expectIdentifier() }) catch return ParseError.OutOfMemory;
+            cols.append(alloc, try self.parseSelectColumn()) catch return ParseError.OutOfMemory;
             while (self.current.type == .comma) {
                 self.advance();
-                cols.append(alloc, .{ .named = try self.expectIdentifier() }) catch return ParseError.OutOfMemory;
+                cols.append(alloc, try self.parseSelectColumn()) catch return ParseError.OutOfMemory;
             }
         }
 
@@ -211,6 +211,36 @@ pub const Parser = struct {
             .assignments = assignments.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
             .where_clause = where,
         };
+    }
+
+    fn parseSelectColumn(self: *Self) ParseError!ast.SelectColumn {
+        // Check for aggregate functions: COUNT, SUM, AVG, MIN, MAX
+        const agg_func: ?ast.AggregateFunc = switch (self.current.type) {
+            .kw_count => .count,
+            .kw_sum => .sum,
+            .kw_avg => .avg,
+            .kw_min => .min,
+            .kw_max => .max,
+            else => null,
+        };
+
+        if (agg_func) |func| {
+            self.advance(); // consume function name
+            try self.expect(.left_paren);
+
+            var column: ?[]const u8 = null;
+            if (self.current.type == .op_star) {
+                // COUNT(*)
+                self.advance();
+            } else {
+                column = try self.expectIdentifier();
+            }
+
+            try self.expect(.right_paren);
+            return .{ .aggregate = .{ .func = func, .column = column } };
+        }
+
+        return .{ .named = try self.expectIdentifier() };
     }
 
     fn parseOrderByColumn(self: *Self) ParseError!ast.OrderByClause {
@@ -633,6 +663,40 @@ test "parse UPDATE" {
         try std.testing.expectEqualStrings("price", upd.assignments[0].column);
         try std.testing.expectEqualStrings("name", upd.assignments[1].column);
         try std.testing.expect(upd.where_clause == null);
+    }
+}
+
+test "parse SELECT with aggregates" {
+    {
+        var p = Parser.init(std.testing.allocator, "SELECT COUNT(*) FROM users");
+        defer p.deinit();
+        const stmt = try p.parse();
+        const sel = stmt.select;
+        try std.testing.expectEqual(@as(usize, 1), sel.columns.len);
+        const agg = sel.columns[0].aggregate;
+        try std.testing.expectEqual(ast.AggregateFunc.count, agg.func);
+        try std.testing.expect(agg.column == null);
+    }
+    {
+        var p = Parser.init(std.testing.allocator, "SELECT SUM(price), AVG(price), MIN(id), MAX(id) FROM items");
+        defer p.deinit();
+        const stmt = try p.parse();
+        const sel = stmt.select;
+        try std.testing.expectEqual(@as(usize, 4), sel.columns.len);
+        try std.testing.expectEqual(ast.AggregateFunc.sum, sel.columns[0].aggregate.func);
+        try std.testing.expectEqualStrings("price", sel.columns[0].aggregate.column.?);
+        try std.testing.expectEqual(ast.AggregateFunc.avg, sel.columns[1].aggregate.func);
+        try std.testing.expectEqual(ast.AggregateFunc.min, sel.columns[2].aggregate.func);
+        try std.testing.expectEqual(ast.AggregateFunc.max, sel.columns[3].aggregate.func);
+    }
+    {
+        // COUNT(column_name)
+        var p = Parser.init(std.testing.allocator, "SELECT COUNT(name) FROM users");
+        defer p.deinit();
+        const stmt = try p.parse();
+        const sel = stmt.select;
+        try std.testing.expectEqual(ast.AggregateFunc.count, sel.columns[0].aggregate.func);
+        try std.testing.expectEqualStrings("name", sel.columns[0].aggregate.column.?);
     }
 }
 

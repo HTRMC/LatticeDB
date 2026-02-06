@@ -30,6 +30,13 @@ pub const TokenType = enum {
     kw_desc,
     kw_limit,
 
+    // Aggregate functions
+    kw_count,
+    kw_sum,
+    kw_avg,
+    kw_min,
+    kw_max,
+
     // Transaction keywords
     kw_begin,
     kw_commit,
@@ -105,6 +112,11 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "asc", .kw_asc },
     .{ "desc", .kw_desc },
     .{ "limit", .kw_limit },
+    .{ "count", .kw_count },
+    .{ "sum", .kw_sum },
+    .{ "avg", .kw_avg },
+    .{ "min", .kw_min },
+    .{ "max", .kw_max },
     .{ "begin", .kw_begin },
     .{ "commit", .kw_commit },
     .{ "rollback", .kw_rollback },

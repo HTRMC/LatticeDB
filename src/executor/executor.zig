@@ -335,6 +335,19 @@ pub const Executor = struct {
 
         const schema = result.schema;
 
+        // Check if this is an aggregate query
+        var has_aggregates = false;
+        for (sel.columns) |col| {
+            if (col == .aggregate) {
+                has_aggregates = true;
+                break;
+            }
+        }
+
+        if (has_aggregates) {
+            return self.execSelectAggregate(sel, &table, schema);
+        }
+
         // Determine which column indices to output
         const col_indices = try self.resolveSelectColumns(sel.columns, schema);
         defer self.allocator.free(col_indices);
@@ -474,6 +487,238 @@ pub const Executor = struct {
                 self.allocator.free(col_names);
                 return ExecError.OutOfMemory;
             },
+        } };
+    }
+
+    // ============================================================
+    // Aggregate SELECT (COUNT, SUM, AVG, MIN, MAX)
+    // ============================================================
+    fn execSelectAggregate(
+        self: *Self,
+        sel: ast.Select,
+        table: *Table,
+        schema: *const Schema,
+    ) ExecError!ExecResult {
+        const num_cols = sel.columns.len;
+
+        // Resolve column indices for each aggregate that references a column
+        const agg_col_indices = self.allocator.alloc(?usize, num_cols) catch {
+            return ExecError.OutOfMemory;
+        };
+        defer self.allocator.free(agg_col_indices);
+
+        for (sel.columns, 0..) |col, i| {
+            switch (col) {
+                .aggregate => |agg| {
+                    if (agg.column) |col_name| {
+                        var found = false;
+                        for (schema.columns, 0..) |sc, ci| {
+                            if (std.ascii.eqlIgnoreCase(sc.name, col_name)) {
+                                agg_col_indices[i] = ci;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) return ExecError.ColumnNotFound;
+                    } else {
+                        agg_col_indices[i] = null; // COUNT(*)
+                    }
+                },
+                .named => |name| {
+                    // Mixed aggregate and non-aggregate columns (without GROUP BY = error)
+                    // For now, allow it but it returns value from last row
+                    var found = false;
+                    for (schema.columns, 0..) |sc, ci| {
+                        if (std.ascii.eqlIgnoreCase(sc.name, name)) {
+                            agg_col_indices[i] = ci;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) return ExecError.ColumnNotFound;
+                },
+                .all_columns => return ExecError.ColumnNotFound, // Can't mix * with aggregates
+            }
+        }
+
+        // Aggregate state
+        var count: u64 = 0;
+        const sums = self.allocator.alloc(f64, num_cols) catch return ExecError.OutOfMemory;
+        defer self.allocator.free(sums);
+        const mins = self.allocator.alloc(?f64, num_cols) catch return ExecError.OutOfMemory;
+        defer self.allocator.free(mins);
+        const maxs = self.allocator.alloc(?f64, num_cols) catch return ExecError.OutOfMemory;
+        defer self.allocator.free(maxs);
+        // Track string min/max for non-numeric types
+        const str_mins = self.allocator.alloc(?[]const u8, num_cols) catch return ExecError.OutOfMemory;
+        defer self.allocator.free(str_mins);
+        const str_maxs = self.allocator.alloc(?[]const u8, num_cols) catch return ExecError.OutOfMemory;
+        defer {
+            for (str_mins) |s| if (s) |v| self.allocator.free(v);
+            for (str_maxs) |s| if (s) |v| self.allocator.free(v);
+            self.allocator.free(str_maxs);
+        }
+        const non_null_counts = self.allocator.alloc(u64, num_cols) catch return ExecError.OutOfMemory;
+        defer self.allocator.free(non_null_counts);
+
+        for (0..num_cols) |i| {
+            sums[i] = 0;
+            mins[i] = null;
+            maxs[i] = null;
+            str_mins[i] = null;
+            str_maxs[i] = null;
+            non_null_counts[i] = 0;
+        }
+
+        // Use explicit txn or begin implicit for read
+        const txn = self.current_txn orelse self.beginImplicitTxn();
+
+        var iter = table.scanWithTxn(txn) catch {
+            self.abortImplicitTxn(txn);
+            return ExecError.StorageError;
+        };
+
+        while (iter.next() catch {
+            self.abortImplicitTxn(txn);
+            return ExecError.StorageError;
+        }) |row| {
+            defer iter.freeValues(row.values);
+
+            // Apply WHERE filter
+            if (sel.where_clause) |where| {
+                if (!self.evalWhere(where, schema, row.values)) continue;
+            }
+
+            count += 1;
+
+            // Accumulate aggregates
+            for (0..num_cols) |i| {
+                const ci = agg_col_indices[i] orelse continue;
+                const val = row.values[ci];
+
+                if (val == .null_value) continue;
+                non_null_counts[i] += 1;
+
+                const num_val: ?f64 = switch (val) {
+                    .integer => |v| @floatFromInt(v),
+                    .bigint => |v| @floatFromInt(v),
+                    .float => |v| v,
+                    else => null,
+                };
+
+                if (num_val) |nv| {
+                    sums[i] += nv;
+                    if (mins[i] == null or nv < mins[i].?) mins[i] = nv;
+                    if (maxs[i] == null or nv > maxs[i].?) maxs[i] = nv;
+                } else {
+                    // String comparison for MIN/MAX
+                    const sv = formatValue(self.allocator, val) catch {
+                        self.abortImplicitTxn(txn);
+                        return ExecError.OutOfMemory;
+                    };
+                    if (str_mins[i]) |cur| {
+                        if (std.mem.order(u8, sv, cur) == .lt) {
+                            self.allocator.free(cur);
+                            str_mins[i] = sv;
+                        } else if (str_maxs[i]) |cur_max| {
+                            if (std.mem.order(u8, sv, cur_max) == .gt) {
+                                self.allocator.free(cur_max);
+                                str_maxs[i] = sv;
+                            } else {
+                                self.allocator.free(sv);
+                            }
+                        } else {
+                            str_maxs[i] = sv;
+                        }
+                    } else {
+                        str_mins[i] = sv;
+                        str_maxs[i] = self.allocator.dupe(u8, sv) catch {
+                            self.abortImplicitTxn(txn);
+                            return ExecError.OutOfMemory;
+                        };
+                    }
+                }
+            }
+        }
+
+        self.commitImplicitTxn(txn);
+
+        // Build column headers and result row
+        const col_names = self.allocator.alloc([]const u8, num_cols) catch return ExecError.OutOfMemory;
+        errdefer {
+            for (col_names) |cn| self.allocator.free(cn);
+            self.allocator.free(col_names);
+        }
+
+        const formatted = self.allocator.alloc([]const u8, num_cols) catch return ExecError.OutOfMemory;
+        errdefer {
+            for (formatted) |f| self.allocator.free(f);
+            self.allocator.free(formatted);
+        }
+
+        for (sel.columns, 0..) |col, i| {
+            switch (col) {
+                .aggregate => |agg| {
+                    const func_name = switch (agg.func) {
+                        .count => "count",
+                        .sum => "sum",
+                        .avg => "avg",
+                        .min => "min",
+                        .max => "max",
+                    };
+                    col_names[i] = if (agg.column) |cn|
+                        std.fmt.allocPrint(self.allocator, "{s}({s})", .{ func_name, cn }) catch return ExecError.OutOfMemory
+                    else
+                        std.fmt.allocPrint(self.allocator, "{s}(*)", .{func_name}) catch return ExecError.OutOfMemory;
+
+                    formatted[i] = switch (agg.func) {
+                        .count => blk: {
+                            if (agg.column != null) {
+                                break :blk std.fmt.allocPrint(self.allocator, "{d}", .{non_null_counts[i]}) catch return ExecError.OutOfMemory;
+                            }
+                            break :blk std.fmt.allocPrint(self.allocator, "{d}", .{count}) catch return ExecError.OutOfMemory;
+                        },
+                        .sum => std.fmt.allocPrint(self.allocator, "{d:.6}", .{sums[i]}) catch return ExecError.OutOfMemory,
+                        .avg => blk: {
+                            if (non_null_counts[i] == 0) {
+                                break :blk self.allocator.dupe(u8, "NULL") catch return ExecError.OutOfMemory;
+                            }
+                            break :blk std.fmt.allocPrint(self.allocator, "{d:.6}", .{sums[i] / @as(f64, @floatFromInt(non_null_counts[i]))}) catch return ExecError.OutOfMemory;
+                        },
+                        .min => blk: {
+                            if (mins[i]) |m| {
+                                break :blk std.fmt.allocPrint(self.allocator, "{d:.6}", .{m}) catch return ExecError.OutOfMemory;
+                            }
+                            if (str_mins[i]) |sm| {
+                                break :blk self.allocator.dupe(u8, sm) catch return ExecError.OutOfMemory;
+                            }
+                            break :blk self.allocator.dupe(u8, "NULL") catch return ExecError.OutOfMemory;
+                        },
+                        .max => blk: {
+                            if (maxs[i]) |m| {
+                                break :blk std.fmt.allocPrint(self.allocator, "{d:.6}", .{m}) catch return ExecError.OutOfMemory;
+                            }
+                            if (str_maxs[i]) |sm| {
+                                break :blk self.allocator.dupe(u8, sm) catch return ExecError.OutOfMemory;
+                            }
+                            break :blk self.allocator.dupe(u8, "NULL") catch return ExecError.OutOfMemory;
+                        },
+                    };
+                },
+                .named => |name| {
+                    col_names[i] = self.allocator.dupe(u8, name) catch return ExecError.OutOfMemory;
+                    formatted[i] = self.allocator.dupe(u8, "NULL") catch return ExecError.OutOfMemory;
+                },
+                .all_columns => unreachable,
+            }
+        }
+
+        const row_slice = self.allocator.alloc(ResultRow, 1) catch return ExecError.OutOfMemory;
+        row_slice[0] = .{ .values = formatted };
+
+        return .{ .rows = .{
+            .columns = col_names,
+            .rows = row_slice,
         } };
     }
 
@@ -1387,4 +1632,134 @@ test "executor LIMIT" {
     try std.testing.expectEqual(@as(usize, 2), sel2.rows.rows.len);
     try std.testing.expectEqualStrings("5", sel2.rows.rows[0].values[0]);
     try std.testing.expectEqualStrings("4", sel2.rows.rows[1].values[0]);
+}
+
+test "executor COUNT" {
+    const test_file = "test_exec_count.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+
+    const r1 = try exec.execute("INSERT INTO t VALUES (1, 'Alice')");
+    exec.freeResult(r1);
+    const r2 = try exec.execute("INSERT INTO t VALUES (2, 'Bob')");
+    exec.freeResult(r2);
+    const r3 = try exec.execute("INSERT INTO t VALUES (3, 'Charlie')");
+    exec.freeResult(r3);
+
+    // COUNT(*)
+    const sel = try exec.execute("SELECT COUNT(*) FROM t");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 1), sel.rows.rows.len);
+    try std.testing.expectEqualStrings("count(*)", sel.rows.columns[0]);
+    try std.testing.expectEqualStrings("3", sel.rows.rows[0].values[0]);
+
+    // COUNT(*) with WHERE
+    const sel2 = try exec.execute("SELECT COUNT(*) FROM t WHERE id > 1");
+    defer exec.freeResult(sel2);
+    try std.testing.expectEqualStrings("2", sel2.rows.rows[0].values[0]);
+}
+
+test "executor SUM AVG" {
+    const test_file = "test_exec_sum_avg.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const ct = try exec.execute("CREATE TABLE items (id INT, price INT)");
+    exec.freeResult(ct);
+
+    const r1 = try exec.execute("INSERT INTO items VALUES (1, 10)");
+    exec.freeResult(r1);
+    const r2 = try exec.execute("INSERT INTO items VALUES (2, 20)");
+    exec.freeResult(r2);
+    const r3 = try exec.execute("INSERT INTO items VALUES (3, 30)");
+    exec.freeResult(r3);
+
+    // SUM
+    const sel = try exec.execute("SELECT SUM(price) FROM items");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqualStrings("sum(price)", sel.rows.columns[0]);
+    // SUM = 60, formatted as float
+    const sum_val = std.fmt.parseFloat(f64, sel.rows.rows[0].values[0]) catch unreachable;
+    try std.testing.expectEqual(@as(f64, 60.0), sum_val);
+
+    // AVG
+    const sel2 = try exec.execute("SELECT AVG(price) FROM items");
+    defer exec.freeResult(sel2);
+    const avg_val = std.fmt.parseFloat(f64, sel2.rows.rows[0].values[0]) catch unreachable;
+    try std.testing.expectEqual(@as(f64, 20.0), avg_val);
+}
+
+test "executor MIN MAX" {
+    const test_file = "test_exec_min_max.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+
+    const r1 = try exec.execute("INSERT INTO t VALUES (5, 'Eve')");
+    exec.freeResult(r1);
+    const r2 = try exec.execute("INSERT INTO t VALUES (1, 'Alice')");
+    exec.freeResult(r2);
+    const r3 = try exec.execute("INSERT INTO t VALUES (9, 'Zara')");
+    exec.freeResult(r3);
+
+    // MIN/MAX on numeric column
+    const sel = try exec.execute("SELECT MIN(id), MAX(id) FROM t");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 2), sel.rows.columns.len);
+    try std.testing.expectEqualStrings("min(id)", sel.rows.columns[0]);
+    try std.testing.expectEqualStrings("max(id)", sel.rows.columns[1]);
+    const min_val = std.fmt.parseFloat(f64, sel.rows.rows[0].values[0]) catch unreachable;
+    const max_val = std.fmt.parseFloat(f64, sel.rows.rows[0].values[1]) catch unreachable;
+    try std.testing.expectEqual(@as(f64, 1.0), min_val);
+    try std.testing.expectEqual(@as(f64, 9.0), max_val);
+
+    // MIN/MAX on string column
+    const sel2 = try exec.execute("SELECT MIN(name), MAX(name) FROM t");
+    defer exec.freeResult(sel2);
+    try std.testing.expectEqualStrings("Alice", sel2.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("Zara", sel2.rows.rows[0].values[1]);
 }

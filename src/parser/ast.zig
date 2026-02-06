@@ -67,12 +67,26 @@ pub const Expression = union(enum) {
     },
 };
 
+/// Aggregate function type
+pub const AggregateFunc = enum {
+    count,
+    sum,
+    avg,
+    min,
+    max,
+};
+
 /// What columns to select
 pub const SelectColumn = union(enum) {
     /// SELECT *
     all_columns: void,
     /// SELECT col_name
     named: []const u8,
+    /// SELECT COUNT(*), SUM(col), etc.
+    aggregate: struct {
+        func: AggregateFunc,
+        column: ?[]const u8, // null for COUNT(*)
+    },
 };
 
 /// Top-level SQL statement
