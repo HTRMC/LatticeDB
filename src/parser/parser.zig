@@ -98,6 +98,33 @@ pub const Parser = struct {
         try self.expect(.kw_from);
         const table_name = try self.expectIdentifier();
 
+        // Optional JOIN clauses
+        var joins: ?[]const ast.JoinClause = null;
+        {
+            var join_list: std.ArrayList(ast.JoinClause) = .empty;
+            while (self.current.type == .kw_join or self.current.type == .kw_inner or self.current.type == .kw_left) {
+                var join_type: ast.JoinType = .inner;
+                if (self.current.type == .kw_left) {
+                    join_type = .left;
+                    self.advance();
+                } else if (self.current.type == .kw_inner) {
+                    self.advance();
+                }
+                try self.expect(.kw_join);
+                const join_table = try self.expectIdentifier();
+                try self.expect(.kw_on);
+                const on_cond = try self.parseExpression();
+                join_list.append(alloc, .{
+                    .join_type = join_type,
+                    .table_name = join_table,
+                    .on_condition = on_cond,
+                }) catch return ParseError.OutOfMemory;
+            }
+            if (join_list.items.len > 0) {
+                joins = join_list.toOwnedSlice(alloc) catch return ParseError.OutOfMemory;
+            }
+        }
+
         // Optional WHERE
         var where: ?*const ast.Expression = null;
         if (self.current.type == .kw_where) {
@@ -154,6 +181,7 @@ pub const Parser = struct {
         return .{
             .columns = cols.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
             .table_name = table_name,
+            .joins = joins,
             .where_clause = where,
             .group_by = group_by,
             .having_clause = having,
@@ -264,7 +292,13 @@ pub const Parser = struct {
             return .{ .aggregate = .{ .func = func, .column = column } };
         }
 
-        return .{ .named = try self.expectIdentifier() };
+        const first = try self.expectIdentifier();
+        // Handle table.column — preserve as qualified reference
+        if (self.current.type == .dot) {
+            self.advance();
+            return .{ .qualified = .{ .table = first, .column = try self.expectIdentifier() } };
+        }
+        return .{ .named = first };
     }
 
     fn parseOrderByColumn(self: *Self) ParseError!ast.OrderByClause {
@@ -472,8 +506,16 @@ pub const Parser = struct {
                 self.advance();
             },
             .identifier => {
-                expr.* = .{ .column_ref = self.current.text };
+                const name = self.current.text;
                 self.advance();
+                // Check for qualified ref: table.column
+                if (self.current.type == .dot) {
+                    self.advance();
+                    const col_name = try self.expectIdentifier();
+                    expr.* = .{ .qualified_ref = .{ .table = name, .column = col_name } };
+                } else {
+                    expr.* = .{ .column_ref = name };
+                }
             },
             .left_paren => {
                 self.advance();
@@ -757,6 +799,33 @@ test "parse SELECT with GROUP BY" {
         try std.testing.expectEqualStrings("dept", gb[0]);
         try std.testing.expectEqualStrings("role", gb[1]);
         try std.testing.expect(sel.order_by != null);
+    }
+}
+
+test "parse SELECT with JOIN" {
+    {
+        // INNER JOIN
+        var p = Parser.init(std.testing.allocator, "SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id");
+        defer p.deinit();
+        const stmt = try p.parse();
+        const sel = stmt.select;
+        const join_list = sel.joins.?;
+        try std.testing.expectEqual(@as(usize, 1), join_list.len);
+        try std.testing.expectEqual(ast.JoinType.inner, join_list[0].join_type);
+        try std.testing.expectEqualStrings("orders", join_list[0].table_name);
+        // ON condition should be a comparison of qualified refs
+        const on_cond = join_list[0].on_condition;
+        try std.testing.expectEqualStrings("users", on_cond.comparison.left.qualified_ref.table);
+        try std.testing.expectEqualStrings("id", on_cond.comparison.left.qualified_ref.column);
+    }
+    {
+        // LEFT JOIN
+        var p = Parser.init(std.testing.allocator, "SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id");
+        defer p.deinit();
+        const stmt = try p.parse();
+        const sel = stmt.select;
+        const join_list = sel.joins.?;
+        try std.testing.expectEqual(ast.JoinType.left, join_list[0].join_type);
     }
 }
 

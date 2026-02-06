@@ -323,6 +323,13 @@ pub const Executor = struct {
     // SELECT
     // ============================================================
     fn execSelect(self: *Self, sel: ast.Select) ExecError!ExecResult {
+        // Route to JOIN handler if joins are present
+        if (sel.joins) |join_list| {
+            if (join_list.len > 0) {
+                return self.execSelectJoin(sel);
+            }
+        }
+
         const result = self.catalog.openTable(sel.table_name) catch {
             return ExecError.StorageError;
         } orelse return ExecError.TableNotFound;
@@ -638,6 +645,9 @@ pub const Executor = struct {
                 .named => |name| {
                     agg_col_indices[i] = resolveColumnIndex(schema, name) orelse return ExecError.ColumnNotFound;
                 },
+                .qualified => |q| {
+                    agg_col_indices[i] = resolveColumnIndex(schema, q.column) orelse return ExecError.ColumnNotFound;
+                },
                 .all_columns => return ExecError.ColumnNotFound,
             }
         }
@@ -823,6 +833,7 @@ pub const Executor = struct {
                         std.fmt.allocPrint(self.allocator, "{s}(*)", .{func_name}) catch return ExecError.OutOfMemory;
                 },
                 .named => |name| self.allocator.dupe(u8, name) catch return ExecError.OutOfMemory,
+                .qualified => |q| self.allocator.dupe(u8, q.column) catch return ExecError.OutOfMemory,
                 .all_columns => unreachable,
             };
         }
@@ -854,6 +865,16 @@ pub const Executor = struct {
                         }
                         break :blk self.allocator.dupe(u8, "NULL") catch return ExecError.OutOfMemory;
                     },
+                    .qualified => |q| blk: {
+                        if (sel.group_by) |gb_cols| {
+                            for (gb_cols, 0..) |gb_name, gi| {
+                                if (std.ascii.eqlIgnoreCase(gb_name, q.column)) {
+                                    break :blk self.allocator.dupe(u8, state.group_values[gi]) catch return ExecError.OutOfMemory;
+                                }
+                            }
+                        }
+                        break :blk self.allocator.dupe(u8, "NULL") catch return ExecError.OutOfMemory;
+                    },
                     .all_columns => unreachable,
                 };
             }
@@ -872,6 +893,299 @@ pub const Executor = struct {
             if (std.ascii.eqlIgnoreCase(col.name, name)) return i;
         }
         return null;
+    }
+
+    // ============================================================
+    // JOIN execution (nested loop join)
+    // ============================================================
+    fn execSelectJoin(self: *Self, sel: ast.Select) ExecError!ExecResult {
+        const join_list = sel.joins orelse return ExecError.StorageError;
+        if (join_list.len == 0) return ExecError.StorageError;
+
+        // Currently support single JOIN only
+        const join = join_list[0];
+
+        // Open left table
+        const left_result = self.catalog.openTable(sel.table_name) catch {
+            return ExecError.StorageError;
+        } orelse return ExecError.TableNotFound;
+        defer self.catalog.freeSchema(left_result.schema);
+        var left_table = left_result.table;
+        left_table.txn_manager = self.txn_manager;
+        left_table.undo_log = self.undo_log;
+        const left_schema = left_result.schema;
+
+        // Open right table
+        const right_result = self.catalog.openTable(join.table_name) catch {
+            return ExecError.StorageError;
+        } orelse return ExecError.TableNotFound;
+        defer self.catalog.freeSchema(right_result.schema);
+        var right_table = right_result.table;
+        right_table.txn_manager = self.txn_manager;
+        right_table.undo_log = self.undo_log;
+        const right_schema = right_result.schema;
+
+        // Build combined schema columns for column resolution
+        const combined_count = left_schema.columns.len + right_schema.columns.len;
+        const combined_cols = self.allocator.alloc(Column, combined_count) catch return ExecError.OutOfMemory;
+        defer self.allocator.free(combined_cols);
+        @memcpy(combined_cols[0..left_schema.columns.len], left_schema.columns);
+        @memcpy(combined_cols[left_schema.columns.len..], right_schema.columns);
+
+        const combined_schema_val = Schema{ .columns = combined_cols };
+        const combined_schema: *const Schema = &combined_schema_val;
+
+        // Resolve output columns (with table name context for qualified refs)
+        const col_indices = try self.resolveSelectColumnsJoin(sel.columns, combined_schema, sel.table_name, join.table_name, left_schema.columns.len);
+        defer self.allocator.free(col_indices);
+
+        // Build column headers
+        const col_names = self.allocator.alloc([]const u8, col_indices.len) catch return ExecError.OutOfMemory;
+        for (col_indices, 0..) |ci, i| {
+            col_names[i] = self.allocator.dupe(u8, combined_cols[ci].name) catch {
+                for (col_names[0..i]) |cn| self.allocator.free(cn);
+                self.allocator.free(col_names);
+                return ExecError.OutOfMemory;
+            };
+        }
+
+        const txn = self.current_txn orelse self.beginImplicitTxn();
+
+        var rows: std.ArrayList(ResultRow) = .empty;
+        errdefer {
+            for (rows.items) |row| {
+                for (row.values) |v| self.allocator.free(v);
+                self.allocator.free(row.values);
+            }
+            rows.deinit(self.allocator);
+        }
+
+        // Materialize right table rows for nested loop
+        var right_rows: std.ArrayList([]Value) = .empty;
+        defer {
+            for (right_rows.items) |rv| {
+                self.allocator.free(rv);
+            }
+            right_rows.deinit(self.allocator);
+        }
+
+        {
+            var riter = right_table.scanWithTxn(txn) catch {
+                for (col_names) |cn| self.allocator.free(cn);
+                self.allocator.free(col_names);
+                self.abortImplicitTxn(txn);
+                return ExecError.StorageError;
+            };
+            while (riter.next() catch {
+                for (col_names) |cn| self.allocator.free(cn);
+                self.allocator.free(col_names);
+                self.abortImplicitTxn(txn);
+                return ExecError.StorageError;
+            }) |row| {
+                // Keep the values (don't free via iterator)
+                right_rows.append(self.allocator, row.values) catch {
+                    riter.freeValues(row.values);
+                    for (col_names) |cn| self.allocator.free(cn);
+                    self.allocator.free(col_names);
+                    self.abortImplicitTxn(txn);
+                    return ExecError.OutOfMemory;
+                };
+            }
+        }
+
+        // Nested loop: for each left row, scan all right rows
+        var liter = left_table.scanWithTxn(txn) catch {
+            for (col_names) |cn| self.allocator.free(cn);
+            self.allocator.free(col_names);
+            self.abortImplicitTxn(txn);
+            return ExecError.StorageError;
+        };
+
+        while (liter.next() catch {
+            for (col_names) |cn| self.allocator.free(cn);
+            self.allocator.free(col_names);
+            self.abortImplicitTxn(txn);
+            return ExecError.StorageError;
+        }) |left_row| {
+            defer liter.freeValues(left_row.values);
+
+            // Build combined values array
+            const combined_values = self.allocator.alloc(Value, combined_count) catch {
+                for (col_names) |cn| self.allocator.free(cn);
+                self.allocator.free(col_names);
+                self.abortImplicitTxn(txn);
+                return ExecError.OutOfMemory;
+            };
+            @memcpy(combined_values[0..left_schema.columns.len], left_row.values);
+
+            var matched = false;
+            for (right_rows.items) |right_vals| {
+                @memcpy(combined_values[left_schema.columns.len..], right_vals);
+
+                // Evaluate ON condition with combined schema
+                const on_match = self.evalJoinCondition(join.on_condition, sel.table_name, join.table_name, left_schema, right_schema, left_row.values, right_vals);
+                if (!on_match) continue;
+
+                // Apply WHERE filter on combined row
+                if (sel.where_clause) |where| {
+                    if (!evalExpr(where, combined_schema, combined_values)) continue;
+                }
+
+                matched = true;
+
+                // Format output columns
+                const formatted = self.allocator.alloc([]const u8, col_indices.len) catch {
+                    self.allocator.free(combined_values);
+                    for (col_names) |cn| self.allocator.free(cn);
+                    self.allocator.free(col_names);
+                    self.abortImplicitTxn(txn);
+                    return ExecError.OutOfMemory;
+                };
+                for (col_indices, 0..) |ci, i| {
+                    formatted[i] = formatValue(self.allocator, combined_values[ci]) catch {
+                        for (formatted[0..i]) |f| self.allocator.free(f);
+                        self.allocator.free(formatted);
+                        self.allocator.free(combined_values);
+                        for (col_names) |cn| self.allocator.free(cn);
+                        self.allocator.free(col_names);
+                        self.abortImplicitTxn(txn);
+                        return ExecError.OutOfMemory;
+                    };
+                }
+                rows.append(self.allocator, .{ .values = formatted }) catch {
+                    for (formatted) |f| self.allocator.free(f);
+                    self.allocator.free(formatted);
+                    self.allocator.free(combined_values);
+                    for (col_names) |cn| self.allocator.free(cn);
+                    self.allocator.free(col_names);
+                    self.abortImplicitTxn(txn);
+                    return ExecError.OutOfMemory;
+                };
+            }
+
+            // LEFT JOIN: emit row with NULLs for right side if no match
+            if (join.join_type == .left and !matched) {
+                // Fill right side with nulls
+                for (combined_values[left_schema.columns.len..]) |*v| {
+                    v.* = .{ .null_value = {} };
+                }
+
+                if (sel.where_clause) |where| {
+                    if (!evalExpr(where, combined_schema, combined_values)) {
+                        self.allocator.free(combined_values);
+                        continue;
+                    }
+                }
+
+                const formatted = self.allocator.alloc([]const u8, col_indices.len) catch {
+                    self.allocator.free(combined_values);
+                    for (col_names) |cn| self.allocator.free(cn);
+                    self.allocator.free(col_names);
+                    self.abortImplicitTxn(txn);
+                    return ExecError.OutOfMemory;
+                };
+                for (col_indices, 0..) |ci, i| {
+                    formatted[i] = formatValue(self.allocator, combined_values[ci]) catch {
+                        for (formatted[0..i]) |f| self.allocator.free(f);
+                        self.allocator.free(formatted);
+                        self.allocator.free(combined_values);
+                        for (col_names) |cn| self.allocator.free(cn);
+                        self.allocator.free(col_names);
+                        self.abortImplicitTxn(txn);
+                        return ExecError.OutOfMemory;
+                    };
+                }
+                rows.append(self.allocator, .{ .values = formatted }) catch {
+                    for (formatted) |f| self.allocator.free(f);
+                    self.allocator.free(formatted);
+                    self.allocator.free(combined_values);
+                    for (col_names) |cn| self.allocator.free(cn);
+                    self.allocator.free(col_names);
+                    self.abortImplicitTxn(txn);
+                    return ExecError.OutOfMemory;
+                };
+            }
+
+            self.allocator.free(combined_values);
+        }
+
+        self.commitImplicitTxn(txn);
+
+        return .{ .rows = .{
+            .columns = col_names,
+            .rows = rows.toOwnedSlice(self.allocator) catch {
+                for (col_names) |cn| self.allocator.free(cn);
+                self.allocator.free(col_names);
+                return ExecError.OutOfMemory;
+            },
+        } };
+    }
+
+    /// Evaluate a JOIN ON condition, resolving qualified refs to the correct table
+    fn evalJoinCondition(
+        self: *Self,
+        expr: *const ast.Expression,
+        left_table_name: []const u8,
+        right_table_name: []const u8,
+        left_schema: *const Schema,
+        right_schema: *const Schema,
+        left_values: []const Value,
+        right_values: []const Value,
+    ) bool {
+        switch (expr.*) {
+            .comparison => |cmp| {
+                const left_val = resolveJoinExprValue(cmp.left, left_table_name, right_table_name, left_schema, right_schema, left_values, right_values);
+                const right_val = resolveJoinExprValue(cmp.right, left_table_name, right_table_name, left_schema, right_schema, left_values, right_values);
+                return compareValues(left_val, cmp.op, right_val);
+            },
+            .and_expr => |a| {
+                return self.evalJoinCondition(a.left, left_table_name, right_table_name, left_schema, right_schema, left_values, right_values) and
+                    self.evalJoinCondition(a.right, left_table_name, right_table_name, left_schema, right_schema, left_values, right_values);
+            },
+            .or_expr => |o| {
+                return self.evalJoinCondition(o.left, left_table_name, right_table_name, left_schema, right_schema, left_values, right_values) or
+                    self.evalJoinCondition(o.right, left_table_name, right_table_name, left_schema, right_schema, left_values, right_values);
+            },
+            else => return false,
+        }
+    }
+
+    fn resolveJoinExprValue(
+        expr: *const ast.Expression,
+        left_table_name: []const u8,
+        right_table_name: []const u8,
+        left_schema: *const Schema,
+        right_schema: *const Schema,
+        left_values: []const Value,
+        right_values: []const Value,
+    ) Value {
+        switch (expr.*) {
+            .qualified_ref => |qr| {
+                if (std.ascii.eqlIgnoreCase(qr.table, left_table_name)) {
+                    if (resolveColumnIndex(left_schema, qr.column)) |idx| {
+                        return left_values[idx];
+                    }
+                }
+                if (std.ascii.eqlIgnoreCase(qr.table, right_table_name)) {
+                    if (resolveColumnIndex(right_schema, qr.column)) |idx| {
+                        return right_values[idx];
+                    }
+                }
+                return .{ .null_value = {} };
+            },
+            .column_ref => |name| {
+                // Try left table first, then right
+                if (resolveColumnIndex(left_schema, name)) |idx| {
+                    return left_values[idx];
+                }
+                if (resolveColumnIndex(right_schema, name)) |idx| {
+                    return right_values[idx];
+                }
+                return .{ .null_value = {} };
+            },
+            .literal => |lit| return litToStorageValue(lit),
+            else => return .{ .null_value = {} },
+        }
     }
 
     fn orderCompareRows(
@@ -1112,6 +1426,19 @@ pub const Executor = struct {
                 // Bare column ref - treat as truthy if not null/false/zero
                 return true;
             },
+            .qualified_ref => |qr| {
+                // Resolve as column_ref using just the column name (table prefix ignored in combined schema)
+                if (resolveColumnIndex(schema, qr.column)) |idx| {
+                    const val = values[idx];
+                    return switch (val) {
+                        .null_value => false,
+                        .boolean => |b| b,
+                        .integer => |i| i != 0,
+                        else => true,
+                    };
+                }
+                return true;
+            },
         }
     }
 
@@ -1121,6 +1448,15 @@ pub const Executor = struct {
                 // Find column index
                 for (schema.columns, 0..) |col, i| {
                     if (std.ascii.eqlIgnoreCase(col.name, name)) {
+                        return values[i];
+                    }
+                }
+                return .{ .null_value = {} };
+            },
+            .qualified_ref => |qr| {
+                // Resolve by column name (table prefix ignored — uses combined schema)
+                for (schema.columns, 0..) |col, i| {
+                    if (std.ascii.eqlIgnoreCase(col.name, qr.column)) {
                         return values[i];
                     }
                 }
@@ -1226,6 +1562,17 @@ pub const Executor = struct {
     // ============================================================
 
     fn resolveSelectColumns(self: *Self, sel_cols: []const ast.SelectColumn, schema: *const Schema) ExecError![]usize {
+        return self.resolveSelectColumnsJoin(sel_cols, schema, null, null, 0);
+    }
+
+    fn resolveSelectColumnsJoin(
+        self: *Self,
+        sel_cols: []const ast.SelectColumn,
+        schema: *const Schema,
+        left_table: ?[]const u8,
+        right_table: ?[]const u8,
+        left_col_count: usize,
+    ) ExecError![]usize {
         if (sel_cols.len == 1 and sel_cols[0] == .all_columns) {
             // SELECT * — all columns
             const indices = self.allocator.alloc(usize, schema.columns.len) catch {
@@ -1242,18 +1589,49 @@ pub const Executor = struct {
         };
 
         for (sel_cols, 0..) |sc, i| {
-            const name = sc.named;
-            var found = false;
-            for (schema.columns, 0..) |col, ci| {
-                if (std.ascii.eqlIgnoreCase(col.name, name)) {
-                    indices[i] = ci;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                self.allocator.free(indices);
-                return ExecError.ColumnNotFound;
+            switch (sc) {
+                .named => |name| {
+                    var found = false;
+                    for (schema.columns, 0..) |col, ci| {
+                        if (std.ascii.eqlIgnoreCase(col.name, name)) {
+                            indices[i] = ci;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        self.allocator.free(indices);
+                        return ExecError.ColumnNotFound;
+                    }
+                },
+                .qualified => |q| {
+                    // Determine which table region to search
+                    var search_start: usize = 0;
+                    var search_end: usize = schema.columns.len;
+                    if (left_table != null and right_table != null) {
+                        if (std.ascii.eqlIgnoreCase(q.table, left_table.?)) {
+                            search_end = left_col_count;
+                        } else if (std.ascii.eqlIgnoreCase(q.table, right_table.?)) {
+                            search_start = left_col_count;
+                        }
+                    }
+                    var found = false;
+                    for (schema.columns[search_start..search_end], search_start..) |col, ci| {
+                        if (std.ascii.eqlIgnoreCase(col.name, q.column)) {
+                            indices[i] = ci;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        self.allocator.free(indices);
+                        return ExecError.ColumnNotFound;
+                    }
+                },
+                else => {
+                    self.allocator.free(indices);
+                    return ExecError.ColumnNotFound;
+                },
             }
         }
 
@@ -2011,6 +2389,107 @@ test "executor GROUP BY with WHERE" {
         }
         if (std.mem.eql(u8, row.values[0], "Tech")) {
             try std.testing.expectEqualStrings("1", row.values[1]); // only 1 tech item > 20
+        }
+    }
+}
+
+test "executor INNER JOIN" {
+    const test_file = "test_exec_join.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const ct1 = try exec.execute("CREATE TABLE users (id INT, name TEXT)");
+    exec.freeResult(ct1);
+    const ct2 = try exec.execute("CREATE TABLE orders (id INT, user_id INT, amount INT)");
+    exec.freeResult(ct2);
+
+    const usr1 = try exec.execute("INSERT INTO users VALUES (1, 'Alice')");
+    exec.freeResult(usr1);
+    const usr2 = try exec.execute("INSERT INTO users VALUES (2, 'Bob')");
+    exec.freeResult(usr2);
+    const usr3 = try exec.execute("INSERT INTO users VALUES (3, 'Charlie')");
+    exec.freeResult(usr3);
+
+    const o1 = try exec.execute("INSERT INTO orders VALUES (1, 1, 100)");
+    exec.freeResult(o1);
+    const o2 = try exec.execute("INSERT INTO orders VALUES (2, 1, 200)");
+    exec.freeResult(o2);
+    const o3 = try exec.execute("INSERT INTO orders VALUES (3, 2, 50)");
+    exec.freeResult(o3);
+
+    // INNER JOIN — should get 3 rows (Alice x2, Bob x1)
+    const sel = try exec.execute("SELECT name, amount FROM users JOIN orders ON users.id = orders.user_id");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 2), sel.rows.columns.len);
+    try std.testing.expectEqualStrings("name", sel.rows.columns[0]);
+    try std.testing.expectEqualStrings("amount", sel.rows.columns[1]);
+    try std.testing.expectEqual(@as(usize, 3), sel.rows.rows.len);
+
+    // Check Alice has 2 orders
+    var alice_count: usize = 0;
+    for (sel.rows.rows) |row| {
+        if (std.mem.eql(u8, row.values[0], "Alice")) alice_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), alice_count);
+}
+
+test "executor LEFT JOIN" {
+    const test_file = "test_exec_leftjoin.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const ct1 = try exec.execute("CREATE TABLE users (id INT, name TEXT)");
+    exec.freeResult(ct1);
+    const ct2 = try exec.execute("CREATE TABLE orders (id INT, user_id INT, amount INT)");
+    exec.freeResult(ct2);
+
+    const usr1 = try exec.execute("INSERT INTO users VALUES (1, 'Alice')");
+    exec.freeResult(usr1);
+    const usr2 = try exec.execute("INSERT INTO users VALUES (2, 'Bob')");
+    exec.freeResult(usr2);
+
+    const o1 = try exec.execute("INSERT INTO orders VALUES (1, 1, 100)");
+    exec.freeResult(o1);
+    // Bob has no orders
+
+    // LEFT JOIN — should get 2 rows (Alice with order, Bob with NULL)
+    const sel = try exec.execute("SELECT name, amount FROM users LEFT JOIN orders ON users.id = orders.user_id");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 2), sel.rows.rows.len);
+
+    // Find Bob's row — amount should be NULL
+    for (sel.rows.rows) |row| {
+        if (std.mem.eql(u8, row.values[0], "Bob")) {
+            try std.testing.expectEqualStrings("NULL", row.values[1]);
+        }
+        if (std.mem.eql(u8, row.values[0], "Alice")) {
+            try std.testing.expectEqualStrings("100", row.values[1]);
         }
     }
 }

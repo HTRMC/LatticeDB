@@ -41,6 +41,12 @@ pub const TokenType = enum {
     kw_group,
     kw_having,
 
+    // JOIN
+    kw_join,
+    kw_inner,
+    kw_left,
+    kw_on,
+
     // Transaction keywords
     kw_begin,
     kw_commit,
@@ -78,6 +84,7 @@ pub const TokenType = enum {
     right_paren, // )
     comma, // ,
     semicolon, // ;
+    dot, // .
 
     // Special
     eof,
@@ -123,6 +130,10 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "max", .kw_max },
     .{ "group", .kw_group },
     .{ "having", .kw_having },
+    .{ "join", .kw_join },
+    .{ "inner", .kw_inner },
+    .{ "left", .kw_left },
+    .{ "on", .kw_on },
     .{ "begin", .kw_begin },
     .{ "commit", .kw_commit },
     .{ "rollback", .kw_rollback },
@@ -178,6 +189,10 @@ pub const Lexer = struct {
             ';' => {
                 self.pos += 1;
                 return .{ .type = .semicolon, .text = ";", .position = start };
+            },
+            '.' => {
+                self.pos += 1;
+                return .{ .type = .dot, .text = ".", .position = start };
             },
             '+' => {
                 self.pos += 1;
