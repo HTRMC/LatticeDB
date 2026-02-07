@@ -123,6 +123,7 @@ pub const Statement = union(enum) {
     update: Update,
     delete: Delete,
     drop_table: DropTable,
+    alter_table: AlterTable,
     begin_txn: void,
     commit_txn: void,
     rollback_txn: void,
@@ -185,4 +186,13 @@ pub const SetClause = struct {
 
 pub const DropTable = struct {
     table_name: []const u8,
+};
+
+pub const AlterAction = union(enum) {
+    add_column: ColumnDef,
+};
+
+pub const AlterTable = struct {
+    table_name: []const u8,
+    action: AlterAction,
 };

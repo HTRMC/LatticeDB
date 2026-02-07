@@ -217,10 +217,15 @@ pub const Tuple = struct {
         const col_count = schema.columns.len;
         const bitmap_size = schema.nullBitmapSize();
 
-        if (data.len < bitmap_size) return error.BufferTooSmall;
-
         const values = try allocator.alloc(Value, col_count);
         errdefer allocator.free(values);
+
+        if (data.len < bitmap_size) {
+            // Short tuple: fewer columns than current schema (after ALTER TABLE ADD COLUMN).
+            // Fill all columns with null as a safe fallback.
+            for (values) |*v| v.* = .null_value;
+            return values;
+        }
 
         // Read null bitmap
         var offset: usize = bitmap_size;
@@ -229,9 +234,14 @@ pub const Tuple = struct {
             if (is_null) {
                 values[i] = .null_value;
             } else {
-                const result = Value.decode(col.col_type, data[offset..]) catch return error.CorruptedTuple;
-                values[i] = result.value;
-                offset += result.size;
+                if (offset >= data.len) {
+                    // Data ran out — column was added after this tuple was written
+                    values[i] = .null_value;
+                } else {
+                    const result = Value.decode(col.col_type, data[offset..]) catch return error.CorruptedTuple;
+                    values[i] = result.value;
+                    offset += result.size;
+                }
             }
         }
 

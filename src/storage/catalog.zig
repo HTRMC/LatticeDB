@@ -238,6 +238,62 @@ pub const Catalog = struct {
         return table_id;
     }
 
+    /// Add a column to an existing table. The new column must be nullable
+    /// (existing rows will have NULL for it).
+    pub fn addColumn(self: *Self, table_name: []const u8, col: Column) CatalogError!void {
+        // Find the table entry in gp_tables
+        var table_id: ?PageId = null;
+        var old_col_count: u16 = 0;
+        var delete_tid: ?page_mod.TupleId = null;
+
+        {
+            var iter = self.tables_table.scan() catch {
+                return CatalogError.StorageError;
+            };
+
+            while (iter.next() catch { return CatalogError.StorageError; }) |row| {
+                defer iter.freeValues(row.values);
+                if (std.mem.eql(u8, row.values[1].bytes, table_name)) {
+                    table_id = @bitCast(row.values[0].integer);
+                    old_col_count = @intCast(row.values[2].integer);
+                    delete_tid = row.tid;
+                    break;
+                }
+            }
+        }
+
+        const tid = table_id orelse return CatalogError.TableNotFound;
+        const dtid = delete_tid orelse return CatalogError.StorageError;
+
+        const new_col_count = old_col_count + 1;
+
+        // Delete old gp_tables row and insert updated one
+        _ = self.tables_table.deleteTuple(null, dtid) catch {
+            return CatalogError.StorageError;
+        };
+        const table_vals = [_]Value{
+            .{ .integer = @bitCast(tid) },
+            .{ .bytes = table_name },
+            .{ .integer = @intCast(new_col_count) },
+        };
+        _ = self.tables_table.insertTuple(null, &table_vals) catch {
+            return CatalogError.StorageError;
+        };
+
+        // Insert new column into gp_columns
+        const col_vals = [_]Value{
+            .{ .integer = @bitCast(tid) },
+            .{ .integer = @intCast(old_col_count) }, // ordinal = old count (0-based)
+            .{ .bytes = col.name },
+            .{ .integer = @intCast(@intFromEnum(col.col_type)) },
+            .{ .integer = @intCast(col.max_length) },
+            .{ .integer = if (col.nullable) @as(i32, 1) else @as(i32, 0) },
+        };
+        _ = self.columns_table.insertTuple(null, &col_vals) catch {
+            return CatalogError.StorageError;
+        };
+    }
+
     /// Drop a user table by name. Removes entries from gp_tables and gp_columns.
     /// System tables (gp_tables, gp_columns) cannot be dropped.
     pub fn dropTable(self: *Self, name: []const u8) CatalogError!void {

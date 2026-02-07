@@ -56,6 +56,11 @@ pub const TokenType = enum {
     kw_like,
     kw_in,
 
+    // ALTER TABLE
+    kw_alter,
+    kw_add,
+    kw_column,
+
     // Transaction keywords
     kw_begin,
     kw_commit,
@@ -143,8 +148,11 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "inner", .kw_inner },
     .{ "left", .kw_left },
     .{ "on", .kw_on },
+    .{ "add", .kw_add },
+    .{ "alter", .kw_alter },
     .{ "as", .kw_as },
     .{ "between", .kw_between },
+    .{ "column", .kw_column },
     .{ "distinct", .kw_distinct },
     .{ "in", .kw_in },
     .{ "like", .kw_like },

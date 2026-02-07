@@ -51,6 +51,7 @@ pub const Parser = struct {
             .kw_delete => ast.Statement{ .delete = try self.parseDelete() },
             .kw_create => ast.Statement{ .create_table = try self.parseCreateTable() },
             .kw_drop => ast.Statement{ .drop_table = try self.parseDropTable() },
+            .kw_alter => ast.Statement{ .alter_table = try self.parseAlterTable() },
             .kw_begin => blk: {
                 self.advance();
                 break :blk ast.Statement{ .begin_txn = {} };
@@ -383,6 +384,25 @@ pub const Parser = struct {
         try self.expect(.kw_table);
         const table_name = try self.expectIdentifier();
         return .{ .table_name = table_name };
+    }
+
+    // ============================================================
+    // ALTER TABLE name ADD [COLUMN] coldef
+    // ============================================================
+    fn parseAlterTable(self: *Self) ParseError!ast.AlterTable {
+        try self.expect(.kw_alter);
+        try self.expect(.kw_table);
+        const table_name = try self.expectIdentifier();
+        try self.expect(.kw_add);
+        // Optional COLUMN keyword
+        if (self.current.type == .kw_column) {
+            self.advance();
+        }
+        const col_def = try self.parseColumnDef();
+        return .{
+            .table_name = table_name,
+            .action = .{ .add_column = col_def },
+        };
     }
 
     // ============================================================
@@ -1037,4 +1057,24 @@ test "parse IN list" {
     const where = sel.where_clause.?;
     try std.testing.expect(where.* == .in_list);
     try std.testing.expectEqual(@as(usize, 3), where.in_list.items.len);
+}
+
+test "parse ALTER TABLE ADD COLUMN" {
+    {
+        var p = Parser.init(std.testing.allocator, "ALTER TABLE users ADD COLUMN email TEXT");
+        defer p.deinit();
+        const stmt = try p.parse();
+        const at = stmt.alter_table;
+        try std.testing.expectEqualStrings("users", at.table_name);
+        try std.testing.expectEqualStrings("email", at.action.add_column.name);
+        try std.testing.expectEqual(ast.DataType.text, at.action.add_column.data_type);
+    }
+    {
+        // Without COLUMN keyword
+        var p = Parser.init(std.testing.allocator, "ALTER TABLE users ADD score FLOAT");
+        defer p.deinit();
+        const stmt = try p.parse();
+        const at = stmt.alter_table;
+        try std.testing.expectEqualStrings("score", at.action.add_column.name);
+    }
 }

@@ -98,6 +98,7 @@ pub const Executor = struct {
             .update => |upd| self.execUpdate(upd),
             .delete => |del| self.execDelete(del),
             .drop_table => |dt| self.execDropTable(dt),
+            .alter_table => |at| self.execAlterTable(at),
             .begin_txn => self.execBegin(),
             .commit_txn => self.execCommit(),
             .rollback_txn => self.execRollback(),
@@ -291,6 +292,36 @@ pub const Executor = struct {
             return ExecError.OutOfMemory;
         };
         return .{ .message = msg };
+    }
+
+    // ============================================================
+    // ALTER TABLE
+    // ============================================================
+    fn execAlterTable(self: *Self, at: ast.AlterTable) ExecError!ExecResult {
+        switch (at.action) {
+            .add_column => |col_def| {
+                // Enforce that added column must be nullable
+                // (existing rows will have NULL for it)
+                const col = Column{
+                    .name = col_def.name,
+                    .col_type = mapDataType(col_def.data_type),
+                    .max_length = col_def.max_length,
+                    .nullable = true, // Always nullable for ADD COLUMN
+                };
+
+                self.catalog.addColumn(at.table_name, col) catch |err| {
+                    return switch (err) {
+                        catalog_mod.CatalogError.TableNotFound => ExecError.TableNotFound,
+                        else => ExecError.StorageError,
+                    };
+                };
+
+                const msg = std.fmt.allocPrint(self.allocator, "ALTER TABLE", .{}) catch {
+                    return ExecError.OutOfMemory;
+                };
+                return .{ .message = msg };
+            },
+        }
     }
 
     // ============================================================
@@ -3246,4 +3277,89 @@ test "executor IN list" {
     const sel = try exec.execute("SELECT * FROM t WHERE id IN (1, 3)");
     defer exec.freeResult(sel);
     try std.testing.expectEqual(@as(usize, 2), sel.rows.rows.len);
+}
+
+test "executor ALTER TABLE ADD COLUMN" {
+    const test_file = "test_exec_alter_add.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    // Create table and insert row BEFORE adding column
+    const ct = try exec.execute("CREATE TABLE users (id INT, name TEXT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO users VALUES (1, 'Alice')");
+    exec.freeResult(ins);
+
+    // ALTER TABLE ADD COLUMN
+    const alt = try exec.execute("ALTER TABLE users ADD COLUMN email TEXT");
+    defer exec.freeResult(alt);
+    try std.testing.expectEqualStrings("ALTER TABLE", alt.message);
+
+    // Existing row should have NULL for new column
+    const sel = try exec.execute("SELECT * FROM users");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 3), sel.rows.columns.len);
+    try std.testing.expectEqualStrings("email", sel.rows.columns[2]);
+    try std.testing.expectEqual(@as(usize, 1), sel.rows.rows.len);
+    try std.testing.expectEqualStrings("1", sel.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("Alice", sel.rows.rows[0].values[1]);
+    try std.testing.expectEqualStrings("NULL", sel.rows.rows[0].values[2]);
+}
+
+test "executor ALTER TABLE ADD COLUMN then insert" {
+    const test_file = "test_exec_alter_ins.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+    const ins1 = try exec.execute("INSERT INTO t VALUES (1)");
+    exec.freeResult(ins1);
+
+    // Add column
+    const alt = try exec.execute("ALTER TABLE t ADD name TEXT");
+    exec.freeResult(alt);
+
+    // Insert with new column
+    const ins2 = try exec.execute("INSERT INTO t VALUES (2, 'Bob')");
+    exec.freeResult(ins2);
+
+    // Select should show both rows
+    const sel = try exec.execute("SELECT * FROM t");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 2), sel.rows.columns.len);
+    try std.testing.expectEqual(@as(usize, 2), sel.rows.rows.len);
+}
+
+test "executor ALTER TABLE nonexistent fails" {
+    const test_file = "test_exec_alter_noent.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const result = exec.execute("ALTER TABLE nonexistent ADD col INT");
+    try std.testing.expectError(ExecError.TableNotFound, result);
 }
