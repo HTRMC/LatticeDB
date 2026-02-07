@@ -41,6 +41,33 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+
+    // ── Benchmark executable (no msquic/openssl needed) ──────────────
+    const engine_mod = b.createModule(.{
+        .root_source_file = b.path("src/engine.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/zig/bench_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_mod.addImport("engine", engine_mod);
+
+    const bench_exe = b.addExecutable(.{
+        .name = "graphene-bench",
+        .root_module = bench_mod,
+    });
+
+    const bench_step = b.step("bench", "Run benchmarks");
+    const bench_run = b.addRunArtifact(bench_exe);
+    bench_step.dependOn(&bench_run.step);
+
+    if (b.args) |a| {
+        bench_run.addArgs(a);
+    }
 }
 
 fn linkDeps(b: *std.Build, compile: *std.Build.Step.Compile, msquic_path: ?[]const u8, openssl_path: ?[]const u8) void {
