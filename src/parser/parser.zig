@@ -959,3 +959,12 @@ test "parse SELECT with aliases" {
     try std.testing.expectEqualStrings("n", sel.aliases.?[0].?);
     try std.testing.expectEqualStrings("i", sel.aliases.?[1].?);
 }
+
+test "parse SELECT DISTINCT" {
+    var p = Parser.init(std.testing.allocator, "SELECT DISTINCT name FROM users");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    try std.testing.expect(sel.distinct);
+    try std.testing.expectEqual(@as(usize, 1), sel.columns.len);
+}

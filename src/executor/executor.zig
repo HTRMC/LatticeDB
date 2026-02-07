@@ -506,6 +506,50 @@ pub const Executor = struct {
             }
         }
 
+        // DISTINCT: dedup rows
+        if (sel.distinct) {
+            var seen = std.StringHashMap(void).init(self.allocator);
+            defer {
+                var key_iter = seen.keyIterator();
+                while (key_iter.next()) |k| self.allocator.free(k.*);
+                seen.deinit();
+            }
+            var write_idx: usize = 0;
+            for (rows.items) |row| {
+                // Build key from all column values concatenated with null separator
+                var key_parts: std.ArrayList(u8) = .empty;
+                for (row.values, 0..) |v, vi| {
+                    if (vi > 0) key_parts.append(self.allocator, 0) catch {
+                        key_parts.deinit(self.allocator);
+                        return ExecError.OutOfMemory;
+                    };
+                    key_parts.appendSlice(self.allocator, v) catch {
+                        key_parts.deinit(self.allocator);
+                        return ExecError.OutOfMemory;
+                    };
+                }
+                const key = key_parts.toOwnedSlice(self.allocator) catch {
+                    key_parts.deinit(self.allocator);
+                    return ExecError.OutOfMemory;
+                };
+
+                if (seen.contains(key)) {
+                    // Duplicate — free this row
+                    self.allocator.free(key);
+                    for (row.values) |v| self.allocator.free(v);
+                    self.allocator.free(row.values);
+                } else {
+                    seen.put(key, {}) catch {
+                        self.allocator.free(key);
+                        return ExecError.OutOfMemory;
+                    };
+                    rows.items[write_idx] = row;
+                    write_idx += 1;
+                }
+            }
+            rows.shrinkRetainingCapacity(write_idx);
+        }
+
         // LIMIT: truncate
         if (sel.limit) |limit_val| {
             const limit: usize = @intCast(@min(limit_val, rows.items.len));
@@ -3015,4 +3059,34 @@ test "executor SELECT with column aliases" {
     try std.testing.expectEqualStrings("user_name", sel.rows.columns[1]);
     try std.testing.expectEqualStrings("1", sel.rows.rows[0].values[0]);
     try std.testing.expectEqualStrings("Alice", sel.rows.rows[0].values[1]);
+}
+
+test "executor SELECT DISTINCT" {
+    const test_file = "test_exec_distinct.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, color TEXT)");
+    exec.freeResult(ct);
+    const r1 = try exec.execute("INSERT INTO t VALUES (1, 'red')");
+    exec.freeResult(r1);
+    const r2 = try exec.execute("INSERT INTO t VALUES (2, 'blue')");
+    exec.freeResult(r2);
+    const r3 = try exec.execute("INSERT INTO t VALUES (3, 'red')");
+    exec.freeResult(r3);
+    const r4 = try exec.execute("INSERT INTO t VALUES (4, 'blue')");
+    exec.freeResult(r4);
+
+    // DISTINCT should return 2 unique colors
+    const sel = try exec.execute("SELECT DISTINCT color FROM t");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 2), sel.rows.rows.len);
 }
