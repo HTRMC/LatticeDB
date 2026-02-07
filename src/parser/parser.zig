@@ -483,6 +483,18 @@ pub const Parser = struct {
 
     fn parseComparison(self: *Self) ParseError!*const ast.Expression {
         const left = try self.parsePrimary();
+        const alloc = self.arena();
+
+        // BETWEEN low AND high
+        if (self.current.type == .kw_between) {
+            self.advance();
+            const low = try self.parsePrimary();
+            try self.expect(.kw_and);
+            const high = try self.parsePrimary();
+            const expr = try alloc.create(ast.Expression);
+            expr.* = .{ .between_expr = .{ .value = left, .low = low, .high = high } };
+            return expr;
+        }
 
         const op: ?ast.CompOp = switch (self.current.type) {
             .op_eq => .eq,
@@ -497,7 +509,7 @@ pub const Parser = struct {
         if (op) |comp_op| {
             self.advance();
             const right = try self.parsePrimary();
-            const expr = try self.arena().create(ast.Expression);
+            const expr = try alloc.create(ast.Expression);
             expr.* = .{ .comparison = .{ .left = left, .op = comp_op, .right = right } };
             return expr;
         }
@@ -967,4 +979,13 @@ test "parse SELECT DISTINCT" {
     const sel = stmt.select;
     try std.testing.expect(sel.distinct);
     try std.testing.expectEqual(@as(usize, 1), sel.columns.len);
+}
+
+test "parse BETWEEN" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t WHERE id BETWEEN 1 AND 10");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    const where = sel.where_clause.?;
+    try std.testing.expect(where.* == .between_expr);
 }

@@ -1516,6 +1516,12 @@ pub const Executor = struct {
             .not_expr => |n| {
                 return !evalExpr(n.operand, schema, values);
             },
+            .between_expr => |b| {
+                const val = resolveExprValue(b.value, schema, values);
+                const low = resolveExprValue(b.low, schema, values);
+                const high = resolveExprValue(b.high, schema, values);
+                return compareValues(val, .gte, low) and compareValues(val, .lte, high);
+            },
             .literal => |lit| {
                 // Bare literal in WHERE - treat as truthy
                 return switch (lit) {
@@ -3087,6 +3093,36 @@ test "executor SELECT DISTINCT" {
 
     // DISTINCT should return 2 unique colors
     const sel = try exec.execute("SELECT DISTINCT color FROM t");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 2), sel.rows.rows.len);
+}
+
+test "executor BETWEEN" {
+    const test_file = "test_exec_between.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+    const r1 = try exec.execute("INSERT INTO t VALUES (1, 'a')");
+    exec.freeResult(r1);
+    const r2 = try exec.execute("INSERT INTO t VALUES (5, 'b')");
+    exec.freeResult(r2);
+    const r3 = try exec.execute("INSERT INTO t VALUES (10, 'c')");
+    exec.freeResult(r3);
+    const r4 = try exec.execute("INSERT INTO t VALUES (15, 'd')");
+    exec.freeResult(r4);
+
+    // BETWEEN 3 AND 12 should return rows with id 5 and 10
+    const sel = try exec.execute("SELECT * FROM t WHERE id BETWEEN 3 AND 12");
     defer exec.freeResult(sel);
     try std.testing.expectEqual(@as(usize, 2), sel.rows.rows.len);
 }

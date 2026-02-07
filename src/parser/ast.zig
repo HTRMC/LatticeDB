@@ -70,6 +70,12 @@ pub const Expression = union(enum) {
     not_expr: struct {
         operand: *const Expression,
     },
+    /// BETWEEN low AND high
+    between_expr: struct {
+        value: *const Expression,
+        low: *const Expression,
+        high: *const Expression,
+    },
 };
 
 /// Aggregate function type
