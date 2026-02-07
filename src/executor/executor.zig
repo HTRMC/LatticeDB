@@ -503,6 +503,115 @@ pub const Executor = struct {
     }
 
     // ============================================================
+    // Index Scan execution
+    // ============================================================
+
+    /// Try to use an index scan for the given SELECT. Returns true if index scan was used
+    /// and rows were populated, false if caller should fall back to seq scan.
+    fn tryIndexScan(
+        self: *Self,
+        sel: ast.Select,
+        table: *Table,
+        schema: *const Schema,
+        col_indices: []const usize,
+        txn: ?*Transaction,
+        rows: *std.ArrayList(ResultRow),
+    ) bool {
+        // Run planner
+        var planner = planner_mod.Planner.init(self.allocator, self.catalog);
+        const plan = planner.planSelect(sel) catch return false;
+        defer planner.freePlan(plan);
+
+        // Find the base node (unwrap filter/sort/limit wrappers)
+        const base = getBasePlanNode(plan);
+
+        // Only execute if planner chose an index scan
+        if (base.* != .index_scan) return false;
+
+        const is = base.index_scan;
+        var btree = btree_mod.BTree.open(table.buffer_pool, is.index_id);
+
+        switch (is.scan_type) {
+            .point => |key| {
+                // Point lookup: single key
+                const tid = btree.search(key) catch return false;
+                if (tid) |t| {
+                    self.fetchAndAppendRow(table, t, txn, sel, schema, col_indices, rows) catch return false;
+                }
+            },
+            .range => |r| {
+                // Range scan [low, high]
+                var range_iter = btree.rangeScan(r.low, r.high) catch return false;
+                while (range_iter.next() catch return false) |entry| {
+                    self.fetchAndAppendRow(table, entry.tid, txn, sel, schema, col_indices, rows) catch return false;
+                }
+            },
+            .range_from => |key| {
+                // key >= value → scan from key to max
+                var range_iter = btree.rangeScan(key, std.math.maxInt(i32)) catch return false;
+                while (range_iter.next() catch return false) |entry| {
+                    self.fetchAndAppendRow(table, entry.tid, txn, sel, schema, col_indices, rows) catch return false;
+                }
+            },
+            .range_to => |key| {
+                // key <= value → scan from min to key
+                var range_iter = btree.rangeScan(std.math.minInt(i32), key) catch return false;
+                while (range_iter.next() catch return false) |entry| {
+                    self.fetchAndAppendRow(table, entry.tid, txn, sel, schema, col_indices, rows) catch return false;
+                }
+            },
+        }
+
+        return true;
+    }
+
+    /// Get the base (leaf) plan node by unwrapping filter/sort/limit wrappers
+    fn getBasePlanNode(node: *const plan_mod.PlanNode) *const plan_mod.PlanNode {
+        return switch (node.*) {
+            .filter => |f| getBasePlanNode(f.child),
+            .sort => |s| getBasePlanNode(s.child),
+            .limit => |l| getBasePlanNode(l.child),
+            else => node,
+        };
+    }
+
+    /// Fetch a tuple by TupleId, apply WHERE filter, format, and append to rows
+    fn fetchAndAppendRow(
+        self: *Self,
+        table: *Table,
+        tid: page_mod.TupleId,
+        txn: ?*Transaction,
+        sel: ast.Select,
+        schema: *const Schema,
+        col_indices: []const usize,
+        rows: *std.ArrayList(ResultRow),
+    ) !void {
+        // Fetch tuple with MVCC visibility
+        const values = if (txn) |t|
+            (try table.getTupleTxn(tid, t))
+        else
+            (try table.getTuple(tid, null));
+
+        if (values == null) return; // deleted or invisible
+        const vals = values.?;
+        defer self.allocator.free(vals);
+
+        // Apply residual WHERE filter
+        if (sel.where_clause) |where| {
+            if (!self.evalWhere(where, schema, vals)) return;
+        }
+
+        // Format selected columns
+        const formatted = try self.allocator.alloc([]const u8, col_indices.len);
+        errdefer self.allocator.free(formatted);
+        for (col_indices, 0..) |ci, i| {
+            formatted[i] = try formatValue(self.allocator, vals[ci]);
+        }
+
+        try rows.append(self.allocator, .{ .values = formatted });
+    }
+
+    // ============================================================
     // INSERT INTO
     // ============================================================
     fn execInsert(self: *Self, ins: ast.Insert) ExecError!ExecResult {
@@ -626,36 +735,51 @@ pub const Executor = struct {
             rows.deinit(self.allocator);
         }
 
-        var iter = table.scanWithTxn(txn) catch {
-            for (col_names) |cn| self.allocator.free(cn);
-            self.allocator.free(col_names);
-            self.abortImplicitTxn(txn);
-            return ExecError.StorageError;
-        };
+        // Try index scan first
+        const used_index = self.tryIndexScan(sel, &table, schema, col_indices, txn, &rows);
 
-        while (iter.next() catch {
-            for (col_names) |cn| self.allocator.free(cn);
-            self.allocator.free(col_names);
-            self.abortImplicitTxn(txn);
-            return ExecError.StorageError;
-        }) |row| {
-            defer iter.freeValues(row.values);
-
-            // Apply WHERE filter
-            if (sel.where_clause) |where| {
-                if (!self.evalWhere(where, schema, row.values)) continue;
-            }
-
-            // Format selected columns
-            const formatted = self.allocator.alloc([]const u8, col_indices.len) catch {
+        if (!used_index) {
+            // Fall back to sequential scan
+            var iter = table.scanWithTxn(txn) catch {
                 for (col_names) |cn| self.allocator.free(cn);
                 self.allocator.free(col_names);
                 self.abortImplicitTxn(txn);
-                return ExecError.OutOfMemory;
+                return ExecError.StorageError;
             };
-            for (col_indices, 0..) |ci, i| {
-                formatted[i] = formatValue(self.allocator, row.values[ci]) catch {
-                    for (formatted[0..i]) |f| self.allocator.free(f);
+
+            while (iter.next() catch {
+                for (col_names) |cn| self.allocator.free(cn);
+                self.allocator.free(col_names);
+                self.abortImplicitTxn(txn);
+                return ExecError.StorageError;
+            }) |row| {
+                defer iter.freeValues(row.values);
+
+                // Apply WHERE filter
+                if (sel.where_clause) |where| {
+                    if (!self.evalWhere(where, schema, row.values)) continue;
+                }
+
+                // Format selected columns
+                const formatted = self.allocator.alloc([]const u8, col_indices.len) catch {
+                    for (col_names) |cn| self.allocator.free(cn);
+                    self.allocator.free(col_names);
+                    self.abortImplicitTxn(txn);
+                    return ExecError.OutOfMemory;
+                };
+                for (col_indices, 0..) |ci, i| {
+                    formatted[i] = formatValue(self.allocator, row.values[ci]) catch {
+                        for (formatted[0..i]) |f| self.allocator.free(f);
+                        self.allocator.free(formatted);
+                        for (col_names) |cn| self.allocator.free(cn);
+                        self.allocator.free(col_names);
+                        self.abortImplicitTxn(txn);
+                        return ExecError.OutOfMemory;
+                    };
+                }
+
+                rows.append(self.allocator, .{ .values = formatted }) catch {
+                    for (formatted) |f| self.allocator.free(f);
                     self.allocator.free(formatted);
                     for (col_names) |cn| self.allocator.free(cn);
                     self.allocator.free(col_names);
@@ -663,15 +787,6 @@ pub const Executor = struct {
                     return ExecError.OutOfMemory;
                 };
             }
-
-            rows.append(self.allocator, .{ .values = formatted }) catch {
-                for (formatted) |f| self.allocator.free(f);
-                self.allocator.free(formatted);
-                for (col_names) |cn| self.allocator.free(cn);
-                self.allocator.free(col_names);
-                self.abortImplicitTxn(txn);
-                return ExecError.OutOfMemory;
-            };
         }
 
         self.commitImplicitTxn(txn);
@@ -3969,4 +4084,190 @@ test "executor EXPLAIN with filter" {
 
     // Should show Filter node wrapping scan
     try std.testing.expect(std.mem.indexOf(u8, result.rows.rows[0].values[0], "Filter") != null);
+}
+
+test "executor index scan point lookup" {
+    const test_file = "test_exec_iscan_point.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE users (id INT, name TEXT)");
+    exec.freeResult(ct);
+
+    // Insert enough rows for index scan to kick in
+    var i: i32 = 0;
+    while (i < 50) : (i += 1) {
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO users VALUES ({d}, 'user{d}')", .{ i, i }) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+
+    const ci = try exec.execute("CREATE INDEX idx_users_id ON users (id)");
+    exec.freeResult(ci);
+
+    // Point lookup: SELECT * FROM users WHERE id = 25
+    const result = try exec.execute("SELECT * FROM users WHERE id = 25");
+    defer exec.freeResult(result);
+
+    try std.testing.expect(result.rows.rows.len == 1);
+    try std.testing.expectEqualStrings("25", result.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("user25", result.rows.rows[0].values[1]);
+}
+
+test "executor index scan range" {
+    const test_file = "test_exec_iscan_range.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, val TEXT)");
+    exec.freeResult(ct);
+
+    var i: i32 = 0;
+    while (i < 100) : (i += 1) {
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d}, 'v{d}')", .{ i, i }) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    // Range scan: id >= 95
+    const result = try exec.execute("SELECT * FROM t WHERE id >= 95");
+    defer exec.freeResult(result);
+
+    // Should get rows 95, 96, 97, 98, 99
+    try std.testing.expectEqual(@as(usize, 5), result.rows.rows.len);
+}
+
+test "executor index scan with residual filter" {
+    const test_file = "test_exec_iscan_resid.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+
+    var i: i32 = 0;
+    while (i < 50) : (i += 1) {
+        const name = if (@mod(i, 2) == 0) "even" else "odd";
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d}, '{s}')", .{ i, name }) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    // Point lookup with index on id, but residual filter on name
+    const result = try exec.execute("SELECT * FROM t WHERE id = 10 AND name = 'even'");
+    defer exec.freeResult(result);
+
+    try std.testing.expect(result.rows.rows.len == 1);
+    try std.testing.expectEqualStrings("10", result.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("even", result.rows.rows[0].values[1]);
+}
+
+test "executor index scan same results as seq scan" {
+    const test_file = "test_exec_iscan_same.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    var i: i32 = 0;
+    while (i < 20) : (i += 1) {
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d})", .{i}) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+
+    // Query without index (seq scan) — small table, planner will use seq scan
+    const seq_result = try exec.execute("SELECT * FROM t WHERE id = 10");
+    defer exec.freeResult(seq_result);
+
+    // Now create index — with 20 rows, planner picks index scan (cost 5.5 < 20)
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    const idx_result = try exec.execute("SELECT * FROM t WHERE id = 10");
+    defer exec.freeResult(idx_result);
+
+    // Both should return exactly one row with id=10
+    try std.testing.expectEqual(seq_result.rows.rows.len, idx_result.rows.rows.len);
+    try std.testing.expectEqualStrings(seq_result.rows.rows[0].values[0], idx_result.rows.rows[0].values[0]);
+}
+
+test "executor index scan with ORDER BY and LIMIT" {
+    const test_file = "test_exec_iscan_order.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, val TEXT)");
+    exec.freeResult(ct);
+
+    var i: i32 = 0;
+    while (i < 100) : (i += 1) {
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d}, 'v{d}')", .{ i, i }) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    // Range scan with ORDER BY DESC and LIMIT
+    const result = try exec.execute("SELECT * FROM t WHERE id >= 90 ORDER BY id DESC LIMIT 3");
+    defer exec.freeResult(result);
+
+    try std.testing.expectEqual(@as(usize, 3), result.rows.rows.len);
+    try std.testing.expectEqualStrings("99", result.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("98", result.rows.rows[1].values[0]);
+    try std.testing.expectEqualStrings("97", result.rows.rows[2].values[0]);
 }
