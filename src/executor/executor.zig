@@ -4906,3 +4906,360 @@ test "executor EXPLAIN after DROP INDEX shows seq scan" {
     defer exec.freeResult(expl2);
     try std.testing.expect(std.mem.indexOf(u8, expl2.rows.rows[0].values[0], "Seq Scan") != null);
 }
+
+test "executor LIMIT 0 returns no rows" {
+    const test_file = "test_exec_limit0.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (1)");
+    exec.freeResult(ins);
+
+    const result = try exec.execute("SELECT * FROM t LIMIT 0");
+    defer exec.freeResult(result);
+
+    try std.testing.expectEqual(@as(usize, 0), result.rows.rows.len);
+}
+
+test "executor SUM AVG MIN MAX on empty result" {
+    const test_file = "test_exec_agg_empty.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, price INT)");
+    exec.freeResult(ct);
+
+    // Table is empty → aggregates should return 1 row each
+
+    // COUNT(*) on empty → 0
+    const r1 = try exec.execute("SELECT COUNT(*) FROM t");
+    defer exec.freeResult(r1);
+    try std.testing.expectEqual(@as(usize, 1), r1.rows.rows.len);
+    try std.testing.expectEqualStrings("0", r1.rows.rows[0].values[0]);
+
+    // SUM on empty → 0.000000 (sum starts at 0)
+    const r2 = try exec.execute("SELECT SUM(price) FROM t");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqual(@as(usize, 1), r2.rows.rows.len);
+    try std.testing.expectEqualStrings("0.000000", r2.rows.rows[0].values[0]);
+
+    // AVG on empty → NULL (non_null_count == 0)
+    const r3 = try exec.execute("SELECT AVG(price) FROM t");
+    defer exec.freeResult(r3);
+    try std.testing.expectEqual(@as(usize, 1), r3.rows.rows.len);
+    try std.testing.expectEqualStrings("NULL", r3.rows.rows[0].values[0]);
+
+    // MIN on empty → NULL
+    const r4 = try exec.execute("SELECT MIN(price) FROM t");
+    defer exec.freeResult(r4);
+    try std.testing.expectEqual(@as(usize, 1), r4.rows.rows.len);
+    try std.testing.expectEqualStrings("NULL", r4.rows.rows[0].values[0]);
+
+    // MAX on empty → NULL
+    const r5 = try exec.execute("SELECT MAX(price) FROM t");
+    defer exec.freeResult(r5);
+    try std.testing.expectEqual(@as(usize, 1), r5.rows.rows.len);
+    try std.testing.expectEqualStrings("NULL", r5.rows.rows[0].values[0]);
+}
+
+test "executor SUM AVG MIN MAX with WHERE matching nothing" {
+    const test_file = "test_exec_agg_nomatch.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    var i: i32 = 1;
+    while (i <= 10) : (i += 1) {
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d})", .{i}) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+
+    // WHERE matches nothing
+    const r1 = try exec.execute("SELECT COUNT(*) FROM t WHERE id > 100");
+    defer exec.freeResult(r1);
+    try std.testing.expectEqualStrings("0", r1.rows.rows[0].values[0]);
+
+    const r2 = try exec.execute("SELECT AVG(id) FROM t WHERE id > 100");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqualStrings("NULL", r2.rows.rows[0].values[0]);
+}
+
+test "executor DROP system table fails" {
+    const test_file = "test_exec_drop_sys.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    try std.testing.expectError(ExecError.StorageError, exec.execute("DROP TABLE gp_tables"));
+    try std.testing.expectError(ExecError.StorageError, exec.execute("DROP TABLE gp_columns"));
+    try std.testing.expectError(ExecError.StorageError, exec.execute("DROP TABLE gp_indexes"));
+}
+
+test "executor CREATE INDEX nonexistent table fails" {
+    const test_file = "test_exec_cidx_no_tbl.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    try std.testing.expectError(ExecError.TableNotFound, exec.execute("CREATE INDEX idx ON nonexistent (id)"));
+}
+
+test "executor CREATE INDEX nonexistent column fails" {
+    const test_file = "test_exec_cidx_no_col.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    try std.testing.expectError(ExecError.StorageError, exec.execute("CREATE INDEX idx ON t (nonexistent)"));
+}
+
+test "executor LIKE edge cases" {
+    const test_file = "test_exec_like_edge.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+
+    const ins1 = try exec.execute("INSERT INTO t VALUES (1, 'alice')");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO t VALUES (2, 'bob')");
+    exec.freeResult(ins2);
+    const ins3 = try exec.execute("INSERT INTO t VALUES (3, '')");
+    exec.freeResult(ins3);
+    const ins4 = try exec.execute("INSERT INTO t VALUES (4, 'a')");
+    exec.freeResult(ins4);
+
+    // '%' matches everything (including empty string)
+    const r1 = try exec.execute("SELECT * FROM t WHERE name LIKE '%'");
+    defer exec.freeResult(r1);
+    try std.testing.expectEqual(@as(usize, 4), r1.rows.rows.len);
+
+    // '_' matches exactly 1 character
+    const r2 = try exec.execute("SELECT * FROM t WHERE name LIKE '_'");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqual(@as(usize, 1), r2.rows.rows.len);
+    try std.testing.expectEqualStrings("a", r2.rows.rows[0].values[1]);
+
+    // Ends-with pattern
+    const r3 = try exec.execute("SELECT * FROM t WHERE name LIKE '%ce'");
+    defer exec.freeResult(r3);
+    try std.testing.expectEqual(@as(usize, 1), r3.rows.rows.len);
+    try std.testing.expectEqualStrings("alice", r3.rows.rows[0].values[1]);
+
+    // Starts-with pattern
+    const r4 = try exec.execute("SELECT * FROM t WHERE name LIKE 'b%'");
+    defer exec.freeResult(r4);
+    try std.testing.expectEqual(@as(usize, 1), r4.rows.rows.len);
+    try std.testing.expectEqualStrings("bob", r4.rows.rows[0].values[1]);
+}
+
+test "executor SELECT with no matching WHERE returns empty" {
+    const test_file = "test_exec_no_match.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (1)");
+    exec.freeResult(ins);
+
+    const result = try exec.execute("SELECT * FROM t WHERE id = 999");
+    defer exec.freeResult(result);
+
+    try std.testing.expectEqual(@as(usize, 0), result.rows.rows.len);
+    // Columns should still be present
+    try std.testing.expectEqual(@as(usize, 1), result.rows.columns.len);
+}
+
+test "executor LEFT JOIN with unmatched rows" {
+    const test_file = "test_exec_lj_unmatched.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct1 = try exec.execute("CREATE TABLE users (id INT, name TEXT)");
+    exec.freeResult(ct1);
+    const ct2 = try exec.execute("CREATE TABLE orders (id INT, user_id INT)");
+    exec.freeResult(ct2);
+
+    const ins1 = try exec.execute("INSERT INTO users VALUES (1, 'alice')");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO users VALUES (2, 'bob')");
+    exec.freeResult(ins2);
+    // Only alice has an order
+    const ins3 = try exec.execute("INSERT INTO orders VALUES (100, 1)");
+    exec.freeResult(ins3);
+
+    const result = try exec.execute("SELECT users.name, orders.id FROM users LEFT JOIN orders ON users.id = orders.user_id");
+    defer exec.freeResult(result);
+
+    // Should have 2 rows: alice with order, bob with NULL
+    try std.testing.expectEqual(@as(usize, 2), result.rows.rows.len);
+}
+
+test "executor DELETE with WHERE matching nothing" {
+    const test_file = "test_exec_del_nomatch.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (1)");
+    exec.freeResult(ins);
+
+    // Delete with non-matching WHERE
+    const del = try exec.execute("DELETE FROM t WHERE id = 999");
+    defer exec.freeResult(del);
+    try std.testing.expectEqual(@as(u64, 0), del.row_count);
+
+    // Row should still exist
+    const sel = try exec.execute("SELECT * FROM t");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 1), sel.rows.rows.len);
+}
+
+test "executor UPDATE SET multiple columns" {
+    const test_file = "test_exec_upd_multi.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT, val INT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (1, 'old', 10)");
+    exec.freeResult(ins);
+
+    const upd = try exec.execute("UPDATE t SET name = 'new', val = 20 WHERE id = 1");
+    exec.freeResult(upd);
+
+    const sel = try exec.execute("SELECT * FROM t WHERE id = 1");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 1), sel.rows.rows.len);
+    try std.testing.expectEqualStrings("new", sel.rows.rows[0].values[1]);
+    try std.testing.expectEqualStrings("20", sel.rows.rows[0].values[2]);
+}
+
+test "executor INSERT INTO nonexistent table" {
+    const test_file = "test_exec_ins_noexist.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    try std.testing.expectError(ExecError.TableNotFound, exec.execute("INSERT INTO ghost VALUES (1)"));
+}
+
+test "executor SELECT FROM nonexistent table" {
+    const test_file = "test_exec_sel_noexist.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    try std.testing.expectError(ExecError.TableNotFound, exec.execute("SELECT * FROM ghost"));
+}

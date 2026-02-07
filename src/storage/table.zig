@@ -1224,3 +1224,88 @@ test "MVCC write conflict after first txn commits" {
     try std.testing.expectError(TableError.WriteConflict, result);
     tm.abort(txn3);
 }
+
+test "table tupleCount after inserts and deletes" {
+    const test_file = "test_table_count.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var table = try Table.create(std.testing.allocator, &bp, &schema);
+
+    try std.testing.expectEqual(@as(u64, 0), try table.tupleCount());
+
+    // Insert 5 rows
+    var i: i32 = 0;
+    while (i < 5) : (i += 1) {
+        _ = try table.insertTuple(null, &.{.{ .integer = i }});
+    }
+    try std.testing.expectEqual(@as(u64, 5), try table.tupleCount());
+}
+
+test "table getTuple invalid slot returns null" {
+    const test_file = "test_table_invalid_tid.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var table = try Table.create(std.testing.allocator, &bp, &schema);
+
+    // Insert one row to have a valid page
+    const tid = try table.insertTuple(null, &.{.{ .integer = 1 }});
+
+    // Access a slot that doesn't exist on the same page
+    const bad_tid = TupleId{ .page_id = tid.page_id, .slot_id = 999 };
+    const result = try table.getTuple(bad_tid, null);
+    try std.testing.expect(result == null);
+}
+
+test "table scan returns all rows after multiple inserts" {
+    const test_file = "test_table_scan_multi.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var table = try Table.create(std.testing.allocator, &bp, &schema);
+
+    var i: i32 = 0;
+    while (i < 10) : (i += 1) {
+        _ = try table.insertTuple(null, &.{.{ .integer = i }});
+    }
+
+    // Scan and count
+    var iter = try table.scan();
+    var count: usize = 0;
+    while (try iter.next()) |entry| {
+        defer iter.freeValues(entry.values);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 10), count);
+}

@@ -617,3 +617,61 @@ test "leaf capacity" {
     try std.testing.expect(LEAF_MAX_ENTRIES > 100);
     try std.testing.expect(INTERNAL_MAX_KEYS > 100);
 }
+
+test "leaf node empty entries and findKey" {
+    var buf: [PAGE_SIZE]u8 align(8) = undefined;
+    const leaf = LeafNode.init(&buf, 10);
+
+    // Empty leaf: entries() returns empty slice
+    try std.testing.expectEqual(@as(usize, 0), leaf.entries().len);
+    try std.testing.expectEqual(@as(u16, 0), leaf.keyCount());
+
+    // findKey on empty leaf returns not found
+    const result = leaf.findKey(42);
+    try std.testing.expect(!result.found);
+    try std.testing.expectEqual(@as(usize, 0), result.index);
+}
+
+test "leaf node insert then delete to empty" {
+    var buf: [PAGE_SIZE]u8 align(8) = undefined;
+    const leaf = LeafNode.init(&buf, 10);
+
+    // Insert a key
+    try std.testing.expect(leaf.insert(42, .{ .page_id = 1, .slot_id = 0 }));
+    try std.testing.expectEqual(@as(u16, 1), leaf.keyCount());
+
+    // Delete it
+    try std.testing.expect(leaf.delete(42));
+    try std.testing.expectEqual(@as(u16, 0), leaf.keyCount());
+
+    // findKey should not find it
+    try std.testing.expect(!leaf.findKey(42).found);
+}
+
+test "leaf node delete nonexistent key returns false" {
+    var buf: [PAGE_SIZE]u8 align(8) = undefined;
+    const leaf = LeafNode.init(&buf, 10);
+
+    _ = leaf.insert(10, .{ .page_id = 1, .slot_id = 0 });
+    _ = leaf.insert(20, .{ .page_id = 2, .slot_id = 0 });
+
+    // Delete key that doesn't exist
+    try std.testing.expect(!leaf.delete(15));
+    try std.testing.expectEqual(@as(u16, 2), leaf.keyCount());
+}
+
+test "internal node findChild with one key" {
+    var buf: [PAGE_SIZE]u8 align(8) = undefined;
+    const node = InternalNode.init(&buf, 20);
+    node.setFirstChild(100); // first child = page 100
+
+    // Insert one key: split at key=50, right child=200
+    try std.testing.expect(node.insertKeyChild(50, 200));
+    try std.testing.expectEqual(@as(u16, 1), node.keyCount());
+
+    // findChild: key < 50 → first child (100)
+    try std.testing.expectEqual(@as(PageId, 100), node.findChild(10));
+    // findChild: key >= 50 → second child (200)
+    try std.testing.expectEqual(@as(PageId, 200), node.findChild(50));
+    try std.testing.expectEqual(@as(PageId, 200), node.findChild(99));
+}

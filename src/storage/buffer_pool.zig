@@ -743,3 +743,80 @@ test "buffer pool single frame pool" {
     try std.testing.expectEqualStrings("data-on-page-0", refetched_data);
     try bp.unpinPage(r0.page_id, false);
 }
+
+test "buffer pool flush non-dirty page is no-op" {
+    const test_file = "test_bp_flush_clean.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 10);
+    defer bp.deinit();
+
+    const r = try bp.newPage();
+    var pg = r.page;
+    _ = pg.insertTuple("data");
+    // Unpin as NOT dirty
+    try bp.unpinPage(r.page_id, false);
+
+    // Flush should be a no-op (page not dirty)
+    try bp.flushPage(r.page_id);
+    // No error means success
+}
+
+test "buffer pool deletePage frees frame" {
+    const test_file = "test_bp_delete_free.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 2);
+    defer bp.deinit();
+
+    const r0 = try bp.newPage();
+    try bp.unpinPage(r0.page_id, false);
+
+    const r1 = try bp.newPage();
+    try bp.unpinPage(r1.page_id, false);
+
+    // Delete page 0 — frees a frame
+    try bp.deletePage(r0.page_id);
+
+    // Pin count should be null (not in pool)
+    try std.testing.expectEqual(@as(?u32, null), bp.getPinCount(r0.page_id));
+
+    // Should be able to create a new page (frame is free)
+    const r2 = try bp.newPage();
+    try bp.unpinPage(r2.page_id, false);
+}
+
+test "buffer pool flushAllPages on clean pool" {
+    const test_file = "test_bp_flush_all_clean.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 10);
+    defer bp.deinit();
+
+    // No pages at all — flushAllPages should be a no-op
+    try bp.flushAllPages();
+
+    // Create pages but unpin as clean
+    const r = try bp.newPage();
+    try bp.unpinPage(r.page_id, false);
+    try bp.flushAllPages();
+}
+
+test "buffer pool flushPage unknown page" {
+    const test_file = "test_bp_flush_unknown.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 10);
+    defer bp.deinit();
+
+    // Flushing a page not in the pool should return PageNotFound
+    try std.testing.expectError(BufferPoolError.PageNotFound, bp.flushPage(999));
+}

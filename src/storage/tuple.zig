@@ -610,3 +610,102 @@ test "value format" {
     const empty_str = try (Value{ .bytes = "" }).format(&buf);
     try std.testing.expectEqualStrings("", empty_str);
 }
+
+test "tuple many columns with mixed nulls" {
+    const allocator = std.testing.allocator;
+
+    // 8 columns — tests null bitmap across a full byte
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "c0", .col_type = .integer, .max_length = 0, .nullable = false },
+            .{ .name = "c1", .col_type = .integer, .max_length = 0, .nullable = true },
+            .{ .name = "c2", .col_type = .text, .max_length = 0, .nullable = true },
+            .{ .name = "c3", .col_type = .boolean, .max_length = 0, .nullable = true },
+            .{ .name = "c4", .col_type = .float, .max_length = 0, .nullable = true },
+            .{ .name = "c5", .col_type = .bigint, .max_length = 0, .nullable = true },
+            .{ .name = "c6", .col_type = .integer, .max_length = 0, .nullable = true },
+            .{ .name = "c7", .col_type = .text, .max_length = 0, .nullable = true },
+        },
+    };
+
+    // Alternate null/non-null: c1, c3, c5, c7 are null
+    const values = [_]Value{
+        .{ .integer = 42 },
+        .{ .null_value = {} },
+        .{ .bytes = "hello" },
+        .{ .null_value = {} },
+        .{ .float = 3.14 },
+        .{ .null_value = {} },
+        .{ .integer = 99 },
+        .{ .null_value = {} },
+    };
+
+    var buf: [512]u8 = undefined;
+    const written = try Tuple.serialize(&schema, &values, &buf);
+
+    const result = try Tuple.deserialize(allocator, &schema, buf[0..written]);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(Value{ .integer = 42 }, result[0]);
+    try std.testing.expect(result[1].isNull());
+    try std.testing.expectEqualStrings("hello", result[2].bytes);
+    try std.testing.expect(result[3].isNull());
+    try std.testing.expectEqual(Value{ .float = 3.14 }, result[4]);
+    try std.testing.expect(result[5].isNull());
+    try std.testing.expectEqual(Value{ .integer = 99 }, result[6]);
+    try std.testing.expect(result[7].isNull());
+}
+
+test "tuple serializedSize matches actual serialized length" {
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+            .{ .name = "name", .col_type = .text, .max_length = 0, .nullable = true },
+            .{ .name = "score", .col_type = .float, .max_length = 0, .nullable = false },
+        },
+    };
+
+    const values = [_]Value{
+        .{ .integer = 100 },
+        .{ .bytes = "test_name" },
+        .{ .float = 99.5 },
+    };
+
+    const predicted = try Tuple.serializedSize(&schema, &values);
+    var buf: [256]u8 = undefined;
+    const written = try Tuple.serialize(&schema, &values, &buf);
+
+    try std.testing.expectEqual(predicted, written);
+}
+
+test "tuple deserialize with fewer values than schema (short tuple)" {
+    const allocator = std.testing.allocator;
+
+    // Serialize with 2-column schema
+    const schema2 = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+            .{ .name = "name", .col_type = .text, .max_length = 0, .nullable = false },
+        },
+    };
+    const values = [_]Value{ .{ .integer = 42 }, .{ .bytes = "bob" } };
+    var buf: [256]u8 = undefined;
+    const written = try Tuple.serialize(&schema2, &values, &buf);
+
+    // Deserialize with 3-column schema (added nullable column)
+    const schema3 = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+            .{ .name = "name", .col_type = .text, .max_length = 0, .nullable = false },
+            .{ .name = "extra", .col_type = .integer, .max_length = 0, .nullable = true },
+        },
+    };
+
+    const result = try Tuple.deserialize(allocator, &schema3, buf[0..written]);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(Value{ .integer = 42 }, result[0]);
+    try std.testing.expectEqualStrings("bob", result[1].bytes);
+    // Third column should be null (short tuple)
+    try std.testing.expect(result[2].isNull());
+}

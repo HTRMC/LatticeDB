@@ -253,3 +253,55 @@ test "formatPlan four level nesting" {
     try std.testing.expect(std.mem.indexOf(u8, text, "      Index Scan") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "point lookup key=42") != null);
 }
+
+test "formatPlan zero cost and zero rows" {
+    const allocator = std.testing.allocator;
+
+    var node = PlanNode{ .seq_scan = .{
+        .table_name = "empty",
+        .table_id = 0,
+        .estimated_rows = 0,
+        .estimated_cost = 0.0,
+    } };
+
+    const text = try formatPlan(allocator, &node, 0);
+    defer allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "Seq Scan on empty") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cost=0.00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "rows=0") != null);
+}
+
+test "formatScanType all variants" {
+    const allocator = std.testing.allocator;
+
+    // range_from
+    var node_rf = PlanNode{ .index_scan = .{
+        .table_name = "t",
+        .table_id = 1,
+        .index_name = "idx",
+        .index_id = 2,
+        .column_ordinal = 0,
+        .scan_type = .{ .range_from = 100 },
+        .estimated_rows = 10,
+        .estimated_cost = 19.0,
+    } };
+    const text_rf = try formatPlan(allocator, &node_rf, 0);
+    defer allocator.free(text_rf);
+    try std.testing.expect(std.mem.indexOf(u8, text_rf, "range key>=100") != null);
+
+    // range_to
+    var node_rt = PlanNode{ .index_scan = .{
+        .table_name = "t",
+        .table_id = 1,
+        .index_name = "idx",
+        .index_id = 2,
+        .column_ordinal = 0,
+        .scan_type = .{ .range_to = 50 },
+        .estimated_rows = 10,
+        .estimated_cost = 19.0,
+    } };
+    const text_rt = try formatPlan(allocator, &node_rt, 0);
+    defer allocator.free(text_rt);
+    try std.testing.expect(std.mem.indexOf(u8, text_rt, "range key<=50") != null);
+}

@@ -299,3 +299,64 @@ test "disk manager multiple pages" {
         try std.testing.expectEqualStrings(expected, retrieved);
     }
 }
+
+test "disk manager read page beyond allocated" {
+    const test_file = "test_disk_manager_beyond.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
+
+    try dm.open();
+
+    // Allocate one page
+    _ = try dm.allocatePage();
+    try std.testing.expectEqual(@as(PageId, 1), dm.getNumPages());
+
+    // Try to read page 999 (beyond allocated)
+    var buffer: [PAGE_SIZE]u8 align(8) = undefined;
+    try std.testing.expectError(DiskManagerError.InvalidPageId, dm.readPage(999, &buffer));
+}
+
+test "disk manager operations on unopened file" {
+    const test_file = "test_disk_manager_closed.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deinit();
+
+    // Do NOT call dm.open()
+
+    // All operations should fail with FileNotOpen
+    var buffer: [PAGE_SIZE]u8 align(8) = undefined;
+    try std.testing.expectError(DiskManagerError.FileNotOpen, dm.readPage(0, &buffer));
+    try std.testing.expectError(DiskManagerError.FileNotOpen, dm.writePage(0, &buffer));
+    try std.testing.expectError(DiskManagerError.FileNotOpen, dm.allocatePage());
+    try std.testing.expectError(DiskManagerError.FileNotOpen, dm.flush());
+}
+
+test "disk manager getNumPages initially zero" {
+    const test_file = "test_disk_manager_init_zero.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
+
+    try dm.open();
+    try std.testing.expectEqual(@as(PageId, 0), dm.getNumPages());
+    try std.testing.expect(dm.isOpen());
+}
+
+test "disk manager write to INVALID_PAGE_ID fails" {
+    const test_file = "test_disk_manager_invalid.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
+
+    try dm.open();
+
+    var buffer: [PAGE_SIZE]u8 align(8) = [_]u8{0} ** PAGE_SIZE;
+    try std.testing.expectError(DiskManagerError.InvalidPageId, dm.writePage(page.INVALID_PAGE_ID, &buffer));
+}

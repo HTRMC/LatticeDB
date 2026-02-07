@@ -345,3 +345,65 @@ test "empty result set" {
     try std.testing.expectEqual(@as(usize, 2), rs.columns.len);
     try std.testing.expectEqual(@as(usize, 0), rs.rows.len);
 }
+
+test "encode decode all message types" {
+    const allocator = std.testing.allocator;
+
+    // Test each message type round-trips correctly
+    const types = [_]MessageType{ .query, .disconnect, .ok_message, .ok_row_count, .result_set, .error_response };
+    for (types) |mt| {
+        const payload = "test";
+        const msg = Message{ .msg_type = mt, .payload = payload };
+        const buf = try encode(msg, allocator);
+        defer allocator.free(buf);
+
+        const result = try decode(buf);
+        try std.testing.expectEqual(mt, result.msg.msg_type);
+        try std.testing.expectEqualStrings(payload, result.msg.payload);
+    }
+}
+
+test "result set with empty string values" {
+    const allocator = std.testing.allocator;
+
+    const columns = &[_][]const u8{ "id", "name" };
+    const rows = &[_][]const []const u8{
+        &[_][]const u8{ "1", "" }, // empty string value
+        &[_][]const u8{ "", "alice" }, // empty string in first col
+    };
+
+    const buf = try makeResultSet(columns, rows, allocator);
+    defer allocator.free(buf);
+
+    const result = try decode(buf);
+    var rs = try parseResultSet(result.msg.payload, allocator);
+    defer rs.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), rs.columns.len);
+    try std.testing.expectEqual(@as(usize, 2), rs.rows.len);
+    try std.testing.expectEqualStrings("1", rs.rows[0][0]);
+    try std.testing.expectEqualStrings("", rs.rows[0][1]);
+    try std.testing.expectEqualStrings("", rs.rows[1][0]);
+    try std.testing.expectEqualStrings("alice", rs.rows[1][1]);
+}
+
+test "single column single row result set" {
+    const allocator = std.testing.allocator;
+
+    const columns = &[_][]const u8{"count"};
+    const rows = &[_][]const []const u8{
+        &[_][]const u8{"42"},
+    };
+
+    const buf = try makeResultSet(columns, rows, allocator);
+    defer allocator.free(buf);
+
+    const result = try decode(buf);
+    var rs = try parseResultSet(result.msg.payload, allocator);
+    defer rs.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), rs.columns.len);
+    try std.testing.expectEqual(@as(usize, 1), rs.rows.len);
+    try std.testing.expectEqualStrings("count", rs.columns[0]);
+    try std.testing.expectEqualStrings("42", rs.rows[0][0]);
+}

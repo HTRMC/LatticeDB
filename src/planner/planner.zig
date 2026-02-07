@@ -587,3 +587,140 @@ test "planner reverse comparison uses index" {
     try std.testing.expect(plan.filter.child.index_scan.scan_type == .point);
     try std.testing.expectEqual(@as(i32, 50), plan.filter.child.index_scan.scan_type.point);
 }
+
+test "planner nonexistent table returns error" {
+    const test_file = "test_planner_no_table.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var planner = Planner.init(std.testing.allocator, &catalog);
+
+    const parser_mod = @import("../parser/parser.zig");
+    var parser = parser_mod.Parser.init(std.testing.allocator, "SELECT * FROM nonexistent WHERE id = 1");
+    defer parser.deinit();
+    const stmt = try parser.parse();
+
+    try std.testing.expectError(PlanError.TableNotFound, planner.planSelect(stmt.select));
+}
+
+test "planner empty table zero rows" {
+    const test_file = "test_planner_empty.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    const cols = [_]Column{
+        .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+    };
+    _ = try catalog.createTable("t", &cols);
+
+    _ = try catalog.createIndex("t", "idx_t_id", "id", false);
+
+    var planner = Planner.init(std.testing.allocator, &catalog);
+
+    const parser_mod = @import("../parser/parser.zig");
+    var parser = parser_mod.Parser.init(std.testing.allocator, "SELECT * FROM t WHERE id = 1");
+    defer parser.deinit();
+    const stmt = try parser.parse();
+
+    const plan = try planner.planSelect(stmt.select);
+    defer planner.freePlan(plan);
+
+    // 0 rows: seq_cost=0, index_cost=4+1.5=5.5 → seq scan is cheaper
+    try std.testing.expect(plan.* == .filter);
+    try std.testing.expect(plan.filter.child.* == .seq_scan);
+    try std.testing.expectEqual(@as(u64, 0), plan.filter.child.seq_scan.estimated_rows);
+}
+
+test "planner OR expression is not sargable" {
+    const test_file = "test_planner_or.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    const cols = [_]Column{
+        .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+    };
+    _ = try catalog.createTable("t", &cols);
+
+    const table_result = (try catalog.openTable("t")).?;
+    defer catalog.freeSchema(table_result.schema);
+    var table = table_result.table;
+    var i: i32 = 0;
+    while (i < 200) : (i += 1) {
+        _ = try table.insertTuple(null, &.{.{ .integer = i }});
+    }
+
+    _ = try catalog.createIndex("t", "idx_t_id", "id", false);
+
+    var planner = Planner.init(std.testing.allocator, &catalog);
+
+    const parser_mod = @import("../parser/parser.zig");
+    // OR is not sargable → should fall back to seq scan
+    var parser = parser_mod.Parser.init(std.testing.allocator, "SELECT * FROM t WHERE id = 1 OR id = 2");
+    defer parser.deinit();
+    const stmt = try parser.parse();
+
+    const plan = try planner.planSelect(stmt.select);
+    defer planner.freePlan(plan);
+
+    try std.testing.expect(plan.* == .filter);
+    try std.testing.expect(plan.filter.child.* == .seq_scan);
+}
+
+test "planner no WHERE clause always seq scan" {
+    const test_file = "test_planner_no_where.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    const cols = [_]Column{
+        .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+    };
+    _ = try catalog.createTable("t", &cols);
+
+    const table_result = (try catalog.openTable("t")).?;
+    defer catalog.freeSchema(table_result.schema);
+    var table = table_result.table;
+    var i: i32 = 0;
+    while (i < 100) : (i += 1) {
+        _ = try table.insertTuple(null, &.{.{ .integer = i }});
+    }
+
+    _ = try catalog.createIndex("t", "idx_t_id", "id", false);
+
+    var planner = Planner.init(std.testing.allocator, &catalog);
+
+    const parser_mod = @import("../parser/parser.zig");
+    // No WHERE clause → no predicate to analyze → seq scan
+    var parser = parser_mod.Parser.init(std.testing.allocator, "SELECT * FROM t");
+    defer parser.deinit();
+    const stmt = try parser.parse();
+
+    const plan = try planner.planSelect(stmt.select);
+    defer planner.freePlan(plan);
+
+    // No filter node when there's no WHERE
+    try std.testing.expect(plan.* == .seq_scan);
+}

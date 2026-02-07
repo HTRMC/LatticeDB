@@ -1044,3 +1044,119 @@ test "catalog drop table cascades indexes" {
     const entry = try catalog.findIndex("idx_t_id");
     try std.testing.expect(entry == null);
 }
+
+test "catalog drop system table fails" {
+    const test_file = "test_catalog_drop_sys.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    try std.testing.expectError(CatalogError.SystemTableError, catalog.dropTable("gp_tables"));
+    try std.testing.expectError(CatalogError.SystemTableError, catalog.dropTable("gp_columns"));
+    try std.testing.expectError(CatalogError.SystemTableError, catalog.dropTable("gp_indexes"));
+}
+
+test "catalog create index nonexistent table" {
+    const test_file = "test_catalog_idx_no_table.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    try std.testing.expectError(CatalogError.TableNotFound, catalog.createIndex("nonexistent", "idx", "id", false));
+}
+
+test "catalog create index nonexistent column" {
+    const test_file = "test_catalog_idx_no_col.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    const col = [_]Column{
+        .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+    };
+    _ = try catalog.createTable("t", &col);
+
+    // Column "nope" doesn't exist
+    try std.testing.expectError(CatalogError.StorageError, catalog.createIndex("t", "idx", "nope", false));
+}
+
+test "catalog getIndexesForTable empty" {
+    const test_file = "test_catalog_idx_empty.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    const col = [_]Column{
+        .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+    };
+    const table_id = try catalog.createTable("t", &col);
+
+    // No indexes created
+    const indexes = try catalog.getIndexesForTable(table_id);
+    defer catalog.freeIndexList(indexes);
+    try std.testing.expectEqual(@as(usize, 0), indexes.len);
+}
+
+test "catalog findIndex nonexistent returns null" {
+    const test_file = "test_catalog_find_idx_null.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    const result = try catalog.findIndex("nonexistent_index");
+    try std.testing.expect(result == null);
+}
+
+test "catalog findTableId nonexistent returns null" {
+    const test_file = "test_catalog_find_tbl_null.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    const result = try catalog.findTableId("nonexistent_table");
+    try std.testing.expect(result == null);
+}
+
+test "catalog drop nonexistent table fails" {
+    const test_file = "test_catalog_drop_noexist.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    try std.testing.expectError(CatalogError.TableNotFound, catalog.dropTable("nonexistent"));
+}

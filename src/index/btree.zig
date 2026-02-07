@@ -723,3 +723,90 @@ test "btree range scan entire range" {
     }
     try std.testing.expectEqual(@as(usize, 50), count);
 }
+
+test "btree rangeScan inverted bounds returns empty" {
+    const test_file = "test_btree_range_inv.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+
+    var btree = try BTree.create(&bp);
+
+    var i: i32 = 0;
+    while (i < 20) : (i += 1) {
+        try btree.insert(i, .{ .page_id = @intCast(i), .slot_id = 0 });
+    }
+
+    // Inverted bounds: low > high → 0 results
+    var iter = try btree.rangeScan(15, 5);
+    var count: usize = 0;
+    while (try iter.next()) |_| {
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), count);
+}
+
+test "btree rangeScan single key (low == high)" {
+    const test_file = "test_btree_range_single.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+
+    var btree = try BTree.create(&bp);
+
+    var i: i32 = 0;
+    while (i < 20) : (i += 1) {
+        try btree.insert(i, .{ .page_id = @intCast(i), .slot_id = 0 });
+    }
+
+    // Range [10, 10] → exactly 1 result
+    var iter = try btree.rangeScan(10, 10);
+    var count: usize = 0;
+    while (try iter.next()) |entry| {
+        try std.testing.expectEqual(@as(i32, 10), entry.key);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "btree search and delete verify consistency" {
+    const test_file = "test_btree_search_del.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+
+    var btree = try BTree.create(&bp);
+
+    // Insert keys 0..9
+    var i: i32 = 0;
+    while (i < 10) : (i += 1) {
+        try btree.insert(i, .{ .page_id = @intCast(i), .slot_id = 0 });
+    }
+
+    // Delete every other key (0, 2, 4, 6, 8)
+    i = 0;
+    while (i < 10) : (i += 2) {
+        try std.testing.expect(try btree.delete(i));
+    }
+
+    // Deleted keys should not be found
+    i = 0;
+    while (i < 10) : (i += 2) {
+        try std.testing.expect((try btree.search(i)) == null);
+    }
+
+    // Remaining keys (1, 3, 5, 7, 9) should be found
+    i = 1;
+    while (i < 10) : (i += 2) {
+        try std.testing.expect((try btree.search(i)) != null);
+    }
+}
