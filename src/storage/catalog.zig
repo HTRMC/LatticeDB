@@ -3,6 +3,7 @@ const page_mod = @import("page.zig");
 const buffer_pool_mod = @import("buffer_pool.zig");
 const tuple_mod = @import("tuple.zig");
 const table_mod = @import("table.zig");
+const btree_mod = @import("../index/btree.zig");
 
 const PageId = page_mod.PageId;
 const INVALID_PAGE_ID = page_mod.INVALID_PAGE_ID;
@@ -17,6 +18,8 @@ pub const CatalogError = error{
     TableAlreadyExists,
     TableNotFound,
     SystemTableError,
+    IndexAlreadyExists,
+    IndexNotFound,
     OutOfMemory,
     BufferPoolError,
     SerializationError,
@@ -43,6 +46,15 @@ pub const ColumnEntry = struct {
     nullable: bool,
 };
 
+/// Entry in the indexes catalog
+pub const IndexEntry = struct {
+    index_id: PageId,
+    table_id: PageId,
+    index_name: []const u8,
+    column_ordinal: u16,
+    is_unique: bool,
+};
+
 /// System catalog - stores metadata about all tables and columns.
 /// Uses two internal heap tables:
 ///   - gp_tables: (table_id: integer, name: varchar, column_count: integer)
@@ -56,6 +68,8 @@ pub const Catalog = struct {
     tables_table: Table,
     /// The heap table storing column metadata
     columns_table: Table,
+    /// The heap table storing index metadata
+    indexes_table: Table,
 
     /// Tracks all heap-allocated schemas so they can be freed on deinit
     owned_schemas: std.ArrayList(*const Schema),
@@ -66,6 +80,17 @@ pub const Catalog = struct {
             .{ .name = "table_id", .col_type = .integer, .max_length = 0, .nullable = false },
             .{ .name = "name", .col_type = .varchar, .max_length = MAX_NAME_LEN, .nullable = false },
             .{ .name = "column_count", .col_type = .integer, .max_length = 0, .nullable = false },
+        },
+    };
+
+    /// Schema for the gp_indexes catalog table
+    const indexes_schema = Schema{
+        .columns = &.{
+            .{ .name = "index_id", .col_type = .integer, .max_length = 0, .nullable = false },
+            .{ .name = "table_id", .col_type = .integer, .max_length = 0, .nullable = false },
+            .{ .name = "index_name", .col_type = .varchar, .max_length = MAX_NAME_LEN, .nullable = false },
+            .{ .name = "column_ordinal", .col_type = .integer, .max_length = 0, .nullable = false },
+            .{ .name = "is_unique", .col_type = .integer, .max_length = 0, .nullable = false },
         },
     };
 
@@ -83,13 +108,17 @@ pub const Catalog = struct {
 
     const Self = @This();
 
-    /// Initialize a new catalog - creates the two system tables
+    /// Initialize a new catalog - creates the three system tables
     pub fn init(allocator: std.mem.Allocator, buffer_pool: *BufferPool) CatalogError!Self {
         var tables_table = Table.create(allocator, buffer_pool, &tables_schema) catch {
             return CatalogError.StorageError;
         };
 
         var columns_table = Table.create(allocator, buffer_pool, &columns_schema) catch {
+            return CatalogError.StorageError;
+        };
+
+        const indexes_table = Table.create(allocator, buffer_pool, &indexes_schema) catch {
             return CatalogError.StorageError;
         };
 
@@ -113,11 +142,21 @@ pub const Catalog = struct {
             return CatalogError.StorageError;
         };
 
+        const indexes_vals = [_]Value{
+            .{ .integer = @bitCast(indexes_table.table_id) },
+            .{ .bytes = "gp_indexes" },
+            .{ .integer = @intCast(indexes_schema.columns.len) },
+        };
+        _ = tables_table.insertTuple(null, &indexes_vals) catch {
+            return CatalogError.StorageError;
+        };
+
         return .{
             .allocator = allocator,
             .buffer_pool = buffer_pool,
             .tables_table = tables_table,
             .columns_table = columns_table,
+            .indexes_table = indexes_table,
             .owned_schemas = .empty,
         };
     }
@@ -142,12 +181,14 @@ pub const Catalog = struct {
         buffer_pool: *BufferPool,
         tables_table_id: PageId,
         columns_table_id: PageId,
+        indexes_table_id: PageId,
     ) Self {
         return .{
             .allocator = allocator,
             .buffer_pool = buffer_pool,
             .tables_table = Table.open(allocator, buffer_pool, &tables_schema, tables_table_id),
             .columns_table = Table.open(allocator, buffer_pool, &columns_schema, columns_table_id),
+            .indexes_table = Table.open(allocator, buffer_pool, &indexes_schema, indexes_table_id),
             .owned_schemas = .empty,
         };
     }
@@ -294,11 +335,11 @@ pub const Catalog = struct {
         };
     }
 
-    /// Drop a user table by name. Removes entries from gp_tables and gp_columns.
-    /// System tables (gp_tables, gp_columns) cannot be dropped.
+    /// Drop a user table by name. Removes entries from gp_tables, gp_columns, and gp_indexes.
+    /// System tables (gp_tables, gp_columns, gp_indexes) cannot be dropped.
     pub fn dropTable(self: *Self, name: []const u8) CatalogError!void {
         // Block dropping system tables
-        if (std.mem.eql(u8, name, "gp_tables") or std.mem.eql(u8, name, "gp_columns")) {
+        if (std.mem.eql(u8, name, "gp_tables") or std.mem.eql(u8, name, "gp_columns") or std.mem.eql(u8, name, "gp_indexes")) {
             return CatalogError.SystemTableError;
         }
 
@@ -347,6 +388,173 @@ pub const Catalog = struct {
                 return CatalogError.StorageError;
             };
         }
+
+        // Cascade-delete indexes from gp_indexes
+        var idx_to_delete: std.ArrayList(page_mod.TupleId) = .empty;
+        defer idx_to_delete.deinit(self.allocator);
+        {
+            var idx_iter = self.indexes_table.scan() catch {
+                return CatalogError.StorageError;
+            };
+            while (idx_iter.next() catch { return CatalogError.StorageError; }) |row| {
+                defer idx_iter.freeValues(row.values);
+                const idx_table_id: PageId = @bitCast(row.values[1].integer);
+                if (idx_table_id == tid) {
+                    idx_to_delete.append(self.allocator, row.tid) catch {
+                        return CatalogError.OutOfMemory;
+                    };
+                }
+            }
+        }
+        for (idx_to_delete.items) |del_tid| {
+            _ = self.indexes_table.deleteTuple(null, del_tid) catch {
+                return CatalogError.StorageError;
+            };
+        }
+    }
+
+    // ============================================================
+    // Index management
+    // ============================================================
+
+    /// Create a new index. Validates table/column exist, creates BTree, inserts into gp_indexes.
+    /// Returns the PageId (root page) of the new BTree index.
+    pub fn createIndex(
+        self: *Self,
+        table_name: []const u8,
+        index_name: []const u8,
+        column_name: []const u8,
+        is_unique: bool,
+    ) CatalogError!PageId {
+        // Check if index name already exists
+        if (try self.findIndex(index_name)) |existing| {
+            self.freeIndexEntry(existing);
+            return CatalogError.IndexAlreadyExists;
+        }
+
+        // Validate table exists
+        const table_id = (try self.findTableId(table_name)) orelse return CatalogError.TableNotFound;
+
+        // Validate column exists and get ordinal
+        const schema = (try self.getSchema(table_id)) orelse return CatalogError.TableNotFound;
+        defer self.freeSchema(schema);
+
+        var column_ordinal: ?u16 = null;
+        for (schema.columns, 0..) |col, i| {
+            if (std.ascii.eqlIgnoreCase(col.name, column_name)) {
+                column_ordinal = @intCast(i);
+                break;
+            }
+        }
+        if (column_ordinal == null) return CatalogError.StorageError; // Column not found
+
+        // Create the BTree
+        const btree = btree_mod.BTree.create(self.buffer_pool) catch {
+            return CatalogError.StorageError;
+        };
+        const index_id = btree.root_page_id;
+
+        // Insert into gp_indexes
+        const idx_vals = [_]Value{
+            .{ .integer = @bitCast(index_id) },
+            .{ .integer = @bitCast(table_id) },
+            .{ .bytes = index_name },
+            .{ .integer = @intCast(column_ordinal.?) },
+            .{ .integer = if (is_unique) @as(i32, 1) else @as(i32, 0) },
+        };
+        _ = self.indexes_table.insertTuple(null, &idx_vals) catch {
+            return CatalogError.StorageError;
+        };
+
+        return index_id;
+    }
+
+    /// Drop an index by name
+    pub fn dropIndex(self: *Self, index_name: []const u8) CatalogError!void {
+        var found = false;
+        var iter = self.indexes_table.scan() catch {
+            return CatalogError.StorageError;
+        };
+        while (iter.next() catch { return CatalogError.StorageError; }) |row| {
+            defer iter.freeValues(row.values);
+            if (std.mem.eql(u8, row.values[2].bytes, index_name)) {
+                _ = self.indexes_table.deleteTuple(null, row.tid) catch {
+                    return CatalogError.StorageError;
+                };
+                found = true;
+                break;
+            }
+        }
+        if (!found) return CatalogError.IndexNotFound;
+    }
+
+    /// Get all indexes for a given table_id. Caller must call freeIndexList.
+    pub fn getIndexesForTable(self: *Self, table_id: PageId) CatalogError![]IndexEntry {
+        var entries: std.ArrayList(IndexEntry) = .empty;
+        defer entries.deinit(self.allocator);
+
+        var iter = self.indexes_table.scan() catch {
+            return CatalogError.StorageError;
+        };
+        while (iter.next() catch { return CatalogError.StorageError; }) |row| {
+            defer iter.freeValues(row.values);
+            const row_table_id: PageId = @bitCast(row.values[1].integer);
+            if (row_table_id == table_id) {
+                const name_copy = self.allocator.dupe(u8, row.values[2].bytes) catch {
+                    return CatalogError.OutOfMemory;
+                };
+                entries.append(self.allocator, .{
+                    .index_id = @bitCast(row.values[0].integer),
+                    .table_id = row_table_id,
+                    .index_name = name_copy,
+                    .column_ordinal = @intCast(row.values[3].integer),
+                    .is_unique = row.values[4].integer != 0,
+                }) catch {
+                    self.allocator.free(name_copy);
+                    return CatalogError.OutOfMemory;
+                };
+            }
+        }
+
+        return entries.toOwnedSlice(self.allocator) catch {
+            return CatalogError.OutOfMemory;
+        };
+    }
+
+    /// Find an index by name. Caller must call freeIndexEntry if non-null.
+    pub fn findIndex(self: *Self, index_name: []const u8) CatalogError!?IndexEntry {
+        var iter = self.indexes_table.scan() catch {
+            return CatalogError.StorageError;
+        };
+        while (iter.next() catch { return CatalogError.StorageError; }) |row| {
+            defer iter.freeValues(row.values);
+            if (std.mem.eql(u8, row.values[2].bytes, index_name)) {
+                const name_copy = self.allocator.dupe(u8, row.values[2].bytes) catch {
+                    return CatalogError.OutOfMemory;
+                };
+                return .{
+                    .index_id = @bitCast(row.values[0].integer),
+                    .table_id = @bitCast(row.values[1].integer),
+                    .index_name = name_copy,
+                    .column_ordinal = @intCast(row.values[3].integer),
+                    .is_unique = row.values[4].integer != 0,
+                };
+            }
+        }
+        return null;
+    }
+
+    /// Free an IndexEntry returned by findIndex
+    pub fn freeIndexEntry(self: *Self, entry: IndexEntry) void {
+        self.allocator.free(entry.index_name);
+    }
+
+    /// Free an index list returned by getIndexesForTable
+    pub fn freeIndexList(self: *Self, entries: []IndexEntry) void {
+        for (entries) |entry| {
+            self.allocator.free(entry.index_name);
+        }
+        self.allocator.free(entries);
     }
 
     /// Find a table's PageId by name. Returns null if not found.
@@ -686,8 +894,8 @@ test "catalog list tables" {
     const names = try catalog.listTables();
     defer catalog.freeTableList(names);
 
-    // Should have gp_tables, gp_columns, alpha, beta, gamma = 5
-    try std.testing.expectEqual(@as(usize, 5), names.len);
+    // Should have gp_tables, gp_columns, gp_indexes, alpha, beta, gamma = 6
+    try std.testing.expectEqual(@as(usize, 6), names.len);
 
     // Check that our user tables are present
     var found_alpha = false;
@@ -733,4 +941,106 @@ test "catalog drop table" {
 
     // Drop system table should fail
     try std.testing.expectError(CatalogError.SystemTableError, catalog.dropTable("gp_tables"));
+    try std.testing.expectError(CatalogError.SystemTableError, catalog.dropTable("gp_indexes"));
+}
+
+test "catalog create and find index" {
+    const test_file = "test_catalog_idx.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    const col = [_]Column{
+        .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+        .{ .name = "name", .col_type = .varchar, .max_length = 255, .nullable = false },
+    };
+    _ = try catalog.createTable("users", &col);
+
+    // Create index
+    const idx_id = try catalog.createIndex("users", "idx_users_id", "id", false);
+    try std.testing.expect(idx_id != INVALID_PAGE_ID);
+
+    // Find it
+    const entry = (try catalog.findIndex("idx_users_id")).?;
+    defer catalog.freeIndexEntry(entry);
+    try std.testing.expectEqualStrings("idx_users_id", entry.index_name);
+    try std.testing.expectEqual(@as(u16, 0), entry.column_ordinal);
+    try std.testing.expect(!entry.is_unique);
+
+    // Not found
+    const missing = try catalog.findIndex("nonexistent");
+    try std.testing.expect(missing == null);
+
+    // Duplicate should fail
+    try std.testing.expectError(CatalogError.IndexAlreadyExists, catalog.createIndex("users", "idx_users_id", "id", false));
+}
+
+test "catalog list indexes for table" {
+    const test_file = "test_catalog_idx_list.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    const col = [_]Column{
+        .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+        .{ .name = "val", .col_type = .integer, .max_length = 0, .nullable = false },
+    };
+    const table_id = try catalog.createTable("t", &col);
+
+    _ = try catalog.createIndex("t", "idx_t_id", "id", true);
+    _ = try catalog.createIndex("t", "idx_t_val", "val", false);
+
+    const indexes = try catalog.getIndexesForTable(table_id);
+    defer catalog.freeIndexList(indexes);
+
+    try std.testing.expectEqual(@as(usize, 2), indexes.len);
+
+    // Drop one
+    try catalog.dropIndex("idx_t_id");
+    const indexes2 = try catalog.getIndexesForTable(table_id);
+    defer catalog.freeIndexList(indexes2);
+    try std.testing.expectEqual(@as(usize, 1), indexes2.len);
+
+    // Drop nonexistent
+    try std.testing.expectError(CatalogError.IndexNotFound, catalog.dropIndex("nope"));
+}
+
+test "catalog drop table cascades indexes" {
+    const test_file = "test_catalog_idx_cascade.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    const col = [_]Column{
+        .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+    };
+    const table_id = try catalog.createTable("t", &col);
+    _ = try catalog.createIndex("t", "idx_t_id", "id", false);
+
+    // Verify index exists
+    const indexes = try catalog.getIndexesForTable(table_id);
+    defer catalog.freeIndexList(indexes);
+    try std.testing.expectEqual(@as(usize, 1), indexes.len);
+
+    // Drop table — should cascade
+    try catalog.dropTable("t");
+
+    // Index should be gone
+    const entry = try catalog.findIndex("idx_t_id");
+    try std.testing.expect(entry == null);
 }
