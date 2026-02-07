@@ -54,6 +54,7 @@ pub const TokenType = enum {
     // SQL operators
     kw_between,
     kw_like,
+    kw_in,
 
     // Transaction keywords
     kw_begin,
@@ -145,6 +146,7 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "as", .kw_as },
     .{ "between", .kw_between },
     .{ "distinct", .kw_distinct },
+    .{ "in", .kw_in },
     .{ "like", .kw_like },
     .{ "begin", .kw_begin },
     .{ "commit", .kw_commit },

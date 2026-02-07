@@ -505,6 +505,27 @@ pub const Parser = struct {
             return expr;
         }
 
+        // IN (val, val, ...)
+        if (self.current.type == .kw_in) {
+            self.advance();
+            try self.expect(.left_paren);
+
+            var items: std.ArrayList(*const ast.Expression) = .empty;
+            items.append(alloc, try self.parsePrimary()) catch return ParseError.OutOfMemory;
+            while (self.current.type == .comma) {
+                self.advance();
+                items.append(alloc, try self.parsePrimary()) catch return ParseError.OutOfMemory;
+            }
+            try self.expect(.right_paren);
+
+            const expr = try alloc.create(ast.Expression);
+            expr.* = .{ .in_list = .{
+                .value = left,
+                .items = items.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
+            } };
+            return expr;
+        }
+
         const op: ?ast.CompOp = switch (self.current.type) {
             .op_eq => .eq,
             .op_neq => .neq,
@@ -1006,4 +1027,14 @@ test "parse LIKE" {
     const sel = stmt.select;
     const where = sel.where_clause.?;
     try std.testing.expect(where.* == .like_expr);
+}
+
+test "parse IN list" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t WHERE id IN (1, 2, 3)");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    const where = sel.where_clause.?;
+    try std.testing.expect(where.* == .in_list);
+    try std.testing.expectEqual(@as(usize, 3), where.in_list.items.len);
 }

@@ -1535,6 +1535,14 @@ pub const Executor = struct {
                 };
                 return matchLike(text, pattern);
             },
+            .in_list => |il| {
+                const val = resolveExprValue(il.value, schema, values);
+                for (il.items) |item| {
+                    const item_val = resolveExprValue(item, schema, values);
+                    if (compareValues(val, .eq, item_val)) return true;
+                }
+                return false;
+            },
             .literal => |lit| {
                 // Bare literal in WHERE - treat as truthy
                 return switch (lit) {
@@ -3210,4 +3218,32 @@ test "executor LIKE" {
     defer exec.freeResult(sel2);
     try std.testing.expectEqual(@as(usize, 1), sel2.rows.rows.len);
     try std.testing.expectEqualStrings("Bob", sel2.rows.rows[0].values[1]);
+}
+
+test "executor IN list" {
+    const test_file = "test_exec_in.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+    const r1 = try exec.execute("INSERT INTO t VALUES (1, 'Alice')");
+    exec.freeResult(r1);
+    const r2 = try exec.execute("INSERT INTO t VALUES (2, 'Bob')");
+    exec.freeResult(r2);
+    const r3 = try exec.execute("INSERT INTO t VALUES (3, 'Charlie')");
+    exec.freeResult(r3);
+
+    // IN (1, 3) should return Alice and Charlie
+    const sel = try exec.execute("SELECT * FROM t WHERE id IN (1, 3)");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 2), sel.rows.rows.len);
 }

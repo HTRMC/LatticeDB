@@ -81,6 +81,11 @@ pub const Expression = union(enum) {
         value: *const Expression,
         pattern: *const Expression,
     },
+    /// IN (val, val, ...)
+    in_list: struct {
+        value: *const Expression,
+        items: []const *const Expression,
+    },
 };
 
 /// Aggregate function type
