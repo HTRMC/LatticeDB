@@ -140,6 +140,8 @@ pub const JoinClause = struct {
 
 pub const Select = struct {
     columns: []const SelectColumn,
+    aliases: ?[]const ?[]const u8, // parallel to columns: alias name or null
+    distinct: bool,
     table_name: []const u8,
     joins: ?[]const JoinClause,
     where_clause: ?*const Expression,

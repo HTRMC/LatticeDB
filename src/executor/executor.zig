@@ -378,12 +378,14 @@ pub const Executor = struct {
         const col_indices = try self.resolveSelectColumns(sel.columns, schema);
         defer self.allocator.free(col_indices);
 
-        // Build column name headers
+        // Build column name headers (prefer alias if present)
         const col_names = self.allocator.alloc([]const u8, col_indices.len) catch {
             return ExecError.OutOfMemory;
         };
         for (col_indices, 0..) |ci, i| {
-            col_names[i] = self.allocator.dupe(u8, schema.columns[ci].name) catch {
+            const alias_name = if (sel.aliases) |aliases| (if (i < aliases.len) aliases[i] else null) else null;
+            const name_src = alias_name orelse schema.columns[ci].name;
+            col_names[i] = self.allocator.dupe(u8, name_src) catch {
                 for (col_names[0..i]) |cn| self.allocator.free(cn);
                 self.allocator.free(col_names);
                 return ExecError.OutOfMemory;
@@ -846,7 +848,10 @@ pub const Executor = struct {
         }
 
         for (sel.columns, 0..) |col, i| {
-            col_names[i] = switch (col) {
+            const alias_name = if (sel.aliases) |aliases| (if (i < aliases.len) aliases[i] else null) else null;
+            col_names[i] = if (alias_name) |a|
+                self.allocator.dupe(u8, a) catch return ExecError.OutOfMemory
+            else switch (col) {
                 .aggregate => |agg| blk: {
                     const func_name = switch (agg.func) {
                         .count => "count",
@@ -2984,4 +2989,30 @@ test "executor DROP TABLE nonexistent fails" {
 
     const result = exec.execute("DROP TABLE nonexistent");
     try std.testing.expectError(ExecError.TableNotFound, result);
+}
+
+test "executor SELECT with column aliases" {
+    const test_file = "test_exec_alias.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE users (id INT, name TEXT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO users VALUES (1, 'Alice')");
+    exec.freeResult(ins);
+
+    const sel = try exec.execute("SELECT id AS user_id, name AS user_name FROM users");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqualStrings("user_id", sel.rows.columns[0]);
+    try std.testing.expectEqualStrings("user_name", sel.rows.columns[1]);
+    try std.testing.expectEqualStrings("1", sel.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("Alice", sel.rows.rows[0].values[1]);
 }

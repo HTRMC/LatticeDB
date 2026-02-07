@@ -81,17 +81,36 @@ pub const Parser = struct {
     fn parseSelect(self: *Self) ParseError!ast.Select {
         try self.expect(.kw_select);
 
+        // Optional DISTINCT
+        const distinct = self.current.type == .kw_distinct;
+        if (distinct) self.advance();
+
         // Parse column list
         const alloc = self.arena();
         var cols: std.ArrayList(ast.SelectColumn) = .empty;
+        var alias_list: std.ArrayList(?[]const u8) = .empty;
         if (self.current.type == .op_star) {
             cols.append(alloc, .{ .all_columns = {} }) catch return ParseError.OutOfMemory;
+            alias_list.append(alloc, null) catch return ParseError.OutOfMemory;
             self.advance();
         } else {
             cols.append(alloc, try self.parseSelectColumn()) catch return ParseError.OutOfMemory;
+            // Check for AS alias
+            if (self.current.type == .kw_as) {
+                self.advance();
+                alias_list.append(alloc, try self.expectIdentifier()) catch return ParseError.OutOfMemory;
+            } else {
+                alias_list.append(alloc, null) catch return ParseError.OutOfMemory;
+            }
             while (self.current.type == .comma) {
                 self.advance();
                 cols.append(alloc, try self.parseSelectColumn()) catch return ParseError.OutOfMemory;
+                if (self.current.type == .kw_as) {
+                    self.advance();
+                    alias_list.append(alloc, try self.expectIdentifier()) catch return ParseError.OutOfMemory;
+                } else {
+                    alias_list.append(alloc, null) catch return ParseError.OutOfMemory;
+                }
             }
         }
 
@@ -178,8 +197,19 @@ pub const Parser = struct {
             self.advance();
         }
 
+        // Check if any aliases were set
+        var has_aliases = false;
+        for (alias_list.items) |a| {
+            if (a != null) {
+                has_aliases = true;
+                break;
+            }
+        }
+
         return .{
             .columns = cols.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
+            .aliases = if (has_aliases) alias_list.toOwnedSlice(alloc) catch return ParseError.OutOfMemory else null,
+            .distinct = distinct,
             .table_name = table_name,
             .joins = joins,
             .where_clause = where,
@@ -917,4 +947,15 @@ test "parse UPDATE without WHERE" {
     try std.testing.expectEqualStrings("t", upd.table_name);
     try std.testing.expect(upd.where_clause == null);
     try std.testing.expectEqual(@as(usize, 1), upd.assignments.len);
+}
+
+test "parse SELECT with aliases" {
+    var p = Parser.init(std.testing.allocator, "SELECT name AS n, id AS i FROM users");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    try std.testing.expectEqual(@as(usize, 2), sel.columns.len);
+    try std.testing.expect(sel.aliases != null);
+    try std.testing.expectEqualStrings("n", sel.aliases.?[0].?);
+    try std.testing.expectEqualStrings("i", sel.aliases.?[1].?);
 }
