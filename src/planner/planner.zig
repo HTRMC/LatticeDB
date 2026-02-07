@@ -417,3 +417,173 @@ test "planner prefers seq scan for tiny tables" {
     try std.testing.expect(plan.* == .filter);
     try std.testing.expect(plan.filter.child.* == .seq_scan);
 }
+
+test "planner range_to with boundary value zero" {
+    const test_file = "test_planner_range_to_zero.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    const cols = [_]Column{
+        .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+    };
+    _ = try catalog.createTable("t", &cols);
+
+    const table_result = (try catalog.openTable("t")).?;
+    defer catalog.freeSchema(table_result.schema);
+    var table = table_result.table;
+    var i: i32 = 0;
+    while (i < 200) : (i += 1) {
+        _ = try table.insertTuple(null, &.{.{ .integer = i }});
+    }
+
+    _ = try catalog.createIndex("t", "idx_t_id", "id", false);
+
+    var planner = Planner.init(std.testing.allocator, &catalog);
+
+    const parser_mod = @import("../parser/parser.zig");
+    var parser = parser_mod.Parser.init(std.testing.allocator, "SELECT * FROM t WHERE id <= 0");
+    defer parser.deinit();
+    const stmt = try parser.parse();
+
+    const plan = try planner.planSelect(stmt.select);
+    defer planner.freePlan(plan);
+
+    try std.testing.expect(plan.* == .filter);
+    try std.testing.expect(plan.filter.child.* == .index_scan);
+    try std.testing.expect(plan.filter.child.index_scan.scan_type == .range_to);
+    try std.testing.expectEqual(@as(i32, 0), plan.filter.child.index_scan.scan_type.range_to);
+}
+
+test "planner picks best index from multiple" {
+    const test_file = "test_planner_multi_idx.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    const cols = [_]Column{
+        .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+        .{ .name = "val", .col_type = .integer, .max_length = 0, .nullable = false },
+    };
+    _ = try catalog.createTable("t", &cols);
+
+    const table_result = (try catalog.openTable("t")).?;
+    defer catalog.freeSchema(table_result.schema);
+    var table = table_result.table;
+    var i: i32 = 0;
+    while (i < 200) : (i += 1) {
+        _ = try table.insertTuple(null, &.{ .{ .integer = i }, .{ .integer = i * 10 } });
+    }
+
+    _ = try catalog.createIndex("t", "idx_t_id", "id", false);
+    _ = try catalog.createIndex("t", "idx_t_val", "val", false);
+
+    var planner = Planner.init(std.testing.allocator, &catalog);
+
+    const parser_mod = @import("../parser/parser.zig");
+    var parser = parser_mod.Parser.init(std.testing.allocator, "SELECT * FROM t WHERE id = 50");
+    defer parser.deinit();
+    const stmt = try parser.parse();
+
+    const plan = try planner.planSelect(stmt.select);
+    defer planner.freePlan(plan);
+
+    try std.testing.expect(plan.* == .filter);
+    try std.testing.expect(plan.filter.child.* == .index_scan);
+    try std.testing.expectEqualStrings("idx_t_id", plan.filter.child.index_scan.index_name);
+}
+
+test "planner BETWEEN produces range scan" {
+    const test_file = "test_planner_between.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    const cols = [_]Column{
+        .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+    };
+    _ = try catalog.createTable("t", &cols);
+
+    const table_result = (try catalog.openTable("t")).?;
+    defer catalog.freeSchema(table_result.schema);
+    var table = table_result.table;
+    var i: i32 = 0;
+    while (i < 200) : (i += 1) {
+        _ = try table.insertTuple(null, &.{.{ .integer = i }});
+    }
+
+    _ = try catalog.createIndex("t", "idx_t_id", "id", false);
+
+    var planner = Planner.init(std.testing.allocator, &catalog);
+
+    const parser_mod = @import("../parser/parser.zig");
+    var parser = parser_mod.Parser.init(std.testing.allocator, "SELECT * FROM t WHERE id BETWEEN 10 AND 20");
+    defer parser.deinit();
+    const stmt = try parser.parse();
+
+    const plan = try planner.planSelect(stmt.select);
+    defer planner.freePlan(plan);
+
+    try std.testing.expect(plan.* == .filter);
+    try std.testing.expect(plan.filter.child.* == .index_scan);
+    try std.testing.expect(plan.filter.child.index_scan.scan_type == .range);
+    try std.testing.expectEqual(@as(i32, 10), plan.filter.child.index_scan.scan_type.range.low);
+    try std.testing.expectEqual(@as(i32, 20), plan.filter.child.index_scan.scan_type.range.high);
+}
+
+test "planner reverse comparison uses index" {
+    const test_file = "test_planner_reverse.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    const cols = [_]Column{
+        .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+    };
+    _ = try catalog.createTable("t", &cols);
+
+    const table_result = (try catalog.openTable("t")).?;
+    defer catalog.freeSchema(table_result.schema);
+    var table = table_result.table;
+    var i: i32 = 0;
+    while (i < 200) : (i += 1) {
+        _ = try table.insertTuple(null, &.{.{ .integer = i }});
+    }
+
+    _ = try catalog.createIndex("t", "idx_t_id", "id", false);
+
+    var planner = Planner.init(std.testing.allocator, &catalog);
+
+    const parser_mod = @import("../parser/parser.zig");
+    var parser = parser_mod.Parser.init(std.testing.allocator, "SELECT * FROM t WHERE 50 = id");
+    defer parser.deinit();
+    const stmt = try parser.parse();
+
+    const plan = try planner.planSelect(stmt.select);
+    defer planner.freePlan(plan);
+
+    try std.testing.expect(plan.* == .filter);
+    try std.testing.expect(plan.filter.child.* == .index_scan);
+    try std.testing.expect(plan.filter.child.index_scan.scan_type == .point);
+    try std.testing.expectEqual(@as(i32, 50), plan.filter.child.index_scan.scan_type.point);
+}

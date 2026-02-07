@@ -222,7 +222,7 @@ pub const LeafNode = struct {
             const src_start = LEAF_HEADER_SIZE + (pos + 1) * LeafEntry.SIZE;
             const dst_start = LEAF_HEADER_SIZE + pos * LeafEntry.SIZE;
             const len = (count - pos - 1) * LeafEntry.SIZE;
-            @memcpy(self.data[dst_start..][0..len], self.data[src_start..][0..len]);
+            std.mem.copyForwards(u8, self.data[dst_start..][0..len], self.data[src_start..][0..len]);
         }
 
         self.headerMut().key_count = count - 1;

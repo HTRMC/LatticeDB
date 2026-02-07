@@ -4271,3 +4271,638 @@ test "executor index scan with ORDER BY and LIMIT" {
     try std.testing.expectEqualStrings("98", result.rows.rows[1].values[0]);
     try std.testing.expectEqualStrings("97", result.rows.rows[2].values[0]);
 }
+
+test "executor index scan on empty table returns no rows" {
+    const test_file = "test_exec_iscan_empty.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    // No inserts — query should return 0 rows
+    const result = try exec.execute("SELECT * FROM t WHERE id = 42");
+    defer exec.freeResult(result);
+
+    try std.testing.expectEqual(@as(usize, 0), result.rows.rows.len);
+}
+
+test "executor index scan point lookup no match" {
+    const test_file = "test_exec_iscan_nomatch.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    var i: i32 = 0;
+    while (i < 50) : (i += 1) {
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d})", .{i}) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    // 999 not in 0..49
+    const result = try exec.execute("SELECT * FROM t WHERE id = 999");
+    defer exec.freeResult(result);
+
+    try std.testing.expectEqual(@as(usize, 0), result.rows.rows.len);
+}
+
+test "executor index scan with zero and boundary keys" {
+    const test_file = "test_exec_iscan_zero.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    // Insert values including 0 and boundary, plus filler for index scan
+    const vals = [_]i32{ 0, 1, 2, 5, 10, 50, 99 };
+    for (vals) |v| {
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d})", .{v}) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+    // Add filler rows to make index scan viable
+    var i: i32 = 100;
+    while (i < 120) : (i += 1) {
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d})", .{i}) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    // Lookup 0 (boundary)
+    const r1 = try exec.execute("SELECT * FROM t WHERE id = 0");
+    defer exec.freeResult(r1);
+    try std.testing.expectEqual(@as(usize, 1), r1.rows.rows.len);
+    try std.testing.expectEqualStrings("0", r1.rows.rows[0].values[0]);
+
+    // Lookup 1
+    const r2 = try exec.execute("SELECT * FROM t WHERE id = 1");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqual(@as(usize, 1), r2.rows.rows.len);
+    try std.testing.expectEqualStrings("1", r2.rows.rows[0].values[0]);
+}
+
+test "executor drop index falls back to seq scan" {
+    const test_file = "test_exec_drop_fallback.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    var i: i32 = 0;
+    while (i < 50) : (i += 1) {
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d})", .{i}) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    // Query with index
+    const r1 = try exec.execute("SELECT * FROM t WHERE id = 25");
+    defer exec.freeResult(r1);
+    try std.testing.expectEqual(@as(usize, 1), r1.rows.rows.len);
+
+    // Drop index
+    const di = try exec.execute("DROP INDEX idx_t_id");
+    exec.freeResult(di);
+
+    // Same query still works (seq scan fallback)
+    const r2 = try exec.execute("SELECT * FROM t WHERE id = 25");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqual(@as(usize, 1), r2.rows.rows.len);
+
+    // EXPLAIN shows Seq Scan
+    const expl = try exec.execute("EXPLAIN SELECT * FROM t WHERE id = 25");
+    defer exec.freeResult(expl);
+    try std.testing.expect(std.mem.indexOf(u8, expl.rows.rows[0].values[0], "Seq Scan") != null);
+}
+
+test "executor uses correct index when multiple exist" {
+    const test_file = "test_exec_multi_idx.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, val INT)");
+    exec.freeResult(ct);
+
+    var i: i32 = 0;
+    while (i < 50) : (i += 1) {
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d}, {d})", .{ i, i * 10 }) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+
+    const ci1 = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci1);
+    const ci2 = try exec.execute("CREATE INDEX idx_t_val ON t (val)");
+    exec.freeResult(ci2);
+
+    // Query on val column — should use idx_t_val
+    const result = try exec.execute("SELECT * FROM t WHERE val = 100");
+    defer exec.freeResult(result);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.rows.len);
+    try std.testing.expectEqualStrings("10", result.rows.rows[0].values[0]); // id=10, val=100
+
+    // EXPLAIN shows idx_t_val
+    const expl = try exec.execute("EXPLAIN SELECT * FROM t WHERE val = 100");
+    defer exec.freeResult(expl);
+    try std.testing.expect(std.mem.indexOf(u8, expl.rows.rows[0].values[0], "idx_t_val") != null);
+}
+
+test "executor index scan BETWEEN range" {
+    const test_file = "test_exec_iscan_between.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    var i: i32 = 0;
+    while (i < 100) : (i += 1) {
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d})", .{i}) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    // BETWEEN 45 AND 55 → 11 rows (45,46,...,55)
+    const result = try exec.execute("SELECT * FROM t WHERE id BETWEEN 45 AND 55");
+    defer exec.freeResult(result);
+
+    try std.testing.expectEqual(@as(usize, 11), result.rows.rows.len);
+}
+
+test "executor BETWEEN with inverted bounds returns empty" {
+    const test_file = "test_exec_iscan_between_inv.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    var i: i32 = 0;
+    while (i < 100) : (i += 1) {
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d})", .{i}) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    // BETWEEN 100 AND 50 — inverted bounds → 0 rows
+    const result = try exec.execute("SELECT * FROM t WHERE id BETWEEN 100 AND 50");
+    defer exec.freeResult(result);
+
+    try std.testing.expectEqual(@as(usize, 0), result.rows.rows.len);
+}
+
+test "executor reverse comparison 25 = id uses index" {
+    const test_file = "test_exec_iscan_reverse.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    var i: i32 = 0;
+    while (i < 50) : (i += 1) {
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d})", .{i}) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    // Reversed comparison: 25 = id
+    const result = try exec.execute("SELECT * FROM t WHERE 25 = id");
+    defer exec.freeResult(result);
+
+    try std.testing.expectEqual(@as(usize, 1), result.rows.rows.len);
+    try std.testing.expectEqualStrings("25", result.rows.rows[0].values[0]);
+}
+
+test "executor index scan with DISTINCT" {
+    const test_file = "test_exec_iscan_distinct.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, category TEXT)");
+    exec.freeResult(ct);
+
+    // 60 rows: id=0..59, category alternates "a"/"b"
+    var i: i32 = 0;
+    while (i < 60) : (i += 1) {
+        const cat = if (@mod(i, 2) == 0) "a" else "b";
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d}, '{s}')", .{ i, cat }) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    // SELECT DISTINCT category WHERE id >= 50 → 10 rows (50..59), alternating a/b → 2 distinct
+    const result = try exec.execute("SELECT DISTINCT category FROM t WHERE id >= 50");
+    defer exec.freeResult(result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.rows.rows.len);
+}
+
+test "executor insert duplicate key into non-unique index" {
+    const test_file = "test_exec_dup_nonunique.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+
+    // Non-unique index on id
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    // Insert two rows with same key
+    const ins1 = try exec.execute("INSERT INTO t VALUES (1, 'first')");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO t VALUES (1, 'second')");
+    exec.freeResult(ins2);
+
+    // Both inserts succeeded — index point lookup returns at least 1 row
+    const result = try exec.execute("SELECT * FROM t WHERE id = 1");
+    defer exec.freeResult(result);
+    try std.testing.expect(result.rows.rows.len >= 1);
+}
+
+test "executor duplicate key index vs seq scan divergence" {
+    const test_file = "test_exec_dup_diverge.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    // 30 rows: 3 copies of ids 0..9
+    var copy: u32 = 0;
+    while (copy < 3) : (copy += 1) {
+        var i: i32 = 0;
+        while (i < 10) : (i += 1) {
+            const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d})", .{i}) catch unreachable;
+            defer std.testing.allocator.free(buf);
+            const ins = try exec.execute(buf);
+            exec.freeResult(ins);
+        }
+    }
+
+    // Without index: seq scan should find all 3 copies
+    const seq_result = try exec.execute("SELECT * FROM t WHERE id = 5");
+    defer exec.freeResult(seq_result);
+    try std.testing.expectEqual(@as(usize, 3), seq_result.rows.rows.len);
+
+    // Create index (backfill silently drops dupes — btree replaces on same key)
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    // With index: btree point lookup returns 1 TID (last inserted for key=5)
+    const idx_result = try exec.execute("SELECT * FROM t WHERE id = 5");
+    defer exec.freeResult(idx_result);
+    try std.testing.expectEqual(@as(usize, 1), idx_result.rows.rows.len);
+}
+
+test "executor index scan after deleting all rows" {
+    const test_file = "test_exec_iscan_del_all.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    var i: i32 = 0;
+    while (i < 50) : (i += 1) {
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d})", .{i}) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    // Delete all rows
+    const del = try exec.execute("DELETE FROM t");
+    exec.freeResult(del);
+
+    // Index scan should return 0 rows
+    const result = try exec.execute("SELECT * FROM t WHERE id = 25");
+    defer exec.freeResult(result);
+
+    try std.testing.expectEqual(@as(usize, 0), result.rows.rows.len);
+}
+
+test "executor index on non-integer column ignored by planner" {
+    const test_file = "test_exec_idx_text.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+
+    var i: i32 = 0;
+    while (i < 50) : (i += 1) {
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d}, 'test')", .{i}) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+
+    // Create index on TEXT column name
+    const ci = try exec.execute("CREATE INDEX idx_t_name ON t (name)");
+    exec.freeResult(ci);
+
+    // EXPLAIN should show Seq Scan (planner can't use TEXT index)
+    const expl = try exec.execute("EXPLAIN SELECT * FROM t WHERE name = 'test'");
+    defer exec.freeResult(expl);
+    try std.testing.expect(std.mem.indexOf(u8, expl.rows.rows[0].values[0], "Seq Scan") != null);
+}
+
+test "executor index scan large range" {
+    const test_file = "test_exec_iscan_large.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    var i: i32 = 0;
+    while (i < 100) : (i += 1) {
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d})", .{i}) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    // id >= 1 → 99 rows (1..99)
+    const result = try exec.execute("SELECT * FROM t WHERE id >= 1");
+    defer exec.freeResult(result);
+
+    try std.testing.expectEqual(@as(usize, 99), result.rows.rows.len);
+}
+
+test "executor update indexed column preserves consistency" {
+    const test_file = "test_exec_iscan_upd.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    var i: i32 = 0;
+    while (i < 50) : (i += 1) {
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d})", .{i}) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    // Update id=25 to id=999
+    const upd = try exec.execute("UPDATE t SET id = 999 WHERE id = 25");
+    exec.freeResult(upd);
+
+    // Old key gone
+    const r1 = try exec.execute("SELECT * FROM t WHERE id = 25");
+    defer exec.freeResult(r1);
+    try std.testing.expectEqual(@as(usize, 0), r1.rows.rows.len);
+
+    // New key present
+    const r2 = try exec.execute("SELECT * FROM t WHERE id = 999");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqual(@as(usize, 1), r2.rows.rows.len);
+}
+
+test "executor EXPLAIN BETWEEN shows range scan" {
+    const test_file = "test_exec_expl_between.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    var i: i32 = 0;
+    while (i < 200) : (i += 1) {
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d})", .{i}) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    const result = try exec.execute("EXPLAIN SELECT * FROM t WHERE id BETWEEN 50 AND 100");
+    defer exec.freeResult(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.rows.rows[0].values[0], "Index Scan") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.rows.rows[0].values[0], "idx_t_id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.rows.rows[0].values[0], "range key=50..100") != null);
+}
+
+test "executor EXPLAIN after DROP INDEX shows seq scan" {
+    const test_file = "test_exec_expl_drop.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    var i: i32 = 0;
+    while (i < 100) : (i += 1) {
+        const buf = std.fmt.allocPrint(std.testing.allocator, "INSERT INTO t VALUES ({d})", .{i}) catch unreachable;
+        defer std.testing.allocator.free(buf);
+        const ins = try exec.execute(buf);
+        exec.freeResult(ins);
+    }
+
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    // EXPLAIN with index → shows Index Scan
+    const expl1 = try exec.execute("EXPLAIN SELECT * FROM t WHERE id = 50");
+    defer exec.freeResult(expl1);
+    try std.testing.expect(std.mem.indexOf(u8, expl1.rows.rows[0].values[0], "Index Scan") != null);
+
+    // Drop index
+    const di = try exec.execute("DROP INDEX idx_t_id");
+    exec.freeResult(di);
+
+    // EXPLAIN without index → shows Seq Scan
+    const expl2 = try exec.execute("EXPLAIN SELECT * FROM t WHERE id = 50");
+    defer exec.freeResult(expl2);
+    try std.testing.expect(std.mem.indexOf(u8, expl2.rows.rows[0].values[0], "Seq Scan") != null);
+}

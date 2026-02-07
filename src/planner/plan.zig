@@ -173,3 +173,83 @@ test "formatPlan output" {
     try std.testing.expect(std.mem.indexOf(u8, idx_text, "idx_users_id") != null);
     try std.testing.expect(std.mem.indexOf(u8, idx_text, "point lookup key=42") != null);
 }
+
+test "formatPlan deep nesting Sort Filter IndexScan" {
+    const allocator = std.testing.allocator;
+
+    // Build 3-level plan: Sort → Filter → IndexScan (range 10..50)
+    var idx_node = PlanNode{ .index_scan = .{
+        .table_name = "t",
+        .table_id = 1,
+        .index_name = "idx_t_id",
+        .index_id = 2,
+        .column_ordinal = 0,
+        .scan_type = .{ .range = .{ .low = 10, .high = 50 } },
+        .estimated_rows = 40,
+        .estimated_cost = 64.0,
+    } };
+    var filter_node = PlanNode{ .filter = .{
+        .child = &idx_node,
+        .predicate = undefined,
+        .estimated_cost = 84.0,
+    } };
+    var sort_node = PlanNode{ .sort = .{
+        .child = &filter_node,
+        .column = "id",
+        .descending = true,
+    } };
+
+    const text = try formatPlan(allocator, &sort_node, 0);
+    defer allocator.free(text);
+
+    // Sort at indent 0 (no leading spaces)
+    try std.testing.expect(std.mem.indexOf(u8, text, "Sort (column=id DESC)") != null);
+    // Filter at indent 1 (2 spaces)
+    try std.testing.expect(std.mem.indexOf(u8, text, "  Filter") != null);
+    // Index Scan at indent 2 (4 spaces)
+    try std.testing.expect(std.mem.indexOf(u8, text, "    Index Scan") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "range key=10..50") != null);
+}
+
+test "formatPlan four level nesting" {
+    const allocator = std.testing.allocator;
+
+    // Build 4-level plan: Limit → Sort → Filter → IndexScan (point=42)
+    var idx_node = PlanNode{ .index_scan = .{
+        .table_name = "t",
+        .table_id = 1,
+        .index_name = "idx_t_id",
+        .index_id = 2,
+        .column_ordinal = 0,
+        .scan_type = .{ .point = 42 },
+        .estimated_rows = 1,
+        .estimated_cost = 5.5,
+    } };
+    var filter_node = PlanNode{ .filter = .{
+        .child = &idx_node,
+        .predicate = undefined,
+        .estimated_cost = 25.5,
+    } };
+    var sort_node = PlanNode{ .sort = .{
+        .child = &filter_node,
+        .column = "id",
+        .descending = false,
+    } };
+    var limit_node = PlanNode{ .limit = .{
+        .child = &sort_node,
+        .count = 10,
+    } };
+
+    const text = try formatPlan(allocator, &limit_node, 0);
+    defer allocator.free(text);
+
+    // Limit at indent 0
+    try std.testing.expect(std.mem.indexOf(u8, text, "Limit (count=10)") != null);
+    // Sort at indent 1
+    try std.testing.expect(std.mem.indexOf(u8, text, "  Sort (column=id ASC)") != null);
+    // Filter at indent 2
+    try std.testing.expect(std.mem.indexOf(u8, text, "    Filter") != null);
+    // Index Scan at indent 3 (6 spaces)
+    try std.testing.expect(std.mem.indexOf(u8, text, "      Index Scan") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "point lookup key=42") != null);
+}
