@@ -7,6 +7,7 @@ const table_mod = @import("../storage/table.zig");
 const page_mod = @import("../storage/page.zig");
 const mvcc_mod = @import("../storage/mvcc.zig");
 const undo_log_mod = @import("../storage/undo_log.zig");
+const btree_mod = @import("../index/btree.zig");
 
 const Value = tuple_mod.Value;
 const Column = tuple_mod.Column;
@@ -128,6 +129,42 @@ pub const Executor = struct {
                 }
                 self.allocator.free(r.columns);
             },
+        }
+    }
+
+    // ============================================================
+    // Index maintenance helpers
+    // ============================================================
+
+    /// Insert key into all indexes for this table
+    fn maintainIndexesInsert(self: *Self, table_id: PageId, schema: *const Schema, values: []const Value, tid: page_mod.TupleId) void {
+        const indexes = self.catalog.getIndexesForTable(table_id) catch return;
+        defer self.catalog.freeIndexList(indexes);
+
+        for (indexes) |idx| {
+            if (idx.column_ordinal >= schema.columns.len) continue;
+            if (schema.columns[idx.column_ordinal].col_type != .integer) continue;
+            const val = values[idx.column_ordinal];
+            if (val != .integer) continue;
+
+            var btree = btree_mod.BTree.open(self.catalog.buffer_pool, idx.index_id);
+            btree.insert(val.integer, tid) catch {};
+        }
+    }
+
+    /// Delete key from all indexes for this table
+    fn maintainIndexesDelete(self: *Self, table_id: PageId, schema: *const Schema, values: []const Value) void {
+        const indexes = self.catalog.getIndexesForTable(table_id) catch return;
+        defer self.catalog.freeIndexList(indexes);
+
+        for (indexes) |idx| {
+            if (idx.column_ordinal >= schema.columns.len) continue;
+            if (schema.columns[idx.column_ordinal].col_type != .integer) continue;
+            const val = values[idx.column_ordinal];
+            if (val != .integer) continue;
+
+            var btree = btree_mod.BTree.open(self.catalog.buffer_pool, idx.index_id);
+            _ = btree.delete(val.integer) catch {};
         }
     }
 
@@ -333,13 +370,54 @@ pub const Executor = struct {
     // CREATE INDEX
     // ============================================================
     fn execCreateIndex(self: *Self, ci: ast.CreateIndex) ExecError!ExecResult {
-        _ = self.catalog.createIndex(ci.table_name, ci.index_name, ci.column_name, ci.is_unique) catch |err| {
+        const index_id = self.catalog.createIndex(ci.table_name, ci.index_name, ci.column_name, ci.is_unique) catch |err| {
             return switch (err) {
                 catalog_mod.CatalogError.IndexAlreadyExists => ExecError.IndexAlreadyExists,
                 catalog_mod.CatalogError.TableNotFound => ExecError.TableNotFound,
                 else => ExecError.StorageError,
             };
         };
+
+        // Backfill: scan existing rows and insert into the new index
+        const table_result = self.catalog.openTable(ci.table_name) catch {
+            return ExecError.StorageError;
+        } orelse return ExecError.TableNotFound;
+        defer self.catalog.freeSchema(table_result.schema);
+        var table = table_result.table;
+        table.txn_manager = self.txn_manager;
+        table.undo_log = self.undo_log;
+
+        const schema = table_result.schema;
+
+        // Find column ordinal
+        var col_ord: ?usize = null;
+        for (schema.columns, 0..) |col, i| {
+            if (std.ascii.eqlIgnoreCase(col.name, ci.column_name)) {
+                col_ord = i;
+                break;
+            }
+        }
+
+        if (col_ord) |ordinal| {
+            if (schema.columns[ordinal].col_type == .integer) {
+                var btree = btree_mod.BTree.open(self.catalog.buffer_pool, index_id);
+                const txn = self.current_txn orelse self.beginImplicitTxn();
+                var iter = table.scanWithTxn(txn) catch {
+                    self.abortImplicitTxn(txn);
+                    return ExecError.StorageError;
+                };
+                while (iter.next() catch {
+                    self.abortImplicitTxn(txn);
+                    return ExecError.StorageError;
+                }) |row| {
+                    defer iter.freeValues(row.values);
+                    if (ordinal < row.values.len and row.values[ordinal] == .integer) {
+                        btree.insert(row.values[ordinal].integer, row.tid) catch {};
+                    }
+                }
+                self.commitImplicitTxn(txn);
+            }
+        }
 
         const msg = std.fmt.allocPrint(self.allocator, "CREATE INDEX", .{}) catch {
             return ExecError.OutOfMemory;
@@ -410,10 +488,13 @@ pub const Executor = struct {
         // Use explicit txn or auto-commit
         const txn = self.current_txn orelse self.beginImplicitTxn();
 
-        _ = table.insertTuple(txn, values) catch {
+        const tid = table.insertTuple(txn, values) catch {
             self.abortImplicitTxn(txn);
             return ExecError.StorageError;
         };
+
+        // Maintain indexes
+        self.maintainIndexesInsert(table.table_id, schema, values, tid);
 
         self.commitImplicitTxn(txn);
         return .{ .row_count = 1 };
@@ -1400,9 +1481,13 @@ pub const Executor = struct {
             }
         }
 
-        // Collect TIDs to delete (can't delete while scanning)
-        var to_delete: std.ArrayList(page_mod.TupleId) = .empty;
-        defer to_delete.deinit(self.allocator);
+        // Collect TIDs and values to delete (can't delete while scanning)
+        const DeleteEntry = struct { tid: page_mod.TupleId, values: []Value };
+        var to_delete: std.ArrayList(DeleteEntry) = .empty;
+        defer {
+            for (to_delete.items) |entry| self.allocator.free(entry.values);
+            to_delete.deinit(self.allocator);
+        }
 
         var iter = table.scanWithTxn(txn) catch {
             self.abortImplicitTxn(txn);
@@ -1413,25 +1498,26 @@ pub const Executor = struct {
             self.abortImplicitTxn(txn);
             return ExecError.StorageError;
         }) |row| {
-            defer iter.freeValues(row.values);
-
             const should_delete = if (del.where_clause) |where|
                 self.evalWhere(where, schema, row.values)
             else
                 true;
 
             if (should_delete) {
-                to_delete.append(self.allocator, row.tid) catch {
+                to_delete.append(self.allocator, .{ .tid = row.tid, .values = row.values }) catch {
+                    iter.freeValues(row.values);
                     self.abortImplicitTxn(txn);
                     return ExecError.OutOfMemory;
                 };
+            } else {
+                iter.freeValues(row.values);
             }
         }
 
         // Now delete collected tuples
         var deleted: u64 = 0;
-        for (to_delete.items) |tid| {
-            if (table.deleteTuple(txn, tid) catch |err| {
+        for (to_delete.items) |entry| {
+            if (table.deleteTuple(txn, entry.tid) catch |err| {
                 if (err == table_mod.TableError.WriteConflict) {
                     self.abortImplicitTxn(txn);
                     return ExecError.WriteConflict;
@@ -1439,6 +1525,8 @@ pub const Executor = struct {
                 self.abortImplicitTxn(txn);
                 return ExecError.StorageError;
             }) {
+                // Maintain indexes
+                self.maintainIndexesDelete(table.table_id, schema, entry.values);
                 deleted += 1;
             }
         }
@@ -1560,11 +1648,16 @@ pub const Executor = struct {
                 return ExecError.StorageError;
             };
 
+            // Maintain indexes: remove old, insert new
+            self.maintainIndexesDelete(table.table_id, schema, entry.values);
+
             // Insert new tuple (MVCC: new xmin)
-            _ = table.insertTuple(txn, new_values) catch {
+            const new_tid = table.insertTuple(txn, new_values) catch {
                 self.abortImplicitTxn(txn);
                 return ExecError.StorageError;
             };
+
+            self.maintainIndexesInsert(table.table_id, schema, new_values, new_tid);
 
             updated += 1;
         }
@@ -3595,4 +3688,151 @@ test "executor CREATE INDEX and DROP INDEX" {
 
     // DROP nonexistent should fail
     try std.testing.expectError(ExecError.IndexNotFound, exec.execute("DROP INDEX nope"));
+}
+
+test "executor index maintained on insert" {
+    const test_file = "test_exec_idx_ins.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    // Insert rows — should be indexed
+    const ins1 = try exec.execute("INSERT INTO t VALUES (10, 'a')");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO t VALUES (20, 'b')");
+    exec.freeResult(ins2);
+
+    // Verify via btree search
+    const idx_entry = (try catalog.findIndex("idx_t_id")).?;
+    defer catalog.freeIndexEntry(idx_entry);
+    var btree = btree_mod.BTree.open(&bp, idx_entry.index_id);
+    const found10 = try btree.search(10);
+    try std.testing.expect(found10 != null);
+    const found20 = try btree.search(20);
+    try std.testing.expect(found20 != null);
+    const found99 = try btree.search(99);
+    try std.testing.expect(found99 == null);
+}
+
+test "executor index maintained on delete" {
+    const test_file = "test_exec_idx_del.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    const ins = try exec.execute("INSERT INTO t VALUES (42, 'x')");
+    exec.freeResult(ins);
+
+    // Verify indexed
+    const idx_entry = (try catalog.findIndex("idx_t_id")).?;
+    defer catalog.freeIndexEntry(idx_entry);
+    var btree = btree_mod.BTree.open(&bp, idx_entry.index_id);
+    try std.testing.expect((try btree.search(42)) != null);
+
+    // Delete
+    const del = try exec.execute("DELETE FROM t WHERE id = 42");
+    exec.freeResult(del);
+
+    // Verify removed from index
+    try std.testing.expect((try btree.search(42)) == null);
+}
+
+test "executor index maintained on update" {
+    const test_file = "test_exec_idx_upd.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+    var exec = Executor.initWithMvcc(std.testing.allocator, &catalog, &tm, &undo);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    const ins = try exec.execute("INSERT INTO t VALUES (1, 'x')");
+    exec.freeResult(ins);
+
+    // Update id from 1 to 99
+    const upd = try exec.execute("UPDATE t SET id = 99 WHERE id = 1");
+    exec.freeResult(upd);
+
+    const idx_entry = (try catalog.findIndex("idx_t_id")).?;
+    defer catalog.freeIndexEntry(idx_entry);
+    var btree = btree_mod.BTree.open(&bp, idx_entry.index_id);
+
+    // Old key gone, new key present
+    try std.testing.expect((try btree.search(1)) == null);
+    try std.testing.expect((try btree.search(99)) != null);
+}
+
+test "executor backfill on CREATE INDEX" {
+    const test_file = "test_exec_idx_backfill.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+
+    // Insert rows first, THEN create index
+    const ins1 = try exec.execute("INSERT INTO t VALUES (5, 'a')");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO t VALUES (15, 'b')");
+    exec.freeResult(ins2);
+    const ins3 = try exec.execute("INSERT INTO t VALUES (25, 'c')");
+    exec.freeResult(ins3);
+
+    const ci = try exec.execute("CREATE INDEX idx_t_id ON t (id)");
+    exec.freeResult(ci);
+
+    // All existing rows should be in the index
+    const idx_entry = (try catalog.findIndex("idx_t_id")).?;
+    defer catalog.freeIndexEntry(idx_entry);
+    var btree = btree_mod.BTree.open(&bp, idx_entry.index_id);
+
+    try std.testing.expect((try btree.search(5)) != null);
+    try std.testing.expect((try btree.search(15)) != null);
+    try std.testing.expect((try btree.search(25)) != null);
+    try std.testing.expect((try btree.search(99)) == null);
 }
