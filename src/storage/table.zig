@@ -35,16 +35,40 @@ pub const TableError = error{
     WriteConflict,
 };
 
-/// Table metadata header stored at the beginning of the first page
-const TableMeta = extern struct {
-    /// Number of pages allocated for this table
+/// Pages per new extent allocation
+const EXTENT_GROWTH_SIZE: u32 = 8;
+/// Bytes reserved in slot 0 for table metadata
+const META_RESERVED_SIZE: usize = 512;
+
+/// An extent: a contiguous group of pages owned by this table
+const ExtentEntry = extern struct {
+    start_page: PageId,
     page_count: u32,
-    /// Page ID of the first page with free space
-    first_free_page: PageId,
-    /// Total number of tuples (including deleted)
+
+    pub const SIZE: usize = @sizeOf(ExtentEntry); // 8
+};
+
+/// Maximum number of extents that fit in the reserved meta area
+const MAX_EXTENTS: usize = (META_RESERVED_SIZE - TableMeta.SIZE) / ExtentEntry.SIZE;
+
+/// Table metadata header stored in slot 0 of the meta page
+const TableMeta = extern struct {
+    extent_count: u32,
+    _reserved: u32,
     tuple_count: u64,
 
-    pub const SIZE: usize = @sizeOf(TableMeta);
+    pub const SIZE: usize = @sizeOf(TableMeta); // 16
+};
+
+/// Result of reading the full meta blob (header + extents)
+const MetaResult = struct {
+    header: TableMeta,
+    extent_buf: [MAX_EXTENTS]ExtentEntry,
+    extent_count: usize,
+
+    fn extents(self: *const MetaResult) []const ExtentEntry {
+        return self.extent_buf[0..self.extent_count];
+    }
 };
 
 /// Heap-organized table with MVCC support.
@@ -63,7 +87,7 @@ pub const Table = struct {
     const Self = @This();
 
     /// Maximum tuple size that can fit in a page (with overhead)
-    pub const MAX_TUPLE_SIZE = PAGE_SIZE - page_mod.PageHeader.SIZE - page_mod.Slot.SIZE - TableMeta.SIZE - 64;
+    pub const MAX_TUPLE_SIZE = PAGE_SIZE - page_mod.PageHeader.SIZE - page_mod.Slot.SIZE - META_RESERVED_SIZE - 64;
 
     /// Create a new table - allocates the first page
     pub fn create(
@@ -96,16 +120,24 @@ pub const Table = struct {
             .undo_log = undo_log,
         };
 
-        // Initialize meta in first page
-        var pg = result.page;
+        // Build meta blob: header + 1 extent + zero-padding to META_RESERVED_SIZE
+        var meta_blob: [META_RESERVED_SIZE]u8 = [_]u8{0} ** META_RESERVED_SIZE;
         const meta = TableMeta{
-            .page_count = 1,
-            .first_free_page = result.page_id,
+            .extent_count = 1,
+            ._reserved = 0,
             .tuple_count = 0,
         };
+        @memcpy(meta_blob[0..TableMeta.SIZE], std.mem.asBytes(&meta));
 
-        // Store meta as the first tuple on the meta page
-        _ = pg.insertTuple(std.mem.asBytes(&meta));
+        const extent = ExtentEntry{
+            .start_page = result.page_id,
+            .page_count = 1,
+        };
+        @memcpy(meta_blob[TableMeta.SIZE..][0..ExtentEntry.SIZE], std.mem.asBytes(&extent));
+
+        // Store meta blob as slot 0 on the meta page
+        var pg = result.page;
+        _ = pg.insertTuple(&meta_blob);
 
         buffer_pool.unpinPage(result.page_id, true) catch {};
 
@@ -162,68 +194,69 @@ pub const Table = struct {
 
         const tuple_data = buf[0..size];
 
-        // Find a page with space
-        const meta = try self.readMeta();
-        var page_id = meta.first_free_page;
+        // Search existing extents for a page with space
+        const meta_full = try self.readMetaFull();
 
-        while (page_id != INVALID_PAGE_ID) {
-            var pg = self.buffer_pool.fetchPage(page_id) catch {
-                return TableError.BufferPoolError;
-            };
+        for (meta_full.extents()) |ext| {
+            var offset: u32 = 0;
+            while (offset < ext.page_count) : (offset += 1) {
+                const page_id = ext.start_page + offset;
 
-            const slot_id = pg.insertTuple(tuple_data);
-            if (slot_id) |sid| {
-                self.buffer_pool.unpinPage(page_id, true) catch {};
-                try self.incrementTupleCount();
+                var pg = self.buffer_pool.fetchPage(page_id) catch {
+                    return TableError.BufferPoolError;
+                };
 
-                const tid = TupleId{ .page_id = page_id, .slot_id = sid };
-
-                // Write insert undo record
-                if (txn != null and self.undo_log != null) {
-                    try self.writeInsertUndo(txn.?, tid);
+                // Check if page is uninitialized (allocated via allocateExtent but never used)
+                const pg_header = pg.getHeader();
+                if (pg_header.free_space_end == 0) {
+                    // Initialize the page
+                    pg = Page.init(pg.data, page_id);
                 }
 
-                return tid;
-            }
+                const slot_id = pg.insertTuple(tuple_data);
+                if (slot_id) |sid| {
+                    self.buffer_pool.unpinPage(page_id, true) catch {};
+                    try self.incrementTupleCount();
 
-            self.buffer_pool.unpinPage(page_id, false) catch {};
+                    const tid = TupleId{ .page_id = page_id, .slot_id = sid };
 
-            if (page_id == self.table_id) {
-                if (meta.page_count > 1) {
-                    page_id = self.table_id + 1;
-                } else {
-                    break;
+                    if (txn != null and self.undo_log != null) {
+                        try self.writeInsertUndo(txn.?, tid);
+                    }
+
+                    return tid;
                 }
-            } else if (page_id < self.table_id + meta.page_count - 1) {
-                page_id += 1;
-            } else {
-                break;
+
+                self.buffer_pool.unpinPage(page_id, false) catch {};
             }
         }
 
-        // No space found - allocate a new page
-        const new_result = self.buffer_pool.newPage() catch {
+        // No space found — allocate a new extent
+        const new_start = self.buffer_pool.allocateExtent(EXTENT_GROWTH_SIZE) catch {
             return TableError.BufferPoolError;
         };
 
-        var new_pg = new_result.page;
+        // Fetch first page of new extent, initialize it, insert tuple
+        var new_pg = self.buffer_pool.fetchPage(new_start) catch {
+            return TableError.BufferPoolError;
+        };
+        new_pg = Page.init(new_pg.data, new_start);
+
         const slot_id = new_pg.insertTuple(tuple_data) orelse {
-            self.buffer_pool.unpinPage(new_result.page_id, false) catch {};
+            self.buffer_pool.unpinPage(new_start, false) catch {};
             return TableError.TupleTooBig;
         };
 
-        self.buffer_pool.unpinPage(new_result.page_id, true) catch {};
+        self.buffer_pool.unpinPage(new_start, true) catch {};
 
-        // Update meta
-        try self.updateMeta(.{
-            .page_count = meta.page_count + 1,
-            .first_free_page = new_result.page_id,
-            .tuple_count = meta.tuple_count + 1,
+        // Add the new extent to meta and increment tuple count
+        try self.addExtent(meta_full, ExtentEntry{
+            .start_page = new_start,
+            .page_count = EXTENT_GROWTH_SIZE,
         });
 
-        const tid = TupleId{ .page_id = new_result.page_id, .slot_id = slot_id };
+        const tid = TupleId{ .page_id = new_start, .slot_id = slot_id };
 
-        // Write insert undo record
         if (txn != null and self.undo_log != null) {
             try self.writeInsertUndo(txn.?, tid);
         }
@@ -331,65 +364,88 @@ pub const Table = struct {
     /// Sequential scan with optional MVCC visibility filtering
     pub const ScanIterator = struct {
         table: *Self,
-        current_page: PageId,
+        extent_buf: [MAX_EXTENTS]ExtentEntry,
+        extent_count: usize,
+        current_extent: usize,
+        current_page_offset: u32,
         current_slot: SlotId,
-        page_count: u32,
         /// Transaction for visibility checks (null = all visible)
         txn: ?*const Transaction,
 
         /// Returns the next visible tuple ID and deserialized values.
         /// Caller must free the returned values slice.
         pub fn next(self: *ScanIterator) TableError!?struct { tid: TupleId, values: []Value } {
-            while (self.current_page < self.table.table_id + self.page_count) {
-                var pg = self.table.buffer_pool.fetchPage(self.current_page) catch {
-                    return TableError.BufferPoolError;
-                };
+            while (self.current_extent < self.extent_count) {
+                const ext = self.extent_buf[self.current_extent];
 
-                const header = pg.getHeader();
-                const start_slot: SlotId = if (self.current_page == self.table.table_id and self.current_slot == 0) 1 else self.current_slot;
+                while (self.current_page_offset < ext.page_count) {
+                    const page_id = ext.start_page + self.current_page_offset;
 
-                var slot = start_slot;
-                while (slot < header.slot_count) : (slot += 1) {
-                    if (pg.getTuple(slot)) |raw| {
-                        const tid = TupleId{ .page_id = self.current_page, .slot_id = slot };
+                    var pg = self.table.buffer_pool.fetchPage(page_id) catch {
+                        return TableError.BufferPoolError;
+                    };
 
-                        // MVCC visibility check
-                        if (self.txn != null and self.table.txn_manager != null) {
-                            if (raw.len < TupleHeader.SIZE) {
-                                continue; // Skip malformed tuples
+                    const pg_header = pg.getHeader();
+
+                    // Skip uninitialized pages (allocated but never written to)
+                    if (pg_header.free_space_end == 0) {
+                        self.table.buffer_pool.unpinPage(page_id, false) catch {};
+                        self.current_page_offset += 1;
+                        self.current_slot = 0;
+                        continue;
+                    }
+
+                    // Skip slot 0 on the meta page (first page of first extent)
+                    const start_slot: SlotId = if (self.current_extent == 0 and self.current_page_offset == 0 and self.current_slot == 0) 1 else self.current_slot;
+
+                    var slot = start_slot;
+                    while (slot < pg_header.slot_count) : (slot += 1) {
+                        if (pg.getTuple(slot)) |raw| {
+                            const tid = TupleId{ .page_id = page_id, .slot_id = slot };
+
+                            // MVCC visibility check
+                            if (self.txn != null and self.table.txn_manager != null) {
+                                if (raw.len < TupleHeader.SIZE) {
+                                    continue; // Skip malformed tuples
+                                }
+                                const stripped = Tuple.stripHeader(raw) catch continue;
+                                const vis = mvcc_mod.isVisible(&stripped.header, &self.txn.?.snapshot, self.table.txn_manager.?, self.txn.?.txn_id);
+                                if (vis == .invisible) continue;
+
+                                self.current_slot = slot + 1;
+
+                                const values = Tuple.deserialize(self.table.allocator, self.table.schema, stripped.user_data) catch {
+                                    self.table.buffer_pool.unpinPage(page_id, false) catch {};
+                                    return TableError.SerializationError;
+                                };
+
+                                self.table.buffer_pool.unpinPage(page_id, false) catch {};
+                                return .{ .tid = tid, .values = values };
+                            } else {
+                                // Legacy mode: no header
+                                self.current_slot = slot + 1;
+
+                                const values = Tuple.deserialize(self.table.allocator, self.table.schema, raw) catch {
+                                    self.table.buffer_pool.unpinPage(page_id, false) catch {};
+                                    return TableError.SerializationError;
+                                };
+
+                                self.table.buffer_pool.unpinPage(page_id, false) catch {};
+                                return .{ .tid = tid, .values = values };
                             }
-                            const stripped = Tuple.stripHeader(raw) catch continue;
-                            const vis = mvcc_mod.isVisible(&stripped.header, &self.txn.?.snapshot, self.table.txn_manager.?, self.txn.?.txn_id);
-                            if (vis == .invisible) continue;
-
-                            self.current_slot = slot + 1;
-
-                            const values = Tuple.deserialize(self.table.allocator, self.table.schema, stripped.user_data) catch {
-                                self.table.buffer_pool.unpinPage(self.current_page, false) catch {};
-                                return TableError.SerializationError;
-                            };
-
-                            self.table.buffer_pool.unpinPage(self.current_page, false) catch {};
-                            return .{ .tid = tid, .values = values };
-                        } else {
-                            // Legacy mode: no header
-                            self.current_slot = slot + 1;
-
-                            const values = Tuple.deserialize(self.table.allocator, self.table.schema, raw) catch {
-                                self.table.buffer_pool.unpinPage(self.current_page, false) catch {};
-                                return TableError.SerializationError;
-                            };
-
-                            self.table.buffer_pool.unpinPage(self.current_page, false) catch {};
-                            return .{ .tid = tid, .values = values };
                         }
                     }
+
+                    self.table.buffer_pool.unpinPage(page_id, false) catch {};
+
+                    // Move to next page within this extent
+                    self.current_page_offset += 1;
+                    self.current_slot = 0;
                 }
 
-                self.table.buffer_pool.unpinPage(self.current_page, false) catch {};
-
-                // Move to next page
-                self.current_page += 1;
+                // Move to next extent
+                self.current_extent += 1;
+                self.current_page_offset = 0;
                 self.current_slot = 0;
             }
 
@@ -409,14 +465,18 @@ pub const Table = struct {
 
     /// Start a sequential scan with a transaction for MVCC visibility
     pub fn scanWithTxn(self: *Self, txn: ?*const Transaction) TableError!ScanIterator {
-        const meta = try self.readMeta();
-        return .{
+        const meta_full = try self.readMetaFull();
+        var iter = ScanIterator{
             .table = self,
-            .current_page = self.table_id,
+            .extent_buf = undefined,
+            .extent_count = meta_full.extent_count,
+            .current_extent = 0,
+            .current_page_offset = 0,
             .current_slot = 0,
-            .page_count = meta.page_count,
             .txn = txn,
         };
+        @memcpy(iter.extent_buf[0..meta_full.extent_count], meta_full.extent_buf[0..meta_full.extent_count]);
+        return iter;
     }
 
     // ── Undo record helpers ──────────────────────────────────────────
@@ -503,7 +563,7 @@ pub const Table = struct {
 
     // ── Internal helpers ─────────────────────────────────────────────
 
-    /// Read the table metadata from the first page
+    /// Read just the table metadata header from slot 0
     fn readMeta(self: *Self) TableError!TableMeta {
         var pg = self.buffer_pool.fetchPage(self.table_id) catch {
             return TableError.BufferPoolError;
@@ -518,24 +578,76 @@ pub const Table = struct {
         return std.mem.bytesToValue(TableMeta, raw[0..TableMeta.SIZE]);
     }
 
-    /// Update the table metadata
-    fn updateMeta(self: *Self, meta: TableMeta) TableError!void {
+    /// Read full metadata: header + extent list
+    fn readMetaFull(self: *Self) TableError!MetaResult {
+        var pg = self.buffer_pool.fetchPage(self.table_id) catch {
+            return TableError.BufferPoolError;
+        };
+        defer self.buffer_pool.unpinPage(self.table_id, false) catch {};
+
+        const raw = pg.getTuple(0) orelse {
+            return TableError.TupleNotFound;
+        };
+
+        if (raw.len < TableMeta.SIZE) return TableError.SerializationError;
+        const header = std.mem.bytesToValue(TableMeta, raw[0..TableMeta.SIZE]);
+
+        var result = MetaResult{
+            .header = header,
+            .extent_buf = undefined,
+            .extent_count = header.extent_count,
+        };
+
+        // Parse extent entries
+        var i: usize = 0;
+        while (i < header.extent_count and i < MAX_EXTENTS) : (i += 1) {
+            const off = TableMeta.SIZE + i * ExtentEntry.SIZE;
+            if (off + ExtentEntry.SIZE > raw.len) break;
+            result.extent_buf[i] = std.mem.bytesToValue(ExtentEntry, raw[off..][0..ExtentEntry.SIZE]);
+        }
+        result.extent_count = i;
+
+        return result;
+    }
+
+    /// Write full metadata: header + extent list back to slot 0
+    fn updateMetaFull(self: *Self, header: TableMeta, extent_list: []const ExtentEntry) TableError!void {
         var pg = self.buffer_pool.fetchPage(self.table_id) catch {
             return TableError.BufferPoolError;
         };
         defer self.buffer_pool.unpinPage(self.table_id, true) catch {};
 
-        // Overwrite the meta slot data directly
-        const slot = pg.getSlot(0) orelse return TableError.TupleNotFound;
-        const dest = pg.data[slot.offset..][0..TableMeta.SIZE];
-        @memcpy(dest, std.mem.asBytes(&meta));
+        var meta_blob: [META_RESERVED_SIZE]u8 = [_]u8{0} ** META_RESERVED_SIZE;
+        @memcpy(meta_blob[0..TableMeta.SIZE], std.mem.asBytes(&header));
+
+        for (extent_list, 0..) |ext, i| {
+            const off = TableMeta.SIZE + i * ExtentEntry.SIZE;
+            @memcpy(meta_blob[off..][0..ExtentEntry.SIZE], std.mem.asBytes(&ext));
+        }
+
+        _ = pg.updateTupleData(0, 0, &meta_blob);
+    }
+
+    /// Add a new extent and increment tuple_count by 1
+    fn addExtent(self: *Self, meta_full: MetaResult, new_extent: ExtentEntry) TableError!void {
+        var new_header = meta_full.header;
+        new_header.extent_count += 1;
+        new_header.tuple_count += 1;
+
+        // Build combined extent list
+        var extents: [MAX_EXTENTS]ExtentEntry = undefined;
+        @memcpy(extents[0..meta_full.extent_count], meta_full.extent_buf[0..meta_full.extent_count]);
+        extents[meta_full.extent_count] = new_extent;
+
+        try self.updateMetaFull(new_header, extents[0 .. meta_full.extent_count + 1]);
     }
 
     /// Increment the tuple count in metadata
     fn incrementTupleCount(self: *Self) TableError!void {
-        var meta = try self.readMeta();
-        meta.tuple_count += 1;
-        try self.updateMeta(meta);
+        const meta_full = try self.readMetaFull();
+        var header = meta_full.header;
+        header.tuple_count += 1;
+        try self.updateMetaFull(header, meta_full.extents());
     }
 
     /// Get the total number of tuples
@@ -1308,4 +1420,144 @@ test "table scan returns all rows after multiple inserts" {
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 10), count);
+}
+
+test "multi-table interleaving no cross-table corruption" {
+    const test_file = "test_table_interleave.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+
+    const schema_a = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+            .{ .name = "name", .col_type = .varchar, .max_length = 255, .nullable = false },
+        },
+    };
+    const schema_b = Schema{
+        .columns = &.{
+            .{ .name = "val", .col_type = .integer, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var table_a = try Table.create(std.testing.allocator, &bp, &schema_a);
+    var table_b = try Table.create(std.testing.allocator, &bp, &schema_b);
+
+    // Interleave inserts into both tables
+    var i: i32 = 0;
+    while (i < 100) : (i += 1) {
+        var name_buf: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "name_{}", .{i}) catch unreachable;
+        _ = try table_a.insertTuple(null, &.{ .{ .integer = i }, .{ .bytes = name } });
+        _ = try table_b.insertTuple(null, &.{.{ .integer = i * 10 }});
+    }
+
+    // Scan table_a — should see exactly 100 rows, no corruption
+    var iter_a = try table_a.scan();
+    var count_a: usize = 0;
+    while (try iter_a.next()) |row| {
+        defer iter_a.freeValues(row.values);
+        count_a += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 100), count_a);
+
+    // Scan table_b — should see exactly 100 rows, no corruption
+    var iter_b = try table_b.scan();
+    var count_b: usize = 0;
+    while (try iter_b.next()) |row| {
+        defer iter_b.freeValues(row.values);
+        count_b += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 100), count_b);
+}
+
+test "extent allocation and multi-extent scan" {
+    const test_file = "test_table_multi_extent.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+            .{ .name = "data", .col_type = .text, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var table = try Table.create(std.testing.allocator, &bp, &schema);
+
+    // Insert large rows to fill the initial page + force extent allocation
+    var large_buf: [512]u8 = undefined;
+    @memset(&large_buf, 'Y');
+
+    var i: i32 = 0;
+    while (i < 50) : (i += 1) {
+        _ = try table.insertTuple(null, &.{ .{ .integer = i }, .{ .bytes = &large_buf } });
+    }
+
+    // Should have multiple extents by now
+    const meta_full = try table.readMetaFull();
+    try std.testing.expect(meta_full.extent_count > 1);
+
+    // Scan all rows — should get exactly 50
+    var iter = try table.scan();
+    var count: usize = 0;
+    while (try iter.next()) |row| {
+        defer iter.freeValues(row.values);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 50), count);
+    try std.testing.expectEqual(@as(u64, 50), try table.tupleCount());
+}
+
+test "three tables interleaved with large rows" {
+    const test_file = "test_table_three_interleave.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 80);
+    defer bp.deinit();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+            .{ .name = "payload", .col_type = .text, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var t1 = try Table.create(std.testing.allocator, &bp, &schema);
+    var t2 = try Table.create(std.testing.allocator, &bp, &schema);
+    var t3 = try Table.create(std.testing.allocator, &bp, &schema);
+
+    var large_buf: [400]u8 = undefined;
+    @memset(&large_buf, 'Z');
+
+    // Interleave inserts across all three tables
+    var i: i32 = 0;
+    while (i < 30) : (i += 1) {
+        _ = try t1.insertTuple(null, &.{ .{ .integer = i }, .{ .bytes = &large_buf } });
+        _ = try t2.insertTuple(null, &.{ .{ .integer = i + 1000 }, .{ .bytes = &large_buf } });
+        _ = try t3.insertTuple(null, &.{ .{ .integer = i + 2000 }, .{ .bytes = &large_buf } });
+    }
+
+    // Verify each table has exactly 30 rows with correct data
+    inline for (.{ &t1, &t2, &t3 }, .{ @as(i32, 0), @as(i32, 1000), @as(i32, 2000) }) |tbl, base| {
+        var iter = try tbl.scan();
+        var count: usize = 0;
+        while (try iter.next()) |row| {
+            defer iter.freeValues(row.values);
+            // Verify the id is in the expected range
+            try std.testing.expect(row.values[0].integer >= base);
+            try std.testing.expect(row.values[0].integer < base + 30);
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 30), count);
+    }
 }

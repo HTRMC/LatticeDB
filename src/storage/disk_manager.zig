@@ -143,6 +143,20 @@ pub const DiskManager = struct {
         return new_page_id;
     }
 
+    /// Allocate a contiguous extent of pages and return the first page ID
+    pub fn allocateExtent(self: *Self, count: u32) DiskManagerError!PageId {
+        _ = self.file orelse return DiskManagerError.FileNotOpen;
+
+        const first = self.num_pages;
+        var empty: [PAGE_SIZE]u8 align(8) = [_]u8{0} ** PAGE_SIZE;
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            try self.writePage(first + i, &empty);
+        }
+        // writePage already updates num_pages incrementally, so no extra addition needed
+        return first;
+    }
+
     /// Flush all pending writes to disk
     pub fn flush(self: *Self) DiskManagerError!void {
         const f = self.file orelse return DiskManagerError.FileNotOpen;
@@ -359,4 +373,41 @@ test "disk manager write to INVALID_PAGE_ID fails" {
 
     var buffer: [PAGE_SIZE]u8 align(8) = [_]u8{0} ** PAGE_SIZE;
     try std.testing.expectError(DiskManagerError.InvalidPageId, dm.writePage(page.INVALID_PAGE_ID, &buffer));
+}
+
+test "disk manager allocateExtent" {
+    const test_file = "test_disk_manager_extent.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
+
+    try dm.open();
+
+    // Allocate a single page first
+    const p0 = try dm.allocatePage();
+    try std.testing.expectEqual(@as(PageId, 0), p0);
+    try std.testing.expectEqual(@as(PageId, 1), dm.getNumPages());
+
+    // Allocate an extent of 4 pages
+    const ext_start = try dm.allocateExtent(4);
+    try std.testing.expectEqual(@as(PageId, 1), ext_start);
+    try std.testing.expectEqual(@as(PageId, 5), dm.getNumPages());
+
+    // All pages in the extent should be readable (zero-initialized)
+    var i: PageId = ext_start;
+    while (i < ext_start + 4) : (i += 1) {
+        var buffer: [PAGE_SIZE]u8 align(8) = undefined;
+        try dm.readPage(i, &buffer);
+        // Should be all zeros
+        for (buffer) |b| {
+            try std.testing.expectEqual(@as(u8, 0), b);
+        }
+    }
+
+    // Allocate another extent — should be contiguous after the first
+    const ext2_start = try dm.allocateExtent(2);
+    try std.testing.expectEqual(@as(PageId, 5), ext2_start);
+    try std.testing.expectEqual(@as(PageId, 7), dm.getNumPages());
 }

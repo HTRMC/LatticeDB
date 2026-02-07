@@ -406,6 +406,13 @@ pub const BufferPool = struct {
         return victim_frame_id;
     }
 
+    /// Allocate a contiguous extent of pages on disk (no frames allocated)
+    pub fn allocateExtent(self: *Self, count: u32) BufferPoolError!PageId {
+        return self.disk_manager.allocateExtent(count) catch {
+            return BufferPoolError.DiskError;
+        };
+    }
+
     /// Get the pin count for a page (for debugging/testing)
     pub fn getPinCount(self: *const Self, page_id: PageId) ?u32 {
         const frame_id = self.page_table.get(page_id) orelse return null;
