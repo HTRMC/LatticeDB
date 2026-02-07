@@ -86,6 +86,15 @@ pub const Expression = union(enum) {
         value: *const Expression,
         items: []const *const Expression,
     },
+    /// IN (SELECT ...)
+    in_subquery: struct {
+        value: *const Expression,
+        subquery: *const Select,
+    },
+    /// EXISTS (SELECT ...)
+    exists_subquery: struct {
+        subquery: *const Select,
+    },
 };
 
 /// Aggregate function type

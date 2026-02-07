@@ -1136,7 +1136,7 @@ pub const Executor = struct {
 
                 // Apply WHERE filter on combined row
                 if (sel.where_clause) |where| {
-                    if (!evalExpr(where, combined_schema, combined_values)) continue;
+                    if (!self.evalExpr(where, combined_schema, combined_values)) continue;
                 }
 
                 matched = true;
@@ -1179,7 +1179,7 @@ pub const Executor = struct {
                 }
 
                 if (sel.where_clause) |where| {
-                    if (!evalExpr(where, combined_schema, combined_values)) {
+                    if (!self.evalExpr(where, combined_schema, combined_values)) {
                         self.allocator.free(combined_values);
                         continue;
                     }
@@ -1527,11 +1527,10 @@ pub const Executor = struct {
     // WHERE evaluation
     // ============================================================
     fn evalWhere(self: *Self, expr: *const ast.Expression, schema: *const Schema, values: []const Value) bool {
-        _ = self;
-        return evalExpr(expr, schema, values);
+        return self.evalExpr(expr, schema, values);
     }
 
-    fn evalExpr(expr: *const ast.Expression, schema: *const Schema, values: []const Value) bool {
+    fn evalExpr(self: *Self, expr: *const ast.Expression, schema: *const Schema, values: []const Value) bool {
         switch (expr.*) {
             .comparison => |cmp| {
                 const left_val = resolveExprValue(cmp.left, schema, values);
@@ -1539,13 +1538,13 @@ pub const Executor = struct {
                 return compareValues(left_val, cmp.op, right_val);
             },
             .and_expr => |a| {
-                return evalExpr(a.left, schema, values) and evalExpr(a.right, schema, values);
+                return self.evalExpr(a.left, schema, values) and self.evalExpr(a.right, schema, values);
             },
             .or_expr => |o| {
-                return evalExpr(o.left, schema, values) or evalExpr(o.right, schema, values);
+                return self.evalExpr(o.left, schema, values) or self.evalExpr(o.right, schema, values);
             },
             .not_expr => |n| {
-                return !evalExpr(n.operand, schema, values);
+                return !self.evalExpr(n.operand, schema, values);
             },
             .between_expr => |b| {
                 const val = resolveExprValue(b.value, schema, values);
@@ -1574,6 +1573,24 @@ pub const Executor = struct {
                 }
                 return false;
             },
+            .in_subquery => |isq| {
+                const val = resolveExprValue(isq.value, schema, values);
+                const sub_result = self.execSelect(isq.subquery.*) catch return false;
+                defer self.freeResult(.{ .rows = sub_result.rows });
+                for (sub_result.rows.rows) |row| {
+                    if (row.values.len > 0) {
+                        // Compare val with first column of each row
+                        const sub_val = self.parseSubqueryValue(row.values[0], val);
+                        if (compareValues(val, .eq, sub_val)) return true;
+                    }
+                }
+                return false;
+            },
+            .exists_subquery => |esq| {
+                const sub_result = self.execSelect(esq.subquery.*) catch return false;
+                defer self.freeResult(.{ .rows = sub_result.rows });
+                return sub_result.rows.rows.len > 0;
+            },
             .literal => |lit| {
                 // Bare literal in WHERE - treat as truthy
                 return switch (lit) {
@@ -1600,6 +1617,33 @@ pub const Executor = struct {
                 }
                 return true;
             },
+        }
+    }
+
+    /// Parse a string from a subquery result row into a Value that can be compared
+    /// with the given reference value. Tries to match the type of the reference.
+    fn parseSubqueryValue(_: *Self, str: []const u8, ref_val: Value) Value {
+        // Try to match the type of the reference value
+        switch (ref_val) {
+            .integer => {
+                const v = std.fmt.parseInt(i32, str, 10) catch return Value{ .bytes = str };
+                return .{ .integer = v };
+            },
+            .bigint => {
+                const v = std.fmt.parseInt(i64, str, 10) catch return Value{ .bytes = str };
+                return .{ .bigint = v };
+            },
+            .float => {
+                const v = std.fmt.parseFloat(f64, str) catch return Value{ .bytes = str };
+                return .{ .float = v };
+            },
+            .bytes => return .{ .bytes = str },
+            .boolean => {
+                if (std.mem.eql(u8, str, "true")) return .{ .boolean = true };
+                if (std.mem.eql(u8, str, "false")) return .{ .boolean = false };
+                return .{ .bytes = str };
+            },
+            .null_value => return .{ .null_value = {} },
         }
     }
 
@@ -3362,4 +3406,105 @@ test "executor ALTER TABLE nonexistent fails" {
 
     const result = exec.execute("ALTER TABLE nonexistent ADD col INT");
     try std.testing.expectError(ExecError.TableNotFound, result);
+}
+
+test "executor IN subquery" {
+    const test_file = "test_exec_in_sub.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct1 = try exec.execute("CREATE TABLE users (id INT, name TEXT)");
+    exec.freeResult(ct1);
+    const ct2 = try exec.execute("CREATE TABLE active_ids (user_id INT)");
+    exec.freeResult(ct2);
+
+    const ins1 = try exec.execute("INSERT INTO users VALUES (1, 'Alice')");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO users VALUES (2, 'Bob')");
+    exec.freeResult(ins2);
+    const ins3 = try exec.execute("INSERT INTO users VALUES (3, 'Charlie')");
+    exec.freeResult(ins3);
+
+    const ins4 = try exec.execute("INSERT INTO active_ids VALUES (1)");
+    exec.freeResult(ins4);
+    const ins5 = try exec.execute("INSERT INTO active_ids VALUES (3)");
+    exec.freeResult(ins5);
+
+    // IN (SELECT ...) — should return Alice and Charlie
+    const sel = try exec.execute("SELECT name FROM users WHERE id IN (SELECT user_id FROM active_ids)");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 2), sel.rows.rows.len);
+}
+
+test "executor EXISTS subquery" {
+    const test_file = "test_exec_exists.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct1 = try exec.execute("CREATE TABLE users (id INT, name TEXT)");
+    exec.freeResult(ct1);
+    const ct2 = try exec.execute("CREATE TABLE orders (id INT, user_id INT)");
+    exec.freeResult(ct2);
+
+    const ins1 = try exec.execute("INSERT INTO users VALUES (1, 'Alice')");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO users VALUES (2, 'Bob')");
+    exec.freeResult(ins2);
+    const ins3 = try exec.execute("INSERT INTO orders VALUES (1, 1)");
+    exec.freeResult(ins3);
+
+    // EXISTS on non-empty table — should return both users since subquery is not correlated
+    const sel = try exec.execute("SELECT * FROM users WHERE EXISTS (SELECT * FROM orders)");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 2), sel.rows.rows.len);
+
+    // EXISTS on empty result — drop orders, empty it
+    const del = try exec.execute("DELETE FROM orders");
+    exec.freeResult(del);
+    const sel2 = try exec.execute("SELECT * FROM users WHERE EXISTS (SELECT * FROM orders)");
+    defer exec.freeResult(sel2);
+    try std.testing.expectEqual(@as(usize, 0), sel2.rows.rows.len);
+}
+
+test "executor IN subquery empty result" {
+    const test_file = "test_exec_in_sub_empty.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct1 = try exec.execute("CREATE TABLE users (id INT, name TEXT)");
+    exec.freeResult(ct1);
+    const ct2 = try exec.execute("CREATE TABLE empty_t (user_id INT)");
+    exec.freeResult(ct2);
+
+    const ins1 = try exec.execute("INSERT INTO users VALUES (1, 'Alice')");
+    exec.freeResult(ins1);
+
+    // IN (SELECT ...) from empty table — should return 0 rows
+    const sel = try exec.execute("SELECT * FROM users WHERE id IN (SELECT user_id FROM empty_t)");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 0), sel.rows.rows.len);
 }

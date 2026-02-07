@@ -55,6 +55,7 @@ pub const TokenType = enum {
     kw_between,
     kw_like,
     kw_in,
+    kw_exists,
 
     // ALTER TABLE
     kw_alter,
@@ -154,6 +155,7 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "between", .kw_between },
     .{ "column", .kw_column },
     .{ "distinct", .kw_distinct },
+    .{ "exists", .kw_exists },
     .{ "in", .kw_in },
     .{ "like", .kw_like },
     .{ "begin", .kw_begin },

@@ -525,10 +525,24 @@ pub const Parser = struct {
             return expr;
         }
 
-        // IN (val, val, ...)
+        // IN (val, val, ...) or IN (SELECT ...)
         if (self.current.type == .kw_in) {
             self.advance();
             try self.expect(.left_paren);
+
+            // Check for subquery
+            if (self.current.type == .kw_select) {
+                const subquery = try self.parseSelect();
+                try self.expect(.right_paren);
+                const sub_ptr = try alloc.create(ast.Select);
+                sub_ptr.* = subquery;
+                const expr = try alloc.create(ast.Expression);
+                expr.* = .{ .in_subquery = .{
+                    .value = left,
+                    .subquery = sub_ptr,
+                } };
+                return expr;
+            }
 
             var items: std.ArrayList(*const ast.Expression) = .empty;
             items.append(alloc, try self.parsePrimary()) catch return ParseError.OutOfMemory;
@@ -608,6 +622,16 @@ pub const Parser = struct {
                 } else {
                     expr.* = .{ .column_ref = name };
                 }
+            },
+            .kw_exists => {
+                self.advance();
+                try self.expect(.left_paren);
+                const subquery = try self.parseSelect();
+                try self.expect(.right_paren);
+                const alloc = self.arena();
+                const sub_ptr = try alloc.create(ast.Select);
+                sub_ptr.* = subquery;
+                expr.* = .{ .exists_subquery = .{ .subquery = sub_ptr } };
             },
             .left_paren => {
                 self.advance();
@@ -1077,4 +1101,24 @@ test "parse ALTER TABLE ADD COLUMN" {
         const at = stmt.alter_table;
         try std.testing.expectEqualStrings("score", at.action.add_column.name);
     }
+}
+
+test "parse IN subquery" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t WHERE id IN (SELECT id FROM other)");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    const where = sel.where_clause.?;
+    try std.testing.expect(where.* == .in_subquery);
+    try std.testing.expectEqualStrings("other", where.in_subquery.subquery.table_name);
+}
+
+test "parse EXISTS subquery" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t WHERE EXISTS (SELECT * FROM other WHERE other.id = 1)");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    const where = sel.where_clause.?;
+    try std.testing.expect(where.* == .exists_subquery);
+    try std.testing.expectEqualStrings("other", where.exists_subquery.subquery.table_name);
 }
