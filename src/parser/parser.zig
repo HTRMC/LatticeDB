@@ -49,9 +49,27 @@ pub const Parser = struct {
             .kw_insert => ast.Statement{ .insert = try self.parseInsert() },
             .kw_update => ast.Statement{ .update = try self.parseUpdate() },
             .kw_delete => ast.Statement{ .delete = try self.parseDelete() },
-            .kw_create => ast.Statement{ .create_table = try self.parseCreateTable() },
-            .kw_drop => ast.Statement{ .drop_table = try self.parseDropTable() },
+            .kw_create => blk: {
+                // Peek ahead to distinguish CREATE TABLE from CREATE [UNIQUE] INDEX
+                const next = self.lexer.peek();
+                if (next.type == .kw_index or next.type == .kw_unique) {
+                    break :blk ast.Statement{ .create_index = try self.parseCreateIndex() };
+                }
+                break :blk ast.Statement{ .create_table = try self.parseCreateTable() };
+            },
+            .kw_drop => blk: {
+                const next = self.lexer.peek();
+                if (next.type == .kw_index) {
+                    break :blk ast.Statement{ .drop_index = try self.parseDropIndex() };
+                }
+                break :blk ast.Statement{ .drop_table = try self.parseDropTable() };
+            },
             .kw_alter => ast.Statement{ .alter_table = try self.parseAlterTable() },
+            .kw_explain => blk: {
+                self.advance(); // consume EXPLAIN
+                const sel = try self.parseSelect();
+                break :blk ast.Statement{ .explain = .{ .select = sel } };
+            },
             .kw_begin => blk: {
                 self.advance();
                 break :blk ast.Statement{ .begin_txn = {} };
@@ -403,6 +421,44 @@ pub const Parser = struct {
             .table_name = table_name,
             .action = .{ .add_column = col_def },
         };
+    }
+
+    // ============================================================
+    // CREATE [UNIQUE] INDEX name ON table (column)
+    // ============================================================
+    fn parseCreateIndex(self: *Self) ParseError!ast.CreateIndex {
+        try self.expect(.kw_create);
+
+        var is_unique = false;
+        if (self.current.type == .kw_unique) {
+            is_unique = true;
+            self.advance();
+        }
+        try self.expect(.kw_index);
+        const index_name = try self.expectIdentifier();
+        // Expect ON keyword — "on" is kw_on
+        try self.expect(.kw_on);
+        const table_name = try self.expectIdentifier();
+        try self.expect(.left_paren);
+        const column_name = try self.expectIdentifier();
+        try self.expect(.right_paren);
+
+        return .{
+            .index_name = index_name,
+            .table_name = table_name,
+            .column_name = column_name,
+            .is_unique = is_unique,
+        };
+    }
+
+    // ============================================================
+    // DROP INDEX name
+    // ============================================================
+    fn parseDropIndex(self: *Self) ParseError!ast.DropIndex {
+        try self.expect(.kw_drop);
+        try self.expect(.kw_index);
+        const index_name = try self.expectIdentifier();
+        return .{ .index_name = index_name };
     }
 
     // ============================================================
@@ -1121,4 +1177,41 @@ test "parse EXISTS subquery" {
     const where = sel.where_clause.?;
     try std.testing.expect(where.* == .exists_subquery);
     try std.testing.expectEqualStrings("other", where.exists_subquery.subquery.table_name);
+}
+
+test "parse CREATE INDEX" {
+    var p = Parser.init(std.testing.allocator, "CREATE INDEX idx_users_id ON users (id)");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const ci = stmt.create_index;
+    try std.testing.expectEqualStrings("idx_users_id", ci.index_name);
+    try std.testing.expectEqualStrings("users", ci.table_name);
+    try std.testing.expectEqualStrings("id", ci.column_name);
+    try std.testing.expect(!ci.is_unique);
+}
+
+test "parse CREATE UNIQUE INDEX" {
+    var p = Parser.init(std.testing.allocator, "CREATE UNIQUE INDEX idx_u ON t (col)");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const ci = stmt.create_index;
+    try std.testing.expectEqualStrings("idx_u", ci.index_name);
+    try std.testing.expect(ci.is_unique);
+}
+
+test "parse DROP INDEX" {
+    var p = Parser.init(std.testing.allocator, "DROP INDEX idx_users_id");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const di = stmt.drop_index;
+    try std.testing.expectEqualStrings("idx_users_id", di.index_name);
+}
+
+test "parse EXPLAIN" {
+    var p = Parser.init(std.testing.allocator, "EXPLAIN SELECT * FROM users WHERE id = 1");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const ex = stmt.explain;
+    try std.testing.expectEqualStrings("users", ex.select.table_name);
+    try std.testing.expect(ex.select.where_clause != null);
 }

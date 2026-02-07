@@ -62,6 +62,13 @@ pub const TokenType = enum {
     kw_add,
     kw_column,
 
+    // Index
+    kw_index,
+    kw_unique,
+
+    // EXPLAIN
+    kw_explain,
+
     // Transaction keywords
     kw_begin,
     kw_commit,
@@ -161,6 +168,9 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "begin", .kw_begin },
     .{ "commit", .kw_commit },
     .{ "rollback", .kw_rollback },
+    .{ "index", .kw_index },
+    .{ "unique", .kw_unique },
+    .{ "explain", .kw_explain },
     .{ "int", .kw_int },
     .{ "integer", .kw_integer },
     .{ "bigint", .kw_bigint },

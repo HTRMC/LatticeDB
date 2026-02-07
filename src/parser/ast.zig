@@ -127,12 +127,15 @@ pub const SelectColumn = union(enum) {
 /// Top-level SQL statement
 pub const Statement = union(enum) {
     create_table: CreateTable,
+    create_index: CreateIndex,
     insert: Insert,
     select: Select,
     update: Update,
     delete: Delete,
     drop_table: DropTable,
+    drop_index: DropIndex,
     alter_table: AlterTable,
+    explain: Explain,
     begin_txn: void,
     commit_txn: void,
     rollback_txn: void,
@@ -204,4 +207,19 @@ pub const AlterAction = union(enum) {
 pub const AlterTable = struct {
     table_name: []const u8,
     action: AlterAction,
+};
+
+pub const CreateIndex = struct {
+    index_name: []const u8,
+    table_name: []const u8,
+    column_name: []const u8,
+    is_unique: bool,
+};
+
+pub const DropIndex = struct {
+    index_name: []const u8,
+};
+
+pub const Explain = struct {
+    select: Select,
 };

@@ -31,6 +31,8 @@ pub const ExecError = error{
     OutOfMemory,
     TransactionError,
     WriteConflict,
+    IndexNotFound,
+    IndexAlreadyExists,
 };
 
 /// A result row — an array of string-formatted values
@@ -93,12 +95,15 @@ pub const Executor = struct {
 
         return switch (stmt) {
             .create_table => |ct| self.execCreateTable(ct),
+            .create_index => |ci| self.execCreateIndex(ci),
             .insert => |ins| self.execInsert(ins),
             .select => |sel| self.execSelect(sel),
             .update => |upd| self.execUpdate(upd),
             .delete => |del| self.execDelete(del),
             .drop_table => |dt| self.execDropTable(dt),
+            .drop_index => |di| self.execDropIndex(di),
             .alter_table => |at| self.execAlterTable(at),
+            .explain => |ex| self.execExplain(ex),
             .begin_txn => self.execBegin(),
             .commit_txn => self.execCommit(),
             .rollback_txn => self.execRollback(),
@@ -322,6 +327,51 @@ pub const Executor = struct {
                 return .{ .message = msg };
             },
         }
+    }
+
+    // ============================================================
+    // CREATE INDEX
+    // ============================================================
+    fn execCreateIndex(self: *Self, ci: ast.CreateIndex) ExecError!ExecResult {
+        _ = self.catalog.createIndex(ci.table_name, ci.index_name, ci.column_name, ci.is_unique) catch |err| {
+            return switch (err) {
+                catalog_mod.CatalogError.IndexAlreadyExists => ExecError.IndexAlreadyExists,
+                catalog_mod.CatalogError.TableNotFound => ExecError.TableNotFound,
+                else => ExecError.StorageError,
+            };
+        };
+
+        const msg = std.fmt.allocPrint(self.allocator, "CREATE INDEX", .{}) catch {
+            return ExecError.OutOfMemory;
+        };
+        return .{ .message = msg };
+    }
+
+    // ============================================================
+    // DROP INDEX
+    // ============================================================
+    fn execDropIndex(self: *Self, di: ast.DropIndex) ExecError!ExecResult {
+        self.catalog.dropIndex(di.index_name) catch |err| {
+            return switch (err) {
+                catalog_mod.CatalogError.IndexNotFound => ExecError.IndexNotFound,
+                else => ExecError.StorageError,
+            };
+        };
+
+        const msg = std.fmt.allocPrint(self.allocator, "DROP INDEX", .{}) catch {
+            return ExecError.OutOfMemory;
+        };
+        return .{ .message = msg };
+    }
+
+    // ============================================================
+    // EXPLAIN (stub — filled in Step 6)
+    // ============================================================
+    fn execExplain(self: *Self, _: ast.Explain) ExecError!ExecResult {
+        const msg = std.fmt.allocPrint(self.allocator, "EXPLAIN not yet implemented", .{}) catch {
+            return ExecError.OutOfMemory;
+        };
+        return .{ .message = msg };
     }
 
     // ============================================================
@@ -3507,4 +3557,42 @@ test "executor IN subquery empty result" {
     const sel = try exec.execute("SELECT * FROM users WHERE id IN (SELECT user_id FROM empty_t)");
     defer exec.freeResult(sel);
     try std.testing.expectEqual(@as(usize, 0), sel.rows.rows.len);
+}
+
+test "executor CREATE INDEX and DROP INDEX" {
+    const test_file = "test_exec_idx.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE users (id INT, name TEXT)");
+    exec.freeResult(ct);
+
+    // CREATE INDEX
+    const r1 = try exec.execute("CREATE INDEX idx_users_id ON users (id)");
+    defer exec.freeResult(r1);
+    try std.testing.expectEqualStrings("CREATE INDEX", r1.message);
+
+    // CREATE UNIQUE INDEX
+    const r2 = try exec.execute("CREATE UNIQUE INDEX idx_users_name ON users (name)");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqualStrings("CREATE INDEX", r2.message);
+
+    // Duplicate should fail
+    try std.testing.expectError(ExecError.IndexAlreadyExists, exec.execute("CREATE INDEX idx_users_id ON users (id)"));
+
+    // DROP INDEX
+    const r3 = try exec.execute("DROP INDEX idx_users_id");
+    defer exec.freeResult(r3);
+    try std.testing.expectEqualStrings("DROP INDEX", r3.message);
+
+    // DROP nonexistent should fail
+    try std.testing.expectError(ExecError.IndexNotFound, exec.execute("DROP INDEX nope"));
 }
