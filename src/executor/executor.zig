@@ -8,6 +8,8 @@ const page_mod = @import("../storage/page.zig");
 const mvcc_mod = @import("../storage/mvcc.zig");
 const undo_log_mod = @import("../storage/undo_log.zig");
 const btree_mod = @import("../index/btree.zig");
+const planner_mod = @import("../planner/planner.zig");
+const plan_mod = @import("../planner/plan.zig");
 
 const Value = tuple_mod.Value;
 const Column = tuple_mod.Column;
@@ -443,13 +445,61 @@ pub const Executor = struct {
     }
 
     // ============================================================
-    // EXPLAIN (stub — filled in Step 6)
+    // EXPLAIN
     // ============================================================
-    fn execExplain(self: *Self, _: ast.Explain) ExecError!ExecResult {
-        const msg = std.fmt.allocPrint(self.allocator, "EXPLAIN not yet implemented", .{}) catch {
+    fn execExplain(self: *Self, ex: ast.Explain) ExecError!ExecResult {
+        var planner = planner_mod.Planner.init(self.allocator, self.catalog);
+        const plan = planner.planSelect(ex.select) catch |err| {
+            return switch (err) {
+                planner_mod.PlanError.TableNotFound => ExecError.TableNotFound,
+                planner_mod.PlanError.OutOfMemory => ExecError.OutOfMemory,
+                else => ExecError.StorageError,
+            };
+        };
+        defer planner.freePlan(plan);
+
+        const plan_text = plan_mod.formatPlan(self.allocator, plan, 0) catch {
             return ExecError.OutOfMemory;
         };
-        return .{ .message = msg };
+
+        // Return as single-row result with "QUERY PLAN" column
+        const columns = self.allocator.alloc([]const u8, 1) catch {
+            self.allocator.free(plan_text);
+            return ExecError.OutOfMemory;
+        };
+        columns[0] = self.allocator.dupe(u8, "QUERY PLAN") catch {
+            self.allocator.free(plan_text);
+            self.allocator.free(columns);
+            return ExecError.OutOfMemory;
+        };
+
+        const row_values = self.allocator.alloc([]const u8, 1) catch {
+            self.allocator.free(columns[0]);
+            self.allocator.free(columns);
+            self.allocator.free(plan_text);
+            return ExecError.OutOfMemory;
+        };
+        // Trim trailing newline from plan text
+        const trimmed = std.mem.trimEnd(u8, plan_text, "\n");
+        row_values[0] = self.allocator.dupe(u8, trimmed) catch {
+            self.allocator.free(columns[0]);
+            self.allocator.free(columns);
+            self.allocator.free(plan_text);
+            self.allocator.free(row_values);
+            return ExecError.OutOfMemory;
+        };
+        self.allocator.free(plan_text);
+
+        const rows = self.allocator.alloc(ResultRow, 1) catch {
+            self.allocator.free(row_values[0]);
+            self.allocator.free(row_values);
+            self.allocator.free(columns[0]);
+            self.allocator.free(columns);
+            return ExecError.OutOfMemory;
+        };
+        rows[0] = .{ .values = row_values };
+
+        return .{ .rows = .{ .columns = columns, .rows = rows } };
     }
 
     // ============================================================
@@ -3835,4 +3885,88 @@ test "executor backfill on CREATE INDEX" {
     try std.testing.expect((try btree.search(15)) != null);
     try std.testing.expect((try btree.search(25)) != null);
     try std.testing.expect((try btree.search(99)) == null);
+}
+
+test "executor EXPLAIN seq scan" {
+    const test_file = "test_exec_explain_seq.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE users (id INT, name TEXT)");
+    exec.freeResult(ct);
+
+    const result = try exec.execute("EXPLAIN SELECT * FROM users WHERE id = 1");
+    defer exec.freeResult(result);
+
+    try std.testing.expectEqualStrings("QUERY PLAN", result.rows.columns[0]);
+    try std.testing.expect(result.rows.rows.len == 1);
+    // No indexes → should show Filter + Seq Scan
+    try std.testing.expect(std.mem.indexOf(u8, result.rows.rows[0].values[0], "Seq Scan") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.rows.rows[0].values[0], "Filter") != null);
+}
+
+test "executor EXPLAIN index scan" {
+    const test_file = "test_exec_explain_idx.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE users (id INT, name TEXT)");
+    exec.freeResult(ct);
+
+    // Insert enough rows for index scan to be cheaper
+    var i: i32 = 0;
+    while (i < 100) : (i += 1) {
+        const ins = try exec.execute("INSERT INTO users VALUES (1, 'test')");
+        exec.freeResult(ins);
+    }
+
+    const ci = try exec.execute("CREATE INDEX idx_users_id ON users (id)");
+    exec.freeResult(ci);
+
+    const result = try exec.execute("EXPLAIN SELECT * FROM users WHERE id = 50");
+    defer exec.freeResult(result);
+
+    try std.testing.expectEqualStrings("QUERY PLAN", result.rows.columns[0]);
+    // With index + 100 rows → should show Index Scan
+    try std.testing.expect(std.mem.indexOf(u8, result.rows.rows[0].values[0], "Index Scan") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.rows.rows[0].values[0], "idx_users_id") != null);
+}
+
+test "executor EXPLAIN with filter" {
+    const test_file = "test_exec_explain_flt.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    const result = try exec.execute("EXPLAIN SELECT * FROM t WHERE id = 1");
+    defer exec.freeResult(result);
+
+    // Should show Filter node wrapping scan
+    try std.testing.expect(std.mem.indexOf(u8, result.rows.rows[0].values[0], "Filter") != null);
 }

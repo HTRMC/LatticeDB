@@ -63,7 +63,7 @@ pub const Planner = struct {
                         .range => @intFromFloat(@max(1.0, @as(f64, @floatFromInt(row_count)) * 0.25)),
                         .range_from, .range_to => @intFromFloat(@max(1.0, @as(f64, @floatFromInt(row_count)) * 0.33)),
                     };
-                    const cost: f64 = 4.0 + @as(f64, @floatFromInt(estimated_matches)) * 4.0;
+                    const cost: f64 = 4.0 + @as(f64, @floatFromInt(estimated_matches)) * 1.5;
                     if (cost < best_index_cost) {
                         best_index_cost = cost;
                         best_scan_type = result.scan_type;
@@ -78,11 +78,15 @@ pub const Planner = struct {
         var base_node: *PlanNode = undefined;
         if (best_scan_type != null and best_index_cost < seq_cost) {
             const idx = indexes[best_index_idx.?];
-            base_node = self.allocator.create(PlanNode) catch return PlanError.OutOfMemory;
+            const name_copy = self.allocator.dupe(u8, idx.index_name) catch return PlanError.OutOfMemory;
+            base_node = self.allocator.create(PlanNode) catch {
+                self.allocator.free(name_copy);
+                return PlanError.OutOfMemory;
+            };
             base_node.* = .{ .index_scan = .{
                 .table_name = sel.table_name,
                 .table_id = table_id,
-                .index_name = idx.index_name,
+                .index_name = name_copy,
                 .index_id = idx.index_id,
                 .column_ordinal = idx.column_ordinal,
                 .scan_type = best_scan_type.?,
@@ -140,6 +144,7 @@ pub const Planner = struct {
 
     pub fn freePlan(self: *Self, node: *PlanNode) void {
         switch (node.*) {
+            .index_scan => |is| self.allocator.free(is.index_name),
             .filter => |f| self.freePlan(f.child),
             .limit => |l| self.freePlan(l.child),
             .sort => |s| self.freePlan(s.child),
@@ -366,6 +371,7 @@ test "planner index scan for range" {
     const plan = try planner.planSelect(stmt.select);
     defer planner.freePlan(plan);
 
+    // 200 rows, range_from selectivity=0.33, matches=66, index cost=4+66*1.5=103 < seq cost=200
     try std.testing.expect(plan.* == .filter);
     try std.testing.expect(plan.filter.child.* == .index_scan);
     try std.testing.expect(plan.filter.child.index_scan.scan_type == .range_from);
@@ -387,7 +393,7 @@ test "planner prefers seq scan for tiny tables" {
     };
     _ = try catalog.createTable("t", &cols);
 
-    // Only 3 rows — seq scan cost (3) < index scan cost (4 + 1*4 = 8)
+    // Only 3 rows — seq scan cost (3) < index scan cost (4 + 1*1.5 = 5.5)
     const table_result = (try catalog.openTable("t")).?;
     defer catalog.freeSchema(table_result.schema);
     var table = table_result.table;
