@@ -496,6 +496,15 @@ pub const Parser = struct {
             return expr;
         }
 
+        // LIKE pattern
+        if (self.current.type == .kw_like) {
+            self.advance();
+            const pattern = try self.parsePrimary();
+            const expr = try alloc.create(ast.Expression);
+            expr.* = .{ .like_expr = .{ .value = left, .pattern = pattern } };
+            return expr;
+        }
+
         const op: ?ast.CompOp = switch (self.current.type) {
             .op_eq => .eq,
             .op_neq => .neq,
@@ -988,4 +997,13 @@ test "parse BETWEEN" {
     const sel = stmt.select;
     const where = sel.where_clause.?;
     try std.testing.expect(where.* == .between_expr);
+}
+
+test "parse LIKE" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t WHERE name LIKE 'A%'");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    const where = sel.where_clause.?;
+    try std.testing.expect(where.* == .like_expr);
 }

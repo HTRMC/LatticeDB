@@ -1522,6 +1522,19 @@ pub const Executor = struct {
                 const high = resolveExprValue(b.high, schema, values);
                 return compareValues(val, .gte, low) and compareValues(val, .lte, high);
             },
+            .like_expr => |l| {
+                const val = resolveExprValue(l.value, schema, values);
+                const pat = resolveExprValue(l.pattern, schema, values);
+                const text = switch (val) {
+                    .bytes => |s| s,
+                    else => return false,
+                };
+                const pattern = switch (pat) {
+                    .bytes => |s| s,
+                    else => return false,
+                };
+                return matchLike(text, pattern);
+            },
             .literal => |lit| {
                 // Bare literal in WHERE - treat as truthy
                 return switch (lit) {
@@ -1549,6 +1562,44 @@ pub const Executor = struct {
                 return true;
             },
         }
+    }
+
+    /// SQL LIKE pattern matching: % = any chars, _ = single char
+    fn matchLike(text: []const u8, pattern: []const u8) bool {
+        var ti: usize = 0;
+        var pi: usize = 0;
+        var star_pi: ?usize = null;
+        var star_ti: usize = 0;
+
+        while (ti < text.len) {
+            if (pi < pattern.len and pattern[pi] == '_') {
+                // _ matches any single character
+                ti += 1;
+                pi += 1;
+            } else if (pi < pattern.len and pattern[pi] == '%') {
+                // % matches zero or more characters - try matching zero first
+                star_pi = pi;
+                star_ti = ti;
+                pi += 1;
+            } else if (pi < pattern.len and pattern[pi] == text[ti]) {
+                ti += 1;
+                pi += 1;
+            } else if (star_pi) |sp| {
+                // Backtrack: try matching one more character with %
+                pi = sp + 1;
+                star_ti += 1;
+                ti = star_ti;
+            } else {
+                return false;
+            }
+        }
+
+        // Consume trailing % in pattern
+        while (pi < pattern.len and pattern[pi] == '%') {
+            pi += 1;
+        }
+
+        return pi == pattern.len;
     }
 
     fn resolveExprValue(expr: *const ast.Expression, schema: *const Schema, values: []const Value) Value {
@@ -3125,4 +3176,38 @@ test "executor BETWEEN" {
     const sel = try exec.execute("SELECT * FROM t WHERE id BETWEEN 3 AND 12");
     defer exec.freeResult(sel);
     try std.testing.expectEqual(@as(usize, 2), sel.rows.rows.len);
+}
+
+test "executor LIKE" {
+    const test_file = "test_exec_like.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+    const r1 = try exec.execute("INSERT INTO t VALUES (1, 'Alice')");
+    exec.freeResult(r1);
+    const r2 = try exec.execute("INSERT INTO t VALUES (2, 'Bob')");
+    exec.freeResult(r2);
+    const r3 = try exec.execute("INSERT INTO t VALUES (3, 'Anna')");
+    exec.freeResult(r3);
+
+    // LIKE 'A%' should match Alice and Anna
+    const sel = try exec.execute("SELECT * FROM t WHERE name LIKE 'A%'");
+    defer exec.freeResult(sel);
+    try std.testing.expectEqual(@as(usize, 2), sel.rows.rows.len);
+
+    // LIKE '_o_' should match Bob
+    const sel2 = try exec.execute("SELECT * FROM t WHERE name LIKE '_ob'");
+    defer exec.freeResult(sel2);
+    try std.testing.expectEqual(@as(usize, 1), sel2.rows.rows.len);
+    try std.testing.expectEqualStrings("Bob", sel2.rows.rows[0].values[1]);
 }

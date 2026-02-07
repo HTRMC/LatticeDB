@@ -76,6 +76,11 @@ pub const Expression = union(enum) {
         low: *const Expression,
         high: *const Expression,
     },
+    /// LIKE pattern
+    like_expr: struct {
+        value: *const Expression,
+        pattern: *const Expression,
+    },
 };
 
 /// Aggregate function type
