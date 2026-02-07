@@ -31,6 +31,12 @@ pub const executor_layer = struct {
     pub const executor_mod = @import("executor/executor.zig");
 };
 
+// Planner layer
+pub const planner = struct {
+    pub const plan = @import("planner/plan.zig");
+    pub const planner_mod = @import("planner/planner.zig");
+};
+
 // Network layer
 pub const network = struct {
     pub const protocol = @import("network/protocol.zig");
