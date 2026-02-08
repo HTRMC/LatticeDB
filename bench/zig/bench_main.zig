@@ -9,6 +9,7 @@ const bench_txn = @import("bench_txn.zig");
 
 const DiskManager = engine.storage.disk_manager.DiskManager;
 const BufferPool = engine.storage.buffer_pool.BufferPool;
+const AllocManager = engine.storage.alloc_map.AllocManager;
 const Catalog = engine.storage.catalog.Catalog;
 const Wal = engine.storage.wal.Wal;
 const TransactionManager = engine.storage.mvcc.TransactionManager;
@@ -21,7 +22,7 @@ const Io = std.Io;
 const Dir = Io.Dir;
 
 const DB_FILE = "bench_graphene.dat";
-const WAL_FILE = "bench_graphene.wal";
+const WAL_DIR = "bench_graphene_wal";
 const BUFFER_POOL_SIZE = 4096;
 
 const Suite = enum { crud, analytical, index, txn, all };
@@ -97,7 +98,6 @@ fn runSuiteIsolated(
 ) void {
     // Clean up previous files
     Dir.deleteFile(.cwd(), io, DB_FILE) catch {};
-    Dir.deleteFile(.cwd(), io, WAL_FILE) catch {};
 
     // Initialize engine stack
     var dm = DiskManager.init(allocator, DB_FILE);
@@ -107,10 +107,13 @@ fn runSuiteIsolated(
     var bp = BufferPool.init(allocator, &dm, BUFFER_POOL_SIZE) catch @panic("failed to init buffer pool");
     defer bp.deinit();
 
-    var catalog = Catalog.init(allocator, &bp) catch @panic("failed to init catalog");
+    var am = AllocManager.init(&bp, &dm);
+    am.initializeFile() catch @panic("failed to init alloc manager");
+
+    var catalog = Catalog.init(allocator, &bp, &am) catch @panic("failed to init catalog");
     defer catalog.deinit();
 
-    var wal = Wal.init(allocator, WAL_FILE);
+    var wal = Wal.init(allocator, WAL_DIR);
     wal.open() catch @panic("failed to open WAL");
     defer wal.deinit();
 

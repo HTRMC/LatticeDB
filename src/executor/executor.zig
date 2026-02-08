@@ -149,7 +149,7 @@ pub const Executor = struct {
             const val = values[idx.column_ordinal];
             if (val != .integer) continue;
 
-            var btree = btree_mod.BTree.open(self.catalog.buffer_pool, idx.index_id);
+            var btree = btree_mod.BTree.open(self.catalog.buffer_pool, idx.index_id, self.catalog.alloc_manager);
             btree.insert(val.integer, tid) catch {};
         }
     }
@@ -165,7 +165,7 @@ pub const Executor = struct {
             const val = values[idx.column_ordinal];
             if (val != .integer) continue;
 
-            var btree = btree_mod.BTree.open(self.catalog.buffer_pool, idx.index_id);
+            var btree = btree_mod.BTree.open(self.catalog.buffer_pool, idx.index_id, self.catalog.alloc_manager);
             _ = btree.delete(val.integer) catch {};
         }
     }
@@ -402,7 +402,7 @@ pub const Executor = struct {
 
         if (col_ord) |ordinal| {
             if (schema.columns[ordinal].col_type == .integer) {
-                var btree = btree_mod.BTree.open(self.catalog.buffer_pool, index_id);
+                var btree = btree_mod.BTree.open(self.catalog.buffer_pool, index_id, self.catalog.alloc_manager);
                 const txn = self.current_txn orelse self.beginImplicitTxn();
                 var iter = table.scanWithTxn(txn) catch {
                     self.abortImplicitTxn(txn);
@@ -529,7 +529,7 @@ pub const Executor = struct {
         if (base.* != .index_scan) return false;
 
         const is = base.index_scan;
-        var btree = btree_mod.BTree.open(table.buffer_pool, is.index_id);
+        var btree = btree_mod.BTree.open(table.buffer_pool, is.index_id, self.catalog.alloc_manager);
 
         switch (is.scan_type) {
             .point => |key| {
@@ -3984,7 +3984,7 @@ test "executor index maintained on insert" {
     // Verify via btree search
     const idx_entry = (try catalog.findIndex("idx_t_id")).?;
     defer catalog.freeIndexEntry(idx_entry);
-    var btree = btree_mod.BTree.open(&bp, idx_entry.index_id);
+    var btree = btree_mod.BTree.open(&bp, idx_entry.index_id, &am);
     const found10 = try btree.search(10);
     try std.testing.expect(found10 != null);
     const found20 = try btree.search(20);
@@ -4019,7 +4019,7 @@ test "executor index maintained on delete" {
     // Verify indexed
     const idx_entry = (try catalog.findIndex("idx_t_id")).?;
     defer catalog.freeIndexEntry(idx_entry);
-    var btree = btree_mod.BTree.open(&bp, idx_entry.index_id);
+    var btree = btree_mod.BTree.open(&bp, idx_entry.index_id, &am);
     try std.testing.expect((try btree.search(42)) != null);
 
     // Delete
@@ -4063,7 +4063,7 @@ test "executor index maintained on update" {
 
     const idx_entry = (try catalog.findIndex("idx_t_id")).?;
     defer catalog.freeIndexEntry(idx_entry);
-    var btree = btree_mod.BTree.open(&bp, idx_entry.index_id);
+    var btree = btree_mod.BTree.open(&bp, idx_entry.index_id, &am);
 
     // Old key gone, new key present
     try std.testing.expect((try btree.search(1)) == null);
@@ -4102,7 +4102,7 @@ test "executor backfill on CREATE INDEX" {
     // All existing rows should be in the index
     const idx_entry = (try catalog.findIndex("idx_t_id")).?;
     defer catalog.freeIndexEntry(idx_entry);
-    var btree = btree_mod.BTree.open(&bp, idx_entry.index_id);
+    var btree = btree_mod.BTree.open(&bp, idx_entry.index_id, &am);
 
     try std.testing.expect((try btree.search(5)) != null);
     try std.testing.expect((try btree.search(15)) != null);

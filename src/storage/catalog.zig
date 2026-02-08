@@ -461,7 +461,7 @@ pub const Catalog = struct {
         if (column_ordinal == null) return CatalogError.StorageError; // Column not found
 
         // Create the BTree
-        const btree = btree_mod.BTree.create(self.buffer_pool) catch {
+        const btree = btree_mod.BTree.create(self.buffer_pool, self.alloc_manager) catch {
             return CatalogError.StorageError;
         };
         const index_id = btree.root_page_id;

@@ -2,8 +2,11 @@ const std = @import("std");
 const page_mod = @import("../storage/page.zig");
 const buffer_pool_mod = @import("../storage/buffer_pool.zig");
 const btree_page = @import("btree_page.zig");
+const alloc_map_mod = @import("../storage/alloc_map.zig");
+const AllocManager = alloc_map_mod.AllocManager;
 
 const PageId = page_mod.PageId;
+const Page = page_mod.Page;
 const TupleId = page_mod.TupleId;
 const INVALID_PAGE_ID = page_mod.INVALID_PAGE_ID;
 const PAGE_SIZE = page_mod.PAGE_SIZE;
@@ -27,31 +30,49 @@ pub const BTreeError = error{
 pub const BTree = struct {
     buffer_pool: *BufferPool,
     root_page_id: PageId,
+    alloc_manager: ?*AllocManager,
 
     const Self = @This();
 
+    const AllocResult = struct { page_id: PageId, page: Page };
+
+    /// Allocate a new page, routing through AllocManager when available.
+    fn allocPage(self: *Self) BTreeError!AllocResult {
+        if (self.alloc_manager) |am| {
+            const page_id = am.allocateMixedPage() catch return BTreeError.BufferPoolError;
+            const pg = self.buffer_pool.fetchPage(page_id) catch return BTreeError.BufferPoolError;
+            return .{ .page_id = page_id, .page = pg };
+        } else {
+            const r = self.buffer_pool.newPage() catch return BTreeError.BufferPoolError;
+            return .{ .page_id = r.page_id, .page = r.page };
+        }
+    }
+
     /// Create a new B+Tree index. Allocates a root leaf page.
-    pub fn create(buffer_pool: *BufferPool) BTreeError!Self {
-        const result = buffer_pool.newPage() catch {
-            return BTreeError.BufferPoolError;
+    pub fn create(buffer_pool: *BufferPool, alloc_manager: ?*AllocManager) BTreeError!Self {
+        var self = Self{
+            .buffer_pool = buffer_pool,
+            .root_page_id = undefined,
+            .alloc_manager = alloc_manager,
         };
+
+        const result = try self.allocPage();
 
         // Initialize as an empty leaf node (root starts as a leaf)
         _ = LeafNode.init(result.page.data, result.page_id);
 
         buffer_pool.unpinPage(result.page_id, true) catch {};
 
-        return .{
-            .buffer_pool = buffer_pool,
-            .root_page_id = result.page_id,
-        };
+        self.root_page_id = result.page_id;
+        return self;
     }
 
     /// Open an existing B+Tree by its root page ID
-    pub fn open(buffer_pool: *BufferPool, root_page_id: PageId) Self {
+    pub fn open(buffer_pool: *BufferPool, root_page_id: PageId, alloc_manager: ?*AllocManager) Self {
         return .{
             .buffer_pool = buffer_pool,
             .root_page_id = root_page_id,
+            .alloc_manager = alloc_manager,
         };
     }
 
@@ -219,7 +240,7 @@ pub const BTree = struct {
         tid: TupleId,
     ) BTreeError!void {
         // Allocate a new page for the right sibling
-        const new_result = self.buffer_pool.newPage() catch {
+        const new_result = self.allocPage() catch {
             self.buffer_pool.unpinPage(leaf_page_id, false) catch {};
             return BTreeError.BufferPoolError;
         };
@@ -309,7 +330,7 @@ pub const BTree = struct {
         key: Key,
         right_child_id: PageId,
     ) BTreeError!void {
-        const result = self.buffer_pool.newPage() catch {
+        const result = self.allocPage() catch {
             return BTreeError.BufferPoolError;
         };
         const new_root_id = result.page_id;
@@ -336,7 +357,7 @@ pub const BTree = struct {
         right_child_id: PageId,
     ) BTreeError!void {
         // Allocate a new page for the right sibling
-        const new_result = self.buffer_pool.newPage() catch {
+        const new_result = self.allocPage() catch {
             self.buffer_pool.unpinPage(node_page_id, false) catch {};
             return BTreeError.BufferPoolError;
         };
@@ -409,7 +430,7 @@ test "btree create and search empty" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
 
-    var btree = try BTree.create(&bp);
+    var btree = try BTree.create(&bp, null);
 
     // Search in empty tree should return null
     const result = try btree.search(42);
@@ -425,7 +446,7 @@ test "btree insert and search" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
 
-    var btree = try BTree.create(&bp);
+    var btree = try BTree.create(&bp, null);
 
     // Insert some key-value pairs
     try btree.insert(10, .{ .page_id = 1, .slot_id = 0 });
@@ -460,7 +481,7 @@ test "btree duplicate key" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
 
-    var btree = try BTree.create(&bp);
+    var btree = try BTree.create(&bp, null);
 
     try btree.insert(10, .{ .page_id = 1, .slot_id = 0 });
     const result = btree.insert(10, .{ .page_id = 2, .slot_id = 0 });
@@ -476,7 +497,7 @@ test "btree delete" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
 
-    var btree = try BTree.create(&bp);
+    var btree = try BTree.create(&bp, null);
 
     try btree.insert(10, .{ .page_id = 1, .slot_id = 0 });
     try btree.insert(20, .{ .page_id = 1, .slot_id = 1 });
@@ -508,7 +529,7 @@ test "btree leaf split" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
 
-    var btree = try BTree.create(&bp);
+    var btree = try BTree.create(&bp, null);
 
     // Insert enough keys to force at least one leaf split
     // LEAF_MAX_ENTRIES is ~680, so we insert more than that
@@ -542,7 +563,7 @@ test "btree range scan" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
 
-    var btree = try BTree.create(&bp);
+    var btree = try BTree.create(&bp, null);
 
     // Insert keys 0, 10, 20, ..., 90
     var i: i32 = 0;
@@ -576,7 +597,7 @@ test "btree large insert with random order" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 200);
     defer bp.deinit();
 
-    var btree = try BTree.create(&bp);
+    var btree = try BTree.create(&bp, null);
 
     // Insert keys in a scattered pattern (not sequential) to test various split scenarios
     const count: i32 = 2000;
@@ -613,7 +634,7 @@ test "btree delete from empty tree" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
 
-    var btree = try BTree.create(&bp);
+    var btree = try BTree.create(&bp, null);
 
     // Delete from empty tree should return false (not crash)
     const deleted = try btree.delete(42);
@@ -629,7 +650,7 @@ test "btree min and max key values" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
 
-    var btree = try BTree.create(&bp);
+    var btree = try BTree.create(&bp, null);
 
     const min_key: i32 = std.math.minInt(i32);
     const max_key: i32 = std.math.maxInt(i32);
@@ -657,7 +678,7 @@ test "btree range scan no results" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
 
-    var btree = try BTree.create(&bp);
+    var btree = try BTree.create(&bp, null);
 
     // Insert keys 100, 200, 300
     try btree.insert(100, .{ .page_id = 1, .slot_id = 0 });
@@ -682,7 +703,7 @@ test "btree insert delete then reinsert same key" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
 
-    var btree = try BTree.create(&bp);
+    var btree = try BTree.create(&bp, null);
 
     try btree.insert(42, .{ .page_id = 1, .slot_id = 0 });
     try std.testing.expect((try btree.search(42)) != null);
@@ -707,7 +728,7 @@ test "btree range scan entire range" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
 
-    var btree = try BTree.create(&bp);
+    var btree = try BTree.create(&bp, null);
 
     // Insert 50 keys
     var i: i32 = 0;
@@ -733,7 +754,7 @@ test "btree rangeScan inverted bounds returns empty" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
 
-    var btree = try BTree.create(&bp);
+    var btree = try BTree.create(&bp, null);
 
     var i: i32 = 0;
     while (i < 20) : (i += 1) {
@@ -758,7 +779,7 @@ test "btree rangeScan single key (low == high)" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
 
-    var btree = try BTree.create(&bp);
+    var btree = try BTree.create(&bp, null);
 
     var i: i32 = 0;
     while (i < 20) : (i += 1) {
@@ -784,7 +805,7 @@ test "btree search and delete verify consistency" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
 
-    var btree = try BTree.create(&bp);
+    var btree = try BTree.create(&bp, null);
 
     // Insert keys 0..9
     var i: i32 = 0;
