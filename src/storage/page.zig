@@ -8,6 +8,20 @@ pub const PageId = u32;
 /// Invalid page ID sentinel
 pub const INVALID_PAGE_ID: PageId = std.math.maxInt(PageId);
 
+/// Full page identifier — combines file ID and page ID for multi-file support.
+pub const FullPageId = struct {
+    file_id: u16,
+    page_id: PageId,
+
+    pub fn fromPageId(page_id: PageId) FullPageId {
+        return .{ .file_id = 0, .page_id = page_id };
+    }
+
+    pub fn eql(a: FullPageId, b: FullPageId) bool {
+        return a.file_id == b.file_id and a.page_id == b.page_id;
+    }
+};
+
 /// Slot pointer - points to a tuple within a page
 pub const SlotId = u16;
 

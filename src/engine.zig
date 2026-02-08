@@ -14,6 +14,8 @@ pub const storage = struct {
     pub const data_dir = @import("storage/data_dir.zig");
     pub const file_header = @import("storage/file_header.zig");
     pub const alloc_map = @import("storage/alloc_map.zig");
+    pub const iam = @import("storage/iam.zig");
+    pub const filegroup = @import("storage/filegroup.zig");
 };
 
 pub const index = struct {
