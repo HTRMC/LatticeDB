@@ -2242,8 +2242,10 @@ pub const Executor = struct {
 
 const disk_manager_mod = @import("../storage/disk_manager.zig");
 const buffer_pool_mod = @import("../storage/buffer_pool.zig");
+const alloc_map_mod = @import("../storage/alloc_map.zig");
 const DiskManager = disk_manager_mod.DiskManager;
 const BufferPool = buffer_pool_mod.BufferPool;
+const AllocManager = alloc_map_mod.AllocManager;
 
 test "executor create table and insert" {
     const test_file = "test_exec_basic.db";
@@ -2253,7 +2255,9 @@ test "executor create table and insert" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -2277,7 +2281,9 @@ test "executor select all" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -2308,7 +2314,9 @@ test "executor select with where" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -2342,7 +2350,9 @@ test "executor delete" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -2376,7 +2386,9 @@ test "executor table not found" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -2393,7 +2405,9 @@ test "executor MVCC begin commit rollback" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -2440,7 +2454,9 @@ test "executor MVCC auto-commit" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -2473,7 +2489,9 @@ test "executor MVCC commit persists" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -2508,7 +2526,9 @@ test "executor UPDATE with WHERE" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -2551,7 +2571,9 @@ test "executor UPDATE all rows" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -2591,7 +2613,9 @@ test "executor UPDATE rollback" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -2630,7 +2654,9 @@ test "executor ORDER BY" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -2681,7 +2707,9 @@ test "executor LIMIT" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -2723,7 +2751,9 @@ test "executor COUNT" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -2764,7 +2794,9 @@ test "executor SUM AVG" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -2807,7 +2839,9 @@ test "executor MIN MAX" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -2853,7 +2887,9 @@ test "executor GROUP BY" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -2907,7 +2943,9 @@ test "executor GROUP BY with WHERE" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -2952,7 +2990,9 @@ test "executor INNER JOIN" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -3005,7 +3045,9 @@ test "executor LEFT JOIN" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -3053,7 +3095,9 @@ test "executor ROLLBACK without BEGIN returns error" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -3075,7 +3119,9 @@ test "executor COMMIT without BEGIN returns error" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -3097,7 +3143,9 @@ test "executor nested BEGIN returns error" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -3127,7 +3175,9 @@ test "executor SELECT on empty table returns no rows" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -3154,7 +3204,9 @@ test "executor DELETE on empty table returns zero" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -3180,7 +3232,9 @@ test "executor UPDATE on empty table returns zero" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -3206,7 +3260,9 @@ test "executor insert then delete then rollback restores row" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -3251,7 +3307,9 @@ test "executor CREATE TABLE duplicate name fails" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3271,7 +3329,9 @@ test "executor INSERT column count mismatch" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3292,7 +3352,9 @@ test "executor UPDATE WHERE matches zero rows" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -3326,7 +3388,9 @@ test "executor multiple inserts then delete all" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -3366,7 +3430,9 @@ test "executor INSERT into nonexistent table" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3383,7 +3449,9 @@ test "executor DELETE from nonexistent table" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3400,7 +3468,9 @@ test "executor parse error" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3417,7 +3487,9 @@ test "executor SELECT COUNT on empty table" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -3444,7 +3516,9 @@ test "executor DROP TABLE" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3474,7 +3548,9 @@ test "executor DROP TABLE nonexistent fails" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3491,7 +3567,9 @@ test "executor SELECT with column aliases" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3517,7 +3595,9 @@ test "executor SELECT DISTINCT" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3547,7 +3627,9 @@ test "executor BETWEEN" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3577,7 +3659,9 @@ test "executor LIKE" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3611,7 +3695,9 @@ test "executor IN list" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3639,7 +3725,9 @@ test "executor ALTER TABLE ADD COLUMN" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3674,7 +3762,9 @@ test "executor ALTER TABLE ADD COLUMN then insert" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3707,7 +3797,9 @@ test "executor ALTER TABLE nonexistent fails" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3724,7 +3816,9 @@ test "executor IN subquery" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3760,7 +3854,9 @@ test "executor EXISTS subquery" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3798,7 +3894,9 @@ test "executor IN subquery empty result" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3825,7 +3923,9 @@ test "executor CREATE INDEX and DROP INDEX" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3863,7 +3963,9 @@ test "executor index maintained on insert" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3899,7 +4001,9 @@ test "executor index maintained on delete" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -3934,7 +4038,9 @@ test "executor index maintained on update" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var tm = TransactionManager.init(std.testing.allocator);
@@ -3972,7 +4078,9 @@ test "executor backfill on CREATE INDEX" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4010,7 +4118,9 @@ test "executor EXPLAIN seq scan" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4036,7 +4146,9 @@ test "executor EXPLAIN index scan" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4071,7 +4183,9 @@ test "executor EXPLAIN with filter" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4094,7 +4208,9 @@ test "executor index scan point lookup" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4131,7 +4247,9 @@ test "executor index scan range" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4166,7 +4284,9 @@ test "executor index scan with residual filter" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4203,7 +4323,9 @@ test "executor index scan same results as seq scan" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4243,7 +4365,9 @@ test "executor index scan with ORDER BY and LIMIT" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4280,7 +4404,9 @@ test "executor index scan on empty table returns no rows" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4305,7 +4431,9 @@ test "executor index scan point lookup no match" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4339,7 +4467,9 @@ test "executor index scan with zero and boundary keys" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4388,7 +4518,9 @@ test "executor drop index falls back to seq scan" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4435,7 +4567,9 @@ test "executor uses correct index when multiple exist" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4476,7 +4610,9 @@ test "executor index scan BETWEEN range" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4510,7 +4646,9 @@ test "executor BETWEEN with inverted bounds returns empty" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4544,7 +4682,9 @@ test "executor reverse comparison 25 = id uses index" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4579,7 +4719,9 @@ test "executor index scan with DISTINCT" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4615,7 +4757,9 @@ test "executor insert duplicate key into non-unique index" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4647,7 +4791,9 @@ test "executor duplicate key index vs seq scan divergence" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4690,7 +4836,9 @@ test "executor index scan after deleting all rows" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4728,7 +4876,9 @@ test "executor index on non-integer column ignored by planner" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4762,7 +4912,9 @@ test "executor index scan large range" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4796,7 +4948,9 @@ test "executor update indexed column preserves consistency" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4838,7 +4992,9 @@ test "executor EXPLAIN BETWEEN shows range scan" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4873,7 +5029,9 @@ test "executor EXPLAIN after DROP INDEX shows seq scan" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4915,7 +5073,9 @@ test "executor LIMIT 0 returns no rows" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4939,7 +5099,9 @@ test "executor SUM AVG MIN MAX on empty result" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -4988,7 +5150,9 @@ test "executor SUM AVG MIN MAX with WHERE matching nothing" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -5022,7 +5186,9 @@ test "executor DROP system table fails" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -5040,7 +5206,9 @@ test "executor CREATE INDEX nonexistent table fails" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -5056,7 +5224,9 @@ test "executor CREATE INDEX nonexistent column fails" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -5075,7 +5245,9 @@ test "executor LIKE edge cases" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -5124,7 +5296,9 @@ test "executor SELECT with no matching WHERE returns empty" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -5150,7 +5324,9 @@ test "executor LEFT JOIN with unmatched rows" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -5183,7 +5359,9 @@ test "executor DELETE with WHERE matching nothing" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -5212,7 +5390,9 @@ test "executor UPDATE SET multiple columns" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -5240,7 +5420,9 @@ test "executor INSERT INTO nonexistent table" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);
@@ -5256,7 +5438,9 @@ test "executor SELECT FROM nonexistent table" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var exec = Executor.init(std.testing.allocator, &catalog);

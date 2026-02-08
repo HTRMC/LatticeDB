@@ -4,6 +4,7 @@ const buffer_pool_mod = @import("buffer_pool.zig");
 const tuple_mod = @import("tuple.zig");
 const table_mod = @import("table.zig");
 const btree_mod = @import("../index/btree.zig");
+const alloc_map_mod = @import("alloc_map.zig");
 
 const PageId = page_mod.PageId;
 const INVALID_PAGE_ID = page_mod.INVALID_PAGE_ID;
@@ -13,6 +14,7 @@ const Column = tuple_mod.Column;
 const ColumnType = tuple_mod.ColumnType;
 const Value = tuple_mod.Value;
 const Table = table_mod.Table;
+const AllocManager = alloc_map_mod.AllocManager;
 
 pub const CatalogError = error{
     TableAlreadyExists,
@@ -63,6 +65,7 @@ pub const IndexEntry = struct {
 pub const Catalog = struct {
     allocator: std.mem.Allocator,
     buffer_pool: *BufferPool,
+    alloc_manager: *AllocManager,
 
     /// The heap table storing table metadata
     tables_table: Table,
@@ -109,16 +112,16 @@ pub const Catalog = struct {
     const Self = @This();
 
     /// Initialize a new catalog - creates the three system tables
-    pub fn init(allocator: std.mem.Allocator, buffer_pool: *BufferPool) CatalogError!Self {
-        var tables_table = Table.create(allocator, buffer_pool, &tables_schema) catch {
+    pub fn init(allocator: std.mem.Allocator, buffer_pool: *BufferPool, alloc_manager: *AllocManager) CatalogError!Self {
+        var tables_table = Table.create(allocator, buffer_pool, &tables_schema, alloc_manager) catch {
             return CatalogError.StorageError;
         };
 
-        var columns_table = Table.create(allocator, buffer_pool, &columns_schema) catch {
+        var columns_table = Table.create(allocator, buffer_pool, &columns_schema, alloc_manager) catch {
             return CatalogError.StorageError;
         };
 
-        const indexes_table = Table.create(allocator, buffer_pool, &indexes_schema) catch {
+        const indexes_table = Table.create(allocator, buffer_pool, &indexes_schema, alloc_manager) catch {
             return CatalogError.StorageError;
         };
 
@@ -154,6 +157,7 @@ pub const Catalog = struct {
         return .{
             .allocator = allocator,
             .buffer_pool = buffer_pool,
+            .alloc_manager = alloc_manager,
             .tables_table = tables_table,
             .columns_table = columns_table,
             .indexes_table = indexes_table,
@@ -179,6 +183,7 @@ pub const Catalog = struct {
     pub fn open(
         allocator: std.mem.Allocator,
         buffer_pool: *BufferPool,
+        alloc_manager: *AllocManager,
         tables_table_id: PageId,
         columns_table_id: PageId,
         indexes_table_id: PageId,
@@ -186,9 +191,10 @@ pub const Catalog = struct {
         return .{
             .allocator = allocator,
             .buffer_pool = buffer_pool,
-            .tables_table = Table.open(allocator, buffer_pool, &tables_schema, tables_table_id),
-            .columns_table = Table.open(allocator, buffer_pool, &columns_schema, columns_table_id),
-            .indexes_table = Table.open(allocator, buffer_pool, &indexes_schema, indexes_table_id),
+            .alloc_manager = alloc_manager,
+            .tables_table = Table.open(allocator, buffer_pool, &tables_schema, tables_table_id, alloc_manager),
+            .columns_table = Table.open(allocator, buffer_pool, &columns_schema, columns_table_id, alloc_manager),
+            .indexes_table = Table.open(allocator, buffer_pool, &indexes_schema, indexes_table_id, alloc_manager),
             .owned_schemas = .empty,
         };
     }
@@ -244,7 +250,7 @@ pub const Catalog = struct {
         };
 
         // Create the actual heap table
-        const table = Table.create(self.allocator, self.buffer_pool, schema) catch {
+        const table = Table.create(self.allocator, self.buffer_pool, schema, self.alloc_manager) catch {
             // Schema is tracked in owned_schemas, will be freed by deinit
             return CatalogError.StorageError;
         };
@@ -363,6 +369,12 @@ pub const Catalog = struct {
         }
 
         const tid = table_id orelse return CatalogError.TableNotFound;
+
+        // Free the table's extents via AllocManager
+        {
+            var tbl = Table.open(self.allocator, self.buffer_pool, &tables_schema, tid, self.alloc_manager);
+            tbl.freeAllExtents() catch {};
+        }
 
         // Delete all matching rows from gp_columns
         var to_delete: std.ArrayList(page_mod.TupleId) = .empty;
@@ -676,7 +688,7 @@ pub const Catalog = struct {
         const table_id = try self.findTableId(name) orelse return null;
         const schema = try self.getSchema(table_id) orelse return null;
         return .{
-            .table = Table.open(self.allocator, self.buffer_pool, schema, table_id),
+            .table = Table.open(self.allocator, self.buffer_pool, schema, table_id, self.alloc_manager),
             .schema = schema,
         };
     }
@@ -728,7 +740,9 @@ test "catalog create and find table" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
 
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     // Create a user table
@@ -759,7 +773,9 @@ test "catalog get table entry" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
 
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const columns = [_]Column{
@@ -783,7 +799,9 @@ test "catalog duplicate table name" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
 
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const columns = [_]Column{
@@ -806,7 +824,9 @@ test "catalog reconstruct schema" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
 
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const columns = [_]Column{
@@ -844,7 +864,9 @@ test "catalog open table and use it" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
 
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const columns = [_]Column{
@@ -880,7 +902,9 @@ test "catalog list tables" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
 
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const col = [_]Column{
@@ -920,7 +944,9 @@ test "catalog drop table" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
 
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const col = [_]Column{
@@ -952,7 +978,9 @@ test "catalog create and find index" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const col = [_]Column{
@@ -988,7 +1016,9 @@ test "catalog list indexes for table" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const col = [_]Column{
@@ -1023,7 +1053,9 @@ test "catalog drop table cascades indexes" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const col = [_]Column{
@@ -1053,7 +1085,9 @@ test "catalog drop system table fails" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     try std.testing.expectError(CatalogError.SystemTableError, catalog.dropTable("gp_tables"));
@@ -1069,7 +1103,9 @@ test "catalog create index nonexistent table" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     try std.testing.expectError(CatalogError.TableNotFound, catalog.createIndex("nonexistent", "idx", "id", false));
@@ -1083,7 +1119,9 @@ test "catalog create index nonexistent column" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const col = [_]Column{
@@ -1103,7 +1141,9 @@ test "catalog getIndexesForTable empty" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const col = [_]Column{
@@ -1125,7 +1165,9 @@ test "catalog findIndex nonexistent returns null" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const result = try catalog.findIndex("nonexistent_index");
@@ -1140,7 +1182,9 @@ test "catalog findTableId nonexistent returns null" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const result = try catalog.findTableId("nonexistent_table");
@@ -1155,7 +1199,9 @@ test "catalog drop nonexistent table fails" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     try std.testing.expectError(CatalogError.TableNotFound, catalog.dropTable("nonexistent"));

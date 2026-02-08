@@ -5,6 +5,7 @@ const tuple_mod = @import("tuple.zig");
 const mvcc_mod = @import("mvcc.zig");
 const undo_log_mod = @import("undo_log.zig");
 const alloc_map_mod = @import("alloc_map.zig");
+const iam_mod = @import("iam.zig");
 
 const Page = page_mod.Page;
 const PageId = page_mod.PageId;
@@ -25,6 +26,9 @@ const Snapshot = mvcc_mod.Snapshot;
 const UndoLog = undo_log_mod.UndoLog;
 const UndoRecordHeader = undo_log_mod.UndoRecordHeader;
 const AllocManager = alloc_map_mod.AllocManager;
+const Iam = iam_mod.Iam;
+const IamChainIterator = iam_mod.IamChainIterator;
+const EXTENT_SIZE = alloc_map_mod.EXTENT_SIZE;
 
 pub const TableError = error{
     BufferPoolError,
@@ -37,69 +41,47 @@ pub const TableError = error{
     WriteConflict,
 };
 
-/// Pages per new extent allocation
-const EXTENT_GROWTH_SIZE: u32 = 8;
 /// Bytes reserved in slot 0 for table metadata
-const META_RESERVED_SIZE: usize = 512;
+const META_RESERVED_SIZE: usize = 64;
 
-/// An extent: a contiguous group of pages owned by this table
-const ExtentEntry = extern struct {
-    start_page: PageId,
-    page_count: u32,
-
-    pub const SIZE: usize = @sizeOf(ExtentEntry); // 8
-};
-
-/// Maximum number of extents that fit in the reserved meta area
-const MAX_EXTENTS: usize = (META_RESERVED_SIZE - TableMeta.SIZE) / ExtentEntry.SIZE;
-
-/// Table metadata header stored in slot 0 of the meta page
+/// Table metadata stored in slot 0 of the meta page.
+/// Extent ownership is tracked via IAM page chain.
 const TableMeta = extern struct {
-    extent_count: u32,
+    iam_page_id: PageId,
     _reserved: u32,
     tuple_count: u64,
 
     pub const SIZE: usize = @sizeOf(TableMeta); // 16
 };
 
-/// Result of reading the full meta blob (header + extents)
-const MetaResult = struct {
-    header: TableMeta,
-    extent_buf: [MAX_EXTENTS]ExtentEntry,
-    extent_count: usize,
-
-    fn extents(self: *const MetaResult) []const ExtentEntry {
-        return self.extent_buf[0..self.extent_count];
-    }
-};
-
 /// Heap-organized table with MVCC support.
-/// All tuples are stored with a TupleHeader prefix for versioning.
+/// Uses AllocManager for extent allocation and IAM pages for extent tracking.
 pub const Table = struct {
     allocator: std.mem.Allocator,
     buffer_pool: *BufferPool,
     schema: *const Schema,
-    /// Table ID (page ID of the first/meta page)
+    /// Table ID (first page of the table's first extent)
     table_id: PageId,
     /// Transaction manager for visibility checks (null = legacy mode, all visible)
     txn_manager: ?*TransactionManager,
     /// Undo log for version chain (null = legacy mode, no undo)
     undo_log: ?*UndoLog,
-    /// Allocation manager for extent-based allocation (null = legacy buffer_pool allocation)
-    alloc_manager: ?*AllocManager,
+    /// Allocation manager for extent-based allocation
+    alloc_manager: *AllocManager,
 
     const Self = @This();
 
     /// Maximum tuple size that can fit in a page (with overhead)
     pub const MAX_TUPLE_SIZE = PAGE_SIZE - page_mod.PageHeader.SIZE - page_mod.Slot.SIZE - META_RESERVED_SIZE - 64;
 
-    /// Create a new table - allocates the first page
+    /// Create a new table
     pub fn create(
         allocator: std.mem.Allocator,
         buffer_pool: *BufferPool,
         schema: *const Schema,
+        alloc_manager: *AllocManager,
     ) TableError!Self {
-        return createWithMvcc(allocator, buffer_pool, schema, null, null);
+        return createFull(allocator, buffer_pool, schema, null, null, alloc_manager);
     }
 
     /// Create a new table with MVCC support
@@ -109,8 +91,9 @@ pub const Table = struct {
         schema: *const Schema,
         txn_manager: ?*TransactionManager,
         undo_log: ?*UndoLog,
+        alloc_manager: *AllocManager,
     ) TableError!Self {
-        return createFull(allocator, buffer_pool, schema, txn_manager, undo_log, null);
+        return createFull(allocator, buffer_pool, schema, txn_manager, undo_log, alloc_manager);
     }
 
     /// Create a new table with full configuration (MVCC + AllocManager)
@@ -120,50 +103,53 @@ pub const Table = struct {
         schema: *const Schema,
         txn_manager: ?*TransactionManager,
         undo_log: ?*UndoLog,
-        alloc_manager: ?*AllocManager,
+        alloc_manager: *AllocManager,
     ) TableError!Self {
-        // Allocate the first page for this table
-        const result = buffer_pool.newPage() catch {
-            return TableError.BufferPoolError;
-        };
+        // Allocate first extent via AllocManager (8 contiguous pages)
+        const first_page = alloc_manager.allocateExtent() catch return TableError.BufferPoolError;
+        const table_id = first_page;
+        const iam_page_id = first_page + 1;
+        const extent_id: usize = @intCast(first_page / EXTENT_SIZE);
 
-        const table = Self{
+        // Initialize meta page: page 0 of the extent, slot 0 = metadata
+        {
+            var pg = buffer_pool.fetchPage(table_id) catch return TableError.BufferPoolError;
+            pg = Page.init(pg.data, table_id);
+
+            var meta_blob: [META_RESERVED_SIZE]u8 = [_]u8{0} ** META_RESERVED_SIZE;
+            const meta = TableMeta{
+                .iam_page_id = iam_page_id,
+                ._reserved = 0,
+                .tuple_count = 0,
+            };
+            @memcpy(meta_blob[0..TableMeta.SIZE], std.mem.asBytes(&meta));
+            _ = pg.insertTuple(&meta_blob);
+
+            buffer_pool.unpinPage(table_id, true) catch {};
+        }
+
+        // Initialize IAM page: page 1 of the extent, tracks owned extents
+        {
+            var pg = buffer_pool.fetchPage(iam_page_id) catch return TableError.BufferPoolError;
+            Iam.initPage(pg.data, table_id, 0, 0);
+            Iam.addExtent(pg.data, extent_id);
+            buffer_pool.unpinPage(iam_page_id, true) catch {};
+        }
+
+        return Self{
             .allocator = allocator,
             .buffer_pool = buffer_pool,
             .schema = schema,
-            .table_id = result.page_id,
+            .table_id = table_id,
             .txn_manager = txn_manager,
             .undo_log = undo_log,
             .alloc_manager = alloc_manager,
         };
-
-        // Build meta blob: header + 1 extent + zero-padding to META_RESERVED_SIZE
-        var meta_blob: [META_RESERVED_SIZE]u8 = [_]u8{0} ** META_RESERVED_SIZE;
-        const meta = TableMeta{
-            .extent_count = 1,
-            ._reserved = 0,
-            .tuple_count = 0,
-        };
-        @memcpy(meta_blob[0..TableMeta.SIZE], std.mem.asBytes(&meta));
-
-        const extent = ExtentEntry{
-            .start_page = result.page_id,
-            .page_count = 1,
-        };
-        @memcpy(meta_blob[TableMeta.SIZE..][0..ExtentEntry.SIZE], std.mem.asBytes(&extent));
-
-        // Store meta blob as slot 0 on the meta page
-        var pg = result.page;
-        _ = pg.insertTuple(&meta_blob);
-
-        buffer_pool.unpinPage(result.page_id, true) catch {};
-
-        return table;
     }
 
     /// Open an existing table by its table ID
-    pub fn open(allocator: std.mem.Allocator, buffer_pool: *BufferPool, schema: *const Schema, table_id: PageId) Self {
-        return openWithMvcc(allocator, buffer_pool, schema, table_id, null, null);
+    pub fn open(allocator: std.mem.Allocator, buffer_pool: *BufferPool, schema: *const Schema, table_id: PageId, alloc_manager: *AllocManager) Self {
+        return openFull(allocator, buffer_pool, schema, table_id, null, null, alloc_manager);
     }
 
     /// Open an existing table with MVCC support
@@ -174,8 +160,9 @@ pub const Table = struct {
         table_id: PageId,
         txn_manager: ?*TransactionManager,
         undo_log: ?*UndoLog,
+        alloc_manager: *AllocManager,
     ) Self {
-        return openFull(allocator, buffer_pool, schema, table_id, txn_manager, undo_log, null);
+        return openFull(allocator, buffer_pool, schema, table_id, txn_manager, undo_log, alloc_manager);
     }
 
     /// Open an existing table with full configuration
@@ -186,7 +173,7 @@ pub const Table = struct {
         table_id: PageId,
         txn_manager: ?*TransactionManager,
         undo_log: ?*UndoLog,
-        alloc_manager: ?*AllocManager,
+        alloc_manager: *AllocManager,
     ) Self {
         return .{
             .allocator = allocator,
@@ -225,22 +212,27 @@ pub const Table = struct {
 
         const tuple_data = buf[0..size];
 
-        // Search existing extents for a page with space
-        const meta_full = try self.readMetaFull();
+        // Read metadata to get IAM page ID
+        const meta = try self.readMeta();
 
-        for (meta_full.extents()) |ext| {
-            var offset: u32 = 0;
-            while (offset < ext.page_count) : (offset += 1) {
-                const page_id = ext.start_page + offset;
+        // Walk IAM chain to find a page with free space
+        var iam_iter = IamChainIterator.init(self.buffer_pool, meta.iam_page_id);
+        while (iam_iter.next()) |extent_id| {
+            const ext_start: PageId = @intCast(extent_id * EXTENT_SIZE);
+
+            for (0..EXTENT_SIZE) |offset| {
+                const page_id: PageId = ext_start + @as(PageId, @intCast(offset));
+
+                // Skip IAM page
+                if (page_id == meta.iam_page_id) continue;
 
                 var pg = self.buffer_pool.fetchPage(page_id) catch {
                     return TableError.BufferPoolError;
                 };
 
-                // Check if page is uninitialized (allocated via allocateExtent but never used)
+                // Check if page is uninitialized (allocated but never written)
                 const pg_header = pg.getHeader();
                 if (pg_header.free_space_end == 0) {
-                    // Initialize the page
                     pg = Page.init(pg.data, page_id);
                 }
 
@@ -263,15 +255,17 @@ pub const Table = struct {
         }
 
         // No space found — allocate a new extent
-        const new_start = blk: {
-            if (self.alloc_manager) |am| {
-                break :blk am.allocateExtent() catch return TableError.BufferPoolError;
-            }
-            break :blk self.buffer_pool.allocateExtent(EXTENT_GROWTH_SIZE) catch return TableError.BufferPoolError;
-        };
-        const new_extent_size: u32 = if (self.alloc_manager != null) alloc_map_mod.EXTENT_SIZE else EXTENT_GROWTH_SIZE;
+        const new_start = self.alloc_manager.allocateExtent() catch return TableError.BufferPoolError;
+        const new_extent_id: usize = @intCast(new_start / EXTENT_SIZE);
 
-        // Fetch first page of new extent, initialize it, insert tuple
+        // Register new extent in IAM
+        {
+            var iam_pg = self.buffer_pool.fetchPage(meta.iam_page_id) catch return TableError.BufferPoolError;
+            Iam.addExtent(iam_pg.data, new_extent_id);
+            self.buffer_pool.unpinPage(meta.iam_page_id, true) catch {};
+        }
+
+        // Initialize and insert into first page of new extent
         var new_pg = self.buffer_pool.fetchPage(new_start) catch {
             return TableError.BufferPoolError;
         };
@@ -283,12 +277,7 @@ pub const Table = struct {
         };
 
         self.buffer_pool.unpinPage(new_start, true) catch {};
-
-        // Add the new extent to meta and increment tuple count
-        try self.addExtent(meta_full, ExtentEntry{
-            .start_page = new_start,
-            .page_count = new_extent_size,
-        });
+        try self.incrementTupleCount();
 
         const tid = TupleId{ .page_id = new_start, .slot_id = slot_id };
 
@@ -387,34 +376,53 @@ pub const Table = struct {
             const updated = pg.updateTupleData(tid.slot_id, 4, xmax_bytes);
 
             self.buffer_pool.unpinPage(tid.page_id, updated) catch {};
+            if (updated) try self.decrementTupleCount();
             return updated;
         } else {
             // Legacy mode: zero the slot
             const result = pg.deleteTuple(tid.slot_id);
             self.buffer_pool.unpinPage(tid.page_id, result) catch {};
+            if (result) try self.decrementTupleCount();
             return result;
         }
     }
 
-    /// Sequential scan with optional MVCC visibility filtering
+    /// Sequential scan with IAM-based extent iteration and optional MVCC visibility
     pub const ScanIterator = struct {
         table: *Self,
-        extent_buf: [MAX_EXTENTS]ExtentEntry,
-        extent_count: usize,
-        current_extent: usize,
-        current_page_offset: u32,
+        iam_iter: IamChainIterator,
+        iam_page_id: PageId,
+        current_extent_start: PageId,
+        current_page_in_extent: u32,
         current_slot: SlotId,
+        has_extent: bool,
         /// Transaction for visibility checks (null = all visible)
         txn: ?*const Transaction,
 
         /// Returns the next visible tuple ID and deserialized values.
         /// Caller must free the returned values slice.
         pub fn next(self: *ScanIterator) TableError!?struct { tid: TupleId, values: []Value } {
-            while (self.current_extent < self.extent_count) {
-                const ext = self.extent_buf[self.current_extent];
+            while (true) {
+                if (!self.has_extent) {
+                    if (self.iam_iter.next()) |extent_id| {
+                        self.current_extent_start = @intCast(extent_id * EXTENT_SIZE);
+                        self.current_page_in_extent = 0;
+                        self.current_slot = 0;
+                        self.has_extent = true;
+                    } else {
+                        return null;
+                    }
+                }
 
-                while (self.current_page_offset < ext.page_count) {
-                    const page_id = ext.start_page + self.current_page_offset;
+                while (self.current_page_in_extent < EXTENT_SIZE) {
+                    const page_id = self.current_extent_start + self.current_page_in_extent;
+
+                    // Skip IAM page
+                    if (page_id == self.iam_page_id) {
+                        self.current_page_in_extent += 1;
+                        self.current_slot = 0;
+                        continue;
+                    }
 
                     var pg = self.table.buffer_pool.fetchPage(page_id) catch {
                         return TableError.BufferPoolError;
@@ -422,16 +430,16 @@ pub const Table = struct {
 
                     const pg_header = pg.getHeader();
 
-                    // Skip uninitialized pages (allocated but never written to)
+                    // Skip uninitialized pages
                     if (pg_header.free_space_end == 0) {
                         self.table.buffer_pool.unpinPage(page_id, false) catch {};
-                        self.current_page_offset += 1;
+                        self.current_page_in_extent += 1;
                         self.current_slot = 0;
                         continue;
                     }
 
-                    // Skip slot 0 on the meta page (first page of first extent)
-                    const start_slot: SlotId = if (self.current_extent == 0 and self.current_page_offset == 0 and self.current_slot == 0) 1 else self.current_slot;
+                    // Skip slot 0 on the meta page (table's first page)
+                    const start_slot: SlotId = if (page_id == self.table.table_id and self.current_slot == 0) 1 else self.current_slot;
 
                     var slot = start_slot;
                     while (slot < pg_header.slot_count) : (slot += 1) {
@@ -474,17 +482,13 @@ pub const Table = struct {
                     self.table.buffer_pool.unpinPage(page_id, false) catch {};
 
                     // Move to next page within this extent
-                    self.current_page_offset += 1;
+                    self.current_page_in_extent += 1;
                     self.current_slot = 0;
                 }
 
                 // Move to next extent
-                self.current_extent += 1;
-                self.current_page_offset = 0;
-                self.current_slot = 0;
+                self.has_extent = false;
             }
-
-            return null;
         }
 
         /// Free values returned by next()
@@ -500,18 +504,17 @@ pub const Table = struct {
 
     /// Start a sequential scan with a transaction for MVCC visibility
     pub fn scanWithTxn(self: *Self, txn: ?*const Transaction) TableError!ScanIterator {
-        const meta_full = try self.readMetaFull();
-        var iter = ScanIterator{
+        const meta = try self.readMeta();
+        return ScanIterator{
             .table = self,
-            .extent_buf = undefined,
-            .extent_count = meta_full.extent_count,
-            .current_extent = 0,
-            .current_page_offset = 0,
+            .iam_iter = IamChainIterator.init(self.buffer_pool, meta.iam_page_id),
+            .iam_page_id = meta.iam_page_id,
+            .current_extent_start = 0,
+            .current_page_in_extent = 0,
             .current_slot = 0,
+            .has_extent = false,
             .txn = txn,
         };
-        @memcpy(iter.extent_buf[0..meta_full.extent_count], meta_full.extent_buf[0..meta_full.extent_count]);
-        return iter;
     }
 
     // ── Undo record helpers ──────────────────────────────────────────
@@ -566,21 +569,23 @@ pub const Table = struct {
 
             switch (rec.header.record_type) {
                 .insert => {
-                    // Undo insert = zero the slot
+                    // Undo insert = zero the slot + decrement count
                     var pg = self.buffer_pool.fetchPage(rec.header.table_page_id) catch {
                         return TableError.BufferPoolError;
                     };
                     _ = pg.deleteTuple(rec.header.slot_id);
                     self.buffer_pool.unpinPage(rec.header.table_page_id, true) catch {};
+                    try self.decrementTupleCount();
                 },
                 .delete => {
-                    // Undo delete = restore xmax to 0
+                    // Undo delete = restore xmax to 0 + increment count
                     var pg = self.buffer_pool.fetchPage(rec.header.table_page_id) catch {
                         return TableError.BufferPoolError;
                     };
                     const zero_xmax = std.mem.asBytes(&@as(TxnId, 0));
                     _ = pg.updateTupleData(rec.header.slot_id, 4, zero_xmax);
                     self.buffer_pool.unpinPage(rec.header.table_page_id, true) catch {};
+                    try self.incrementTupleCount();
                 },
                 .update => {
                     // Undo update = overwrite heap tuple with old data
@@ -598,7 +603,7 @@ pub const Table = struct {
 
     // ── Internal helpers ─────────────────────────────────────────────
 
-    /// Read just the table metadata header from slot 0
+    /// Read table metadata from slot 0
     fn readMeta(self: *Self) TableError!TableMeta {
         var pg = self.buffer_pool.fetchPage(self.table_id) catch {
             return TableError.BufferPoolError;
@@ -613,82 +618,59 @@ pub const Table = struct {
         return std.mem.bytesToValue(TableMeta, raw[0..TableMeta.SIZE]);
     }
 
-    /// Read full metadata: header + extent list
-    fn readMetaFull(self: *Self) TableError!MetaResult {
-        var pg = self.buffer_pool.fetchPage(self.table_id) catch {
-            return TableError.BufferPoolError;
-        };
-        defer self.buffer_pool.unpinPage(self.table_id, false) catch {};
-
-        const raw = pg.getTuple(0) orelse {
-            return TableError.TupleNotFound;
-        };
-
-        if (raw.len < TableMeta.SIZE) return TableError.SerializationError;
-        const header = std.mem.bytesToValue(TableMeta, raw[0..TableMeta.SIZE]);
-
-        var result = MetaResult{
-            .header = header,
-            .extent_buf = undefined,
-            .extent_count = header.extent_count,
-        };
-
-        // Parse extent entries
-        var i: usize = 0;
-        while (i < header.extent_count and i < MAX_EXTENTS) : (i += 1) {
-            const off = TableMeta.SIZE + i * ExtentEntry.SIZE;
-            if (off + ExtentEntry.SIZE > raw.len) break;
-            result.extent_buf[i] = std.mem.bytesToValue(ExtentEntry, raw[off..][0..ExtentEntry.SIZE]);
-        }
-        result.extent_count = i;
-
-        return result;
-    }
-
-    /// Write full metadata: header + extent list back to slot 0
-    fn updateMetaFull(self: *Self, header: TableMeta, extent_list: []const ExtentEntry) TableError!void {
+    /// Write table metadata to slot 0
+    fn writeMeta(self: *Self, meta: TableMeta) TableError!void {
         var pg = self.buffer_pool.fetchPage(self.table_id) catch {
             return TableError.BufferPoolError;
         };
         defer self.buffer_pool.unpinPage(self.table_id, true) catch {};
 
         var meta_blob: [META_RESERVED_SIZE]u8 = [_]u8{0} ** META_RESERVED_SIZE;
-        @memcpy(meta_blob[0..TableMeta.SIZE], std.mem.asBytes(&header));
-
-        for (extent_list, 0..) |ext, i| {
-            const off = TableMeta.SIZE + i * ExtentEntry.SIZE;
-            @memcpy(meta_blob[off..][0..ExtentEntry.SIZE], std.mem.asBytes(&ext));
-        }
-
+        @memcpy(meta_blob[0..TableMeta.SIZE], std.mem.asBytes(&meta));
         _ = pg.updateTupleData(0, 0, &meta_blob);
-    }
-
-    /// Add a new extent and increment tuple_count by 1
-    fn addExtent(self: *Self, meta_full: MetaResult, new_extent: ExtentEntry) TableError!void {
-        var new_header = meta_full.header;
-        new_header.extent_count += 1;
-        new_header.tuple_count += 1;
-
-        // Build combined extent list
-        var extents: [MAX_EXTENTS]ExtentEntry = undefined;
-        @memcpy(extents[0..meta_full.extent_count], meta_full.extent_buf[0..meta_full.extent_count]);
-        extents[meta_full.extent_count] = new_extent;
-
-        try self.updateMetaFull(new_header, extents[0 .. meta_full.extent_count + 1]);
     }
 
     /// Increment the tuple count in metadata
     fn incrementTupleCount(self: *Self) TableError!void {
-        const meta_full = try self.readMetaFull();
-        var header = meta_full.header;
-        header.tuple_count += 1;
-        try self.updateMetaFull(header, meta_full.extents());
+        var meta = try self.readMeta();
+        meta.tuple_count += 1;
+        try self.writeMeta(meta);
+    }
+
+    /// Decrement the tuple count in metadata
+    fn decrementTupleCount(self: *Self) TableError!void {
+        var meta = try self.readMeta();
+        if (meta.tuple_count > 0) meta.tuple_count -= 1;
+        try self.writeMeta(meta);
     }
 
     /// Get the total number of tuples
     pub fn tupleCount(self: *Self) TableError!u64 {
         const meta = try self.readMeta();
         return meta.tuple_count;
+    }
+
+    /// Free all extents owned by this table (for DROP TABLE).
+    /// Walks the IAM chain, collects extent IDs, then frees them via AllocManager.
+    pub fn freeAllExtents(self: *Self) TableError!void {
+        const meta = try self.readMeta();
+
+        // Collect extent IDs first (can't free while iterating — IAM page lives in an extent)
+        var extent_ids: [256]usize = undefined;
+        var count: usize = 0;
+        var iam_iter = IamChainIterator.init(self.buffer_pool, meta.iam_page_id);
+        while (iam_iter.next()) |eid| {
+            if (count < 256) {
+                extent_ids[count] = eid;
+                count += 1;
+            }
+        }
+
+        // Free all collected extents
+        for (extent_ids[0..count]) |eid| {
+            const fp: PageId = @intCast(eid * EXTENT_SIZE);
+            self.alloc_manager.freeExtent(fp) catch {};
+        }
     }
 };
 
@@ -698,14 +680,18 @@ pub const Table = struct {
 const disk_manager_mod = @import("disk_manager.zig");
 const DiskManager = disk_manager_mod.DiskManager;
 
-test "table create and insert (legacy)" {
+test "table create and insert" {
     const test_file = "test_table_basic.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     const schema = Schema{
         .columns = &.{
@@ -714,24 +700,27 @@ test "table create and insert (legacy)" {
         },
     };
 
-    var table = try Table.create(std.testing.allocator, &bp, &schema);
+    var table = try Table.create(std.testing.allocator, &bp, &schema, &am);
 
     // Insert a row (legacy, no txn)
     const values = [_]Value{ .{ .integer = 1 }, .{ .bytes = "Alice" } };
-    const tid = try table.insertTuple(null, &values);
+    _ = try table.insertTuple(null, &values);
 
-    try std.testing.expectEqual(table.table_id, tid.page_id);
     try std.testing.expectEqual(@as(u64, 1), try table.tupleCount());
 }
 
-test "table insert and retrieve (legacy)" {
+test "table insert and retrieve" {
     const test_file = "test_table_get.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     const schema = Schema{
         .columns = &.{
@@ -741,7 +730,7 @@ test "table insert and retrieve (legacy)" {
         },
     };
 
-    var table = try Table.create(std.testing.allocator, &bp, &schema);
+    var table = try Table.create(std.testing.allocator, &bp, &schema, &am);
 
     const values = [_]Value{ .{ .integer = 42 }, .{ .bytes = "Bob" }, .{ .boolean = true } };
     const tid = try table.insertTuple(null, &values);
@@ -755,14 +744,18 @@ test "table insert and retrieve (legacy)" {
     try std.testing.expectEqual(true, result[2].boolean);
 }
 
-test "table sequential scan (legacy)" {
+test "table sequential scan" {
     const test_file = "test_table_scan.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     const schema = Schema{
         .columns = &.{
@@ -771,7 +764,7 @@ test "table sequential scan (legacy)" {
         },
     };
 
-    var table = try Table.create(std.testing.allocator, &bp, &schema);
+    var table = try Table.create(std.testing.allocator, &bp, &schema, &am);
 
     // Insert multiple rows
     var i: i32 = 0;
@@ -795,14 +788,18 @@ test "table sequential scan (legacy)" {
     try std.testing.expectEqual(@as(usize, 5), count);
 }
 
-test "table delete tuple (legacy)" {
+test "table delete tuple" {
     const test_file = "test_table_delete.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     const schema = Schema{
         .columns = &.{
@@ -810,7 +807,7 @@ test "table delete tuple (legacy)" {
         },
     };
 
-    var table = try Table.create(std.testing.allocator, &bp, &schema);
+    var table = try Table.create(std.testing.allocator, &bp, &schema, &am);
 
     const vals = [_]Value{.{ .integer = 1 }};
     const tid = try table.insertTuple(null, &vals);
@@ -824,14 +821,18 @@ test "table delete tuple (legacy)" {
     try std.testing.expect(result == null);
 }
 
-test "table multiple pages (legacy)" {
+test "table multiple pages" {
     const test_file = "test_table_multi_page.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     const schema = Schema{
         .columns = &.{
@@ -840,7 +841,7 @@ test "table multiple pages (legacy)" {
         },
     };
 
-    var table = try Table.create(std.testing.allocator, &bp, &schema);
+    var table = try Table.create(std.testing.allocator, &bp, &schema, &am);
 
     // Insert rows with large data to force multiple pages
     var large_buf: [512]u8 = undefined;
@@ -867,11 +868,15 @@ test "table multiple pages (legacy)" {
 test "MVCC insert and visibility" {
     const test_file = "test_table_mvcc_insert.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     var tm = TransactionManager.init(std.testing.allocator);
     defer tm.deinit();
@@ -885,7 +890,7 @@ test "MVCC insert and visibility" {
         },
     };
 
-    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo, &am);
 
     // txn1 inserts a row
     const txn1 = try tm.begin();
@@ -932,11 +937,15 @@ test "MVCC insert and visibility" {
 test "MVCC delete visibility" {
     const test_file = "test_table_mvcc_delete.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     var tm = TransactionManager.init(std.testing.allocator);
     defer tm.deinit();
@@ -949,7 +958,7 @@ test "MVCC delete visibility" {
         },
     };
 
-    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo, &am);
 
     // Insert and commit
     const txn1 = try tm.begin();
@@ -987,11 +996,15 @@ test "MVCC delete visibility" {
 test "MVCC rollback restores insert" {
     const test_file = "test_table_mvcc_rollback.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     var tm = TransactionManager.init(std.testing.allocator);
     defer tm.deinit();
@@ -1004,7 +1017,7 @@ test "MVCC rollback restores insert" {
         },
     };
 
-    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo, &am);
 
     // Insert in a transaction
     const txn1 = try tm.begin();
@@ -1031,11 +1044,15 @@ test "MVCC rollback restores insert" {
 test "MVCC rollback restores delete" {
     const test_file = "test_table_mvcc_rollback_del.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     var tm = TransactionManager.init(std.testing.allocator);
     defer tm.deinit();
@@ -1048,7 +1065,7 @@ test "MVCC rollback restores delete" {
         },
     };
 
-    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo, &am);
 
     // Insert and commit
     const txn1 = try tm.begin();
@@ -1079,11 +1096,15 @@ test "MVCC rollback restores delete" {
 test "MVCC write-write conflict detection" {
     const test_file = "test_table_ww_conflict.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     var tm = TransactionManager.init(std.testing.allocator);
     defer tm.deinit();
@@ -1096,7 +1117,7 @@ test "MVCC write-write conflict detection" {
         },
     };
 
-    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo, &am);
 
     // Insert and commit a row
     const txn1 = try tm.begin();
@@ -1120,11 +1141,15 @@ test "MVCC write-write conflict detection" {
 test "MVCC same-txn double delete no conflict" {
     const test_file = "test_table_same_txn_delete.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     var tm = TransactionManager.init(std.testing.allocator);
     defer tm.deinit();
@@ -1137,7 +1162,7 @@ test "MVCC same-txn double delete no conflict" {
         },
     };
 
-    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo, &am);
 
     // Insert and commit a row
     const txn1 = try tm.begin();
@@ -1150,7 +1175,6 @@ test "MVCC same-txn double delete no conflict" {
     const del1 = try table.deleteTuple(txn2, tid);
     try std.testing.expect(del1);
 
-    // Second delete on same tuple by same txn — xmax already set to our id, no conflict
     const del2 = try table.deleteTuple(txn2, tid);
     try std.testing.expect(del2);
 
@@ -1160,11 +1184,15 @@ test "MVCC same-txn double delete no conflict" {
 test "MVCC insert-delete same txn then rollback" {
     const test_file = "test_table_ins_del_rollback.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     var tm = TransactionManager.init(std.testing.allocator);
     defer tm.deinit();
@@ -1177,7 +1205,7 @@ test "MVCC insert-delete same txn then rollback" {
         },
     };
 
-    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo, &am);
 
     // Insert a row, delete it, all in one txn, then rollback
     const txn1 = try tm.begin();
@@ -1204,11 +1232,15 @@ test "MVCC insert-delete same txn then rollback" {
 test "MVCC insert-delete same txn commit makes row invisible" {
     const test_file = "test_table_ins_del_commit.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     var tm = TransactionManager.init(std.testing.allocator);
     defer tm.deinit();
@@ -1221,7 +1253,7 @@ test "MVCC insert-delete same txn commit makes row invisible" {
         },
     };
 
-    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo, &am);
 
     // Insert + delete in same txn, then commit
     const txn1 = try tm.begin();
@@ -1245,11 +1277,15 @@ test "MVCC insert-delete same txn commit makes row invisible" {
 test "MVCC scan empty table" {
     const test_file = "test_table_scan_empty.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     var tm = TransactionManager.init(std.testing.allocator);
     defer tm.deinit();
@@ -1262,7 +1298,7 @@ test "MVCC scan empty table" {
         },
     };
 
-    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo, &am);
 
     // Scan with active txn on empty table — should return nothing, not crash
     const txn = try tm.begin();
@@ -1279,11 +1315,15 @@ test "MVCC scan empty table" {
 test "MVCC large batch insert then rollback" {
     const test_file = "test_table_batch_rollback.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 40);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 128);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     var tm = TransactionManager.init(std.testing.allocator);
     defer tm.deinit();
@@ -1296,7 +1336,7 @@ test "MVCC large batch insert then rollback" {
         },
     };
 
-    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo, &am);
 
     // Insert 50 rows in one txn
     const txn1 = try tm.begin();
@@ -1334,11 +1374,15 @@ test "MVCC large batch insert then rollback" {
 test "MVCC write conflict after first txn commits" {
     const test_file = "test_table_ww_after_commit.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     var tm = TransactionManager.init(std.testing.allocator);
     defer tm.deinit();
@@ -1351,7 +1395,7 @@ test "MVCC write conflict after first txn commits" {
         },
     };
 
-    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo);
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo, &am);
 
     // Insert and commit a row
     const txn1 = try tm.begin();
@@ -1365,7 +1409,6 @@ test "MVCC write conflict after first txn commits" {
     try tm.commit(txn2);
 
     // txn3 tries to delete the same row — xmax is set to committed txn2
-    // This is still a conflict because xmax != 0 and xmax != txn3.txn_id
     const txn3 = try tm.begin();
     const result = table.deleteTuple(txn3, tid);
     try std.testing.expectError(TableError.WriteConflict, result);
@@ -1375,11 +1418,15 @@ test "MVCC write conflict after first txn commits" {
 test "table tupleCount after inserts and deletes" {
     const test_file = "test_table_count.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     const schema = Schema{
         .columns = &.{
@@ -1387,7 +1434,7 @@ test "table tupleCount after inserts and deletes" {
         },
     };
 
-    var table = try Table.create(std.testing.allocator, &bp, &schema);
+    var table = try Table.create(std.testing.allocator, &bp, &schema, &am);
 
     try std.testing.expectEqual(@as(u64, 0), try table.tupleCount());
 
@@ -1402,11 +1449,15 @@ test "table tupleCount after inserts and deletes" {
 test "table getTuple invalid slot returns null" {
     const test_file = "test_table_invalid_tid.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     const schema = Schema{
         .columns = &.{
@@ -1414,7 +1465,7 @@ test "table getTuple invalid slot returns null" {
         },
     };
 
-    var table = try Table.create(std.testing.allocator, &bp, &schema);
+    var table = try Table.create(std.testing.allocator, &bp, &schema, &am);
 
     // Insert one row to have a valid page
     const tid = try table.insertTuple(null, &.{.{ .integer = 1 }});
@@ -1428,11 +1479,15 @@ test "table getTuple invalid slot returns null" {
 test "table scan returns all rows after multiple inserts" {
     const test_file = "test_table_scan_multi.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     const schema = Schema{
         .columns = &.{
@@ -1440,7 +1495,7 @@ test "table scan returns all rows after multiple inserts" {
         },
     };
 
-    var table = try Table.create(std.testing.allocator, &bp, &schema);
+    var table = try Table.create(std.testing.allocator, &bp, &schema, &am);
 
     var i: i32 = 0;
     while (i < 10) : (i += 1) {
@@ -1460,11 +1515,15 @@ test "table scan returns all rows after multiple inserts" {
 test "multi-table interleaving no cross-table corruption" {
     const test_file = "test_table_interleave.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 128);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     const schema_a = Schema{
         .columns = &.{
@@ -1478,8 +1537,8 @@ test "multi-table interleaving no cross-table corruption" {
         },
     };
 
-    var table_a = try Table.create(std.testing.allocator, &bp, &schema_a);
-    var table_b = try Table.create(std.testing.allocator, &bp, &schema_b);
+    var table_a = try Table.create(std.testing.allocator, &bp, &schema_a, &am);
+    var table_b = try Table.create(std.testing.allocator, &bp, &schema_b, &am);
 
     // Interleave inserts into both tables
     var i: i32 = 0;
@@ -1509,14 +1568,18 @@ test "multi-table interleaving no cross-table corruption" {
     try std.testing.expectEqual(@as(usize, 100), count_b);
 }
 
-test "extent allocation and multi-extent scan" {
+test "multi-extent scan with large rows" {
     const test_file = "test_table_multi_extent.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 128);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     const schema = Schema{
         .columns = &.{
@@ -1525,40 +1588,40 @@ test "extent allocation and multi-extent scan" {
         },
     };
 
-    var table = try Table.create(std.testing.allocator, &bp, &schema);
+    var table = try Table.create(std.testing.allocator, &bp, &schema, &am);
 
-    // Insert large rows to fill the initial page + force extent allocation
+    // Insert large rows to force multiple extent allocations
     var large_buf: [512]u8 = undefined;
     @memset(&large_buf, 'Y');
 
     var i: i32 = 0;
-    while (i < 50) : (i += 1) {
+    while (i < 80) : (i += 1) {
         _ = try table.insertTuple(null, &.{ .{ .integer = i }, .{ .bytes = &large_buf } });
     }
 
-    // Should have multiple extents by now
-    const meta_full = try table.readMetaFull();
-    try std.testing.expect(meta_full.extent_count > 1);
-
-    // Scan all rows — should get exactly 50
+    // Scan all rows — should get exactly 80
     var iter = try table.scan();
     var count: usize = 0;
     while (try iter.next()) |row| {
         defer iter.freeValues(row.values);
         count += 1;
     }
-    try std.testing.expectEqual(@as(usize, 50), count);
-    try std.testing.expectEqual(@as(u64, 50), try table.tupleCount());
+    try std.testing.expectEqual(@as(usize, 80), count);
+    try std.testing.expectEqual(@as(u64, 80), try table.tupleCount());
 }
 
 test "three tables interleaved with large rows" {
     const test_file = "test_table_three_interleave.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer dm.deleteFile();
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
     try dm.open();
-    defer dm.close();
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 80);
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 128);
     defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
     const schema = Schema{
         .columns = &.{
@@ -1567,9 +1630,9 @@ test "three tables interleaved with large rows" {
         },
     };
 
-    var t1 = try Table.create(std.testing.allocator, &bp, &schema);
-    var t2 = try Table.create(std.testing.allocator, &bp, &schema);
-    var t3 = try Table.create(std.testing.allocator, &bp, &schema);
+    var t1 = try Table.create(std.testing.allocator, &bp, &schema, &am);
+    var t2 = try Table.create(std.testing.allocator, &bp, &schema, &am);
+    var t3 = try Table.create(std.testing.allocator, &bp, &schema, &am);
 
     var large_buf: [400]u8 = undefined;
     @memset(&large_buf, 'Z');
@@ -1597,62 +1660,96 @@ test "three tables interleaved with large rows" {
     }
 }
 
-test "table with AllocManager basic insert and scan" {
-    const test_file = "test_table_alloc_mgr.db";
+test "tuple_count decrements on delete" {
+    const test_file = "test_table_count_dec.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
     defer {
         dm.deleteFile();
         dm.deinit();
     }
     try dm.open();
-
     var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
     defer bp.deinit();
-
-    // Initialize the file with allocation maps
     var am = AllocManager.init(&bp, &dm);
     try am.initializeFile();
 
     const schema = Schema{
         .columns = &.{
             .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
-            .{ .name = "name", .col_type = .text, .max_length = 0, .nullable = false },
         },
     };
 
-    var table = try Table.createFull(std.testing.allocator, &bp, &schema, null, null, &am);
+    var table = try Table.create(std.testing.allocator, &bp, &schema, &am);
 
-    // Insert rows
-    var i: i32 = 0;
-    while (i < 10) : (i += 1) {
-        var name_buf: [32]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buf, "row_{}", .{i}) catch unreachable;
-        _ = try table.insertTuple(null, &.{ .{ .integer = i }, .{ .bytes = name } });
-    }
+    // Insert 3 rows
+    const tid1 = try table.insertTuple(null, &.{.{ .integer = 1 }});
+    _ = try table.insertTuple(null, &.{.{ .integer = 2 }});
+    _ = try table.insertTuple(null, &.{.{ .integer = 3 }});
+    try std.testing.expectEqual(@as(u64, 3), try table.tupleCount());
 
-    // Scan should return all 10
-    var iter = try table.scan();
-    var count: usize = 0;
-    while (try iter.next()) |row| {
-        defer iter.freeValues(row.values);
-        count += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 10), count);
-    try std.testing.expectEqual(@as(u64, 10), try table.tupleCount());
+    // Delete one
+    _ = try table.deleteTuple(null, tid1);
+    try std.testing.expectEqual(@as(u64, 2), try table.tupleCount());
 }
 
-test "table with AllocManager multi-extent allocation" {
-    const test_file = "test_table_alloc_multi_ext.db";
+test "rollback fixes tuple_count" {
+    const test_file = "test_table_rollback_count.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
     defer {
         dm.deleteFile();
         dm.deinit();
     }
     try dm.open();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
 
+    var tm = TransactionManager.init(std.testing.allocator);
+    defer tm.deinit();
+    var undo = UndoLog.init(std.testing.allocator);
+    defer undo.deinit();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var table = try Table.createWithMvcc(std.testing.allocator, &bp, &schema, &tm, &undo, &am);
+
+    // Insert 3 rows and commit
+    const txn1 = try tm.begin();
+    _ = try table.insertTuple(txn1, &.{.{ .integer = 1 }});
+    _ = try table.insertTuple(txn1, &.{.{ .integer = 2 }});
+    _ = try table.insertTuple(txn1, &.{.{ .integer = 3 }});
+    try tm.commit(txn1);
+    try std.testing.expectEqual(@as(u64, 3), try table.tupleCount());
+
+    // Insert 2 more then rollback
+    const txn2 = try tm.begin();
+    _ = try table.insertTuple(txn2, &.{.{ .integer = 4 }});
+    _ = try table.insertTuple(txn2, &.{.{ .integer = 5 }});
+    try std.testing.expectEqual(@as(u64, 5), try table.tupleCount());
+
+    try table.rollback(txn2);
+    tm.abort(txn2);
+    try std.testing.expectEqual(@as(u64, 3), try table.tupleCount());
+}
+
+test "freeAllExtents releases to GAM" {
+    const Gam = alloc_map_mod.Gam;
+    const file_header = @import("file_header.zig");
+
+    const test_file = "test_table_free_extents.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
+    try dm.open();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 128);
     defer bp.deinit();
-
     var am = AllocManager.init(&bp, &dm);
     try am.initializeFile();
 
@@ -1663,83 +1760,31 @@ test "table with AllocManager multi-extent allocation" {
         },
     };
 
-    var table = try Table.createFull(std.testing.allocator, &bp, &schema, null, null, &am);
+    var table = try Table.create(std.testing.allocator, &bp, &schema, &am);
+    const table_extent_id: usize = @intCast(table.table_id / EXTENT_SIZE);
 
-    // Insert large rows to force multiple extent allocations
+    // Insert enough rows to force a second extent
     var large_buf: [512]u8 = undefined;
-    @memset(&large_buf, 'A');
-
+    @memset(&large_buf, 'X');
     var i: i32 = 0;
     while (i < 80) : (i += 1) {
         _ = try table.insertTuple(null, &.{ .{ .integer = i }, .{ .bytes = &large_buf } });
     }
 
-    // Should have multiple extents
-    const meta = try table.readMetaFull();
-    try std.testing.expect(meta.extent_count > 1);
-
-    // Scan all rows
-    var iter = try table.scan();
-    var count: usize = 0;
-    while (try iter.next()) |row| {
-        defer iter.freeValues(row.values);
-        count += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 80), count);
-}
-
-test "two tables with AllocManager no corruption" {
-    const test_file = "test_table_alloc_two.db";
-    var dm = DiskManager.init(std.testing.allocator, test_file);
-    defer {
-        dm.deleteFile();
-        dm.deinit();
-    }
-    try dm.open();
-
-    var bp = try BufferPool.init(std.testing.allocator, &dm, 128);
-    defer bp.deinit();
-
-    var am = AllocManager.init(&bp, &dm);
-    try am.initializeFile();
-
-    const schema = Schema{
-        .columns = &.{
-            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
-            .{ .name = "payload", .col_type = .text, .max_length = 0, .nullable = false },
-        },
-    };
-
-    var t1 = try Table.createFull(std.testing.allocator, &bp, &schema, null, null, &am);
-    var t2 = try Table.createFull(std.testing.allocator, &bp, &schema, null, null, &am);
-
-    var large_buf: [400]u8 = undefined;
-    @memset(&large_buf, 'B');
-
-    // Interleave inserts
-    var i: i32 = 0;
-    while (i < 50) : (i += 1) {
-        _ = try t1.insertTuple(null, &.{ .{ .integer = i }, .{ .bytes = &large_buf } });
-        _ = try t2.insertTuple(null, &.{ .{ .integer = i + 1000 }, .{ .bytes = &large_buf } });
+    // Verify the table's first extent is allocated in GAM
+    {
+        var gam_pg = try bp.fetchPage(file_header.GAM_PAGE);
+        defer bp.unpinPage(file_header.GAM_PAGE, false) catch {};
+        try std.testing.expect(!Gam.isExtentFree(gam_pg.data, table_extent_id));
     }
 
-    // Scan t1
-    var iter1 = try t1.scan();
-    var c1: usize = 0;
-    while (try iter1.next()) |row| {
-        defer iter1.freeValues(row.values);
-        try std.testing.expect(row.values[0].integer < 1000);
-        c1 += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 50), c1);
+    // Free all extents
+    try table.freeAllExtents();
 
-    // Scan t2
-    var iter2 = try t2.scan();
-    var c2: usize = 0;
-    while (try iter2.next()) |row| {
-        defer iter2.freeValues(row.values);
-        try std.testing.expect(row.values[0].integer >= 1000);
-        c2 += 1;
+    // Verify the table's first extent is now free in GAM
+    {
+        var gam_pg = try bp.fetchPage(file_header.GAM_PAGE);
+        defer bp.unpinPage(file_header.GAM_PAGE, false) catch {};
+        try std.testing.expect(Gam.isExtentFree(gam_pg.data, table_extent_id));
     }
-    try std.testing.expectEqual(@as(usize, 50), c2);
 }

@@ -253,8 +253,10 @@ const PlanNodeExt = struct {
 
 const disk_manager_mod = @import("../storage/disk_manager.zig");
 const buffer_pool_mod = @import("../storage/buffer_pool.zig");
+const alloc_map_mod = @import("../storage/alloc_map.zig");
 const DiskManager = disk_manager_mod.DiskManager;
 const BufferPool = buffer_pool_mod.BufferPool;
+const AllocManager = alloc_map_mod.AllocManager;
 const tuple_mod = @import("../storage/tuple.zig");
 const Column = tuple_mod.Column;
 
@@ -266,7 +268,9 @@ test "planner seq scan when no indexes" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const cols = [_]Column{
@@ -298,7 +302,9 @@ test "planner index scan for equality" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const cols = [_]Column{
@@ -343,7 +349,9 @@ test "planner index scan for range" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const cols = [_]Column{
@@ -385,7 +393,9 @@ test "planner prefers seq scan for tiny tables" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const cols = [_]Column{
@@ -426,7 +436,9 @@ test "planner range_to with boundary value zero" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const cols = [_]Column{
@@ -468,7 +480,9 @@ test "planner picks best index from multiple" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const cols = [_]Column{
@@ -511,7 +525,9 @@ test "planner BETWEEN produces range scan" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const cols = [_]Column{
@@ -554,7 +570,9 @@ test "planner reverse comparison uses index" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const cols = [_]Column{
@@ -596,7 +614,9 @@ test "planner nonexistent table returns error" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     var planner = Planner.init(std.testing.allocator, &catalog);
@@ -617,7 +637,9 @@ test "planner empty table zero rows" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const cols = [_]Column{
@@ -651,7 +673,9 @@ test "planner OR expression is not sargable" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const cols = [_]Column{
@@ -692,7 +716,9 @@ test "planner no WHERE clause always seq scan" {
     defer dm.close();
     var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
     defer bp.deinit();
-    var catalog = try Catalog.init(std.testing.allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
     defer catalog.deinit();
 
     const cols = [_]Column{

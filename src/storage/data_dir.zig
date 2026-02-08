@@ -136,13 +136,13 @@ pub const DataDir = struct {
         if (self.versionFileExists()) return DataDirError.AlreadyInitialized;
 
         // Create directory structure
-        self.createDir(root_path);
-        self.createDir(self.data_file_path[0 .. root_path.len + 1 + DATA_SUBDIR.len]);
-        self.createDir(self.wal_file_path[0 .. root_path.len + 1 + WAL_SUBDIR.len]);
+        try self.createDir(root_path);
+        try self.createDir(self.data_file_path[0 .. root_path.len + 1 + DATA_SUBDIR.len]);
+        try self.createDir(self.wal_file_path[0 .. root_path.len + 1 + WAL_SUBDIR.len]);
         const wal_archive = joinPath(allocator, root_path, WAL_ARCHIVE_SUBDIR) catch return DataDirError.OutOfMemory;
         defer allocator.free(wal_archive);
-        self.createDir(wal_archive);
-        self.createDir(self.tls_dir_path);
+        try self.createDir(wal_archive);
+        try self.createDir(self.tls_dir_path);
 
         // Write version file
         self.writeFile(self.version_file_path, VERSION) catch return DataDirError.IoError;
@@ -186,9 +186,13 @@ pub const DataDir = struct {
             if (lines.next()) |pid_line| {
                 const pid_str = std.mem.trimEnd(u8, pid_line, "\r");
                 if (pid_str.len > 0) {
-                    // PID file exists — could be stale. On Windows we can't easily
-                    // check if process is running, so we just warn and overwrite.
-                    // In production this would check /proc/<pid> or OpenProcess().
+                    const old_pid = std.fmt.parseInt(u32, pid_str, 10) catch 0;
+                    if (old_pid != 0 and old_pid != getPid()) {
+                        if (isProcessAlive(old_pid)) {
+                            return DataDirError.PidLockHeld;
+                        }
+                        // Stale lock — overwrite below
+                    }
                 }
             }
         } else |_| {
@@ -232,16 +236,38 @@ pub const DataDir = struct {
         }
     }
 
+    fn isProcessAlive(pid: u32) bool {
+        if (builtin.os.tag == .windows) {
+            const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+            const handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if (handle) |h| {
+                std.os.windows.CloseHandle(h);
+                return true;
+            }
+            return false;
+        } else {
+            // On POSIX, use kill(pid, 0) to check if process exists
+            const result = std.c.kill(@intCast(pid), 0);
+            return result == 0;
+        }
+    }
+
+    extern "kernel32" fn OpenProcess(
+        dwDesiredAccess: u32,
+        bInheritHandle: u32,
+        dwProcessId: u32,
+    ) ?std.os.windows.HANDLE;
+
     fn versionFileExists(self: *Self) bool {
         const f = Dir.openFile(.cwd(), self.io(), self.version_file_path, .{ .mode = .read_only }) catch return false;
         f.close(self.io());
         return true;
     }
 
-    fn createDir(self: *Self, path: []const u8) void {
+    fn createDir(self: *Self, path: []const u8) DataDirError!void {
         Dir.createDir(.cwd(), self.io(), path, .default_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => {},
+            error.PathAlreadyExists => return,
+            else => return DataDirError.IoError,
         };
     }
 

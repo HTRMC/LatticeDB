@@ -3,6 +3,7 @@ const page_mod = @import("page.zig");
 
 const PAGE_SIZE = page_mod.PAGE_SIZE;
 const PageId = page_mod.PageId;
+const INVALID_PAGE_ID = page_mod.INVALID_PAGE_ID;
 
 /// Magic bytes: "GDB\x01"
 pub const FILE_MAGIC: u32 = 0x47444201;
@@ -31,6 +32,11 @@ pub const FileHeaderPage = extern struct {
     creation_time: u64,
     page_count: u32,
     first_free_extent: u32,
+    // Catalog bootstrap IDs — persisted so catalog survives restart
+    catalog_tables_id: PageId,
+    catalog_columns_id: PageId,
+    catalog_indexes_id: PageId,
+    _reserved2: u32,
 
     pub const SIZE: usize = @sizeOf(FileHeaderPage);
 
@@ -43,6 +49,10 @@ pub const FileHeaderPage = extern struct {
             .creation_time = 0, // Could use timestamp but not critical
             .page_count = page_count,
             .first_free_extent = 0,
+            .catalog_tables_id = INVALID_PAGE_ID,
+            .catalog_columns_id = INVALID_PAGE_ID,
+            .catalog_indexes_id = INVALID_PAGE_ID,
+            ._reserved2 = 0,
         };
     }
 

@@ -53,6 +53,7 @@ pub const network = struct {
 
 const DiskManager = storage.disk_manager.DiskManager;
 const BufferPool = storage.buffer_pool.BufferPool;
+const AllocManager = storage.alloc_map.AllocManager;
 const Catalog = storage.catalog.Catalog;
 const TransactionManager = storage.mvcc.TransactionManager;
 const UndoLog = storage.undo_log.UndoLog;
@@ -318,7 +319,21 @@ fn runServer(allocator: std.mem.Allocator, out: *std.Io.Writer, port: u16, tls_c
     var bp = try BufferPool.init(allocator, &dm, BUFFER_POOL_SIZE);
     defer bp.deinit();
 
-    var catalog = try Catalog.init(allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    const is_new_server = try am.openOrInitFile();
+
+    var catalog = if (is_new_server or !(try am.hasCatalogIds())) blk: {
+        var cat = try Catalog.init(allocator, &bp, &am);
+        try am.writeCatalogIds(
+            cat.tables_table.table_id,
+            cat.columns_table.table_id,
+            cat.indexes_table.table_id,
+        );
+        break :blk cat;
+    } else blk: {
+        const ids = try am.readCatalogIds();
+        break :blk Catalog.open(allocator, &bp, &am, ids.tables, ids.columns, ids.indexes);
+    };
     defer catalog.deinit();
 
     var wal = storage.wal.Wal.init(allocator, dd.wal_dir_path);
@@ -502,7 +517,21 @@ fn runRepl(allocator: std.mem.Allocator, out: *std.Io.Writer, in: *std.Io.Reader
     var bp = try BufferPool.init(allocator, &dm, BUFFER_POOL_SIZE);
     defer bp.deinit();
 
-    var catalog = try Catalog.init(allocator, &bp);
+    var am = AllocManager.init(&bp, &dm);
+    const is_new_repl = try am.openOrInitFile();
+
+    var catalog = if (is_new_repl or !(try am.hasCatalogIds())) blk: {
+        var cat = try Catalog.init(allocator, &bp, &am);
+        try am.writeCatalogIds(
+            cat.tables_table.table_id,
+            cat.columns_table.table_id,
+            cat.indexes_table.table_id,
+        );
+        break :blk cat;
+    } else blk: {
+        const ids = try am.readCatalogIds();
+        break :blk Catalog.open(allocator, &bp, &am, ids.tables, ids.columns, ids.indexes);
+    };
     defer catalog.deinit();
 
     var wal = storage.wal.Wal.init(allocator, dd.wal_dir_path);

@@ -418,6 +418,54 @@ pub const AllocManager = struct {
         }
     }
 
+    /// Open an existing file or initialize a new one.
+    /// Returns `true` if a new file was initialized, `false` if an existing file was opened.
+    pub fn openOrInitFile(self: *Self) AllocError!bool {
+        if (self.disk_manager.getNumPages() >= file_header.SYSTEM_PAGES) {
+            // File has enough pages — validate the header
+            var pg = self.buffer_pool.fetchPage(file_header.FILE_HEADER_PAGE) catch return AllocError.BufferPoolError;
+            defer self.buffer_pool.unpinPage(file_header.FILE_HEADER_PAGE, false) catch {};
+            const hdr = FileHeaderPage.readFrom(pg.data);
+            if (!hdr.validate()) return AllocError.CorruptedFile;
+            return false;
+        } else {
+            // New file — initialize
+            try self.initializeFile();
+            return true;
+        }
+    }
+
+    /// Write catalog table IDs into the file header (page 0).
+    pub fn writeCatalogIds(self: *Self, tables: PageId, columns: PageId, indexes: PageId) AllocError!void {
+        var pg = self.buffer_pool.fetchPage(file_header.FILE_HEADER_PAGE) catch return AllocError.BufferPoolError;
+        var hdr = FileHeaderPage.readFrom(pg.data);
+        hdr.catalog_tables_id = tables;
+        hdr.catalog_columns_id = columns;
+        hdr.catalog_indexes_id = indexes;
+        @memcpy(pg.data[0..FileHeaderPage.SIZE], std.mem.asBytes(&hdr));
+        self.buffer_pool.unpinPage(file_header.FILE_HEADER_PAGE, true) catch {};
+    }
+
+    /// Read catalog table IDs from the file header (page 0).
+    pub fn readCatalogIds(self: *Self) AllocError!struct { tables: PageId, columns: PageId, indexes: PageId } {
+        var pg = self.buffer_pool.fetchPage(file_header.FILE_HEADER_PAGE) catch return AllocError.BufferPoolError;
+        defer self.buffer_pool.unpinPage(file_header.FILE_HEADER_PAGE, false) catch {};
+        const hdr = FileHeaderPage.readFrom(pg.data);
+        return .{
+            .tables = hdr.catalog_tables_id,
+            .columns = hdr.catalog_columns_id,
+            .indexes = hdr.catalog_indexes_id,
+        };
+    }
+
+    /// Check if the file header has valid (non-INVALID, non-zero) catalog IDs.
+    pub fn hasCatalogIds(self: *Self) AllocError!bool {
+        const ids = try self.readCatalogIds();
+        return ids.tables != INVALID_PAGE_ID and ids.tables != 0 and
+            ids.columns != INVALID_PAGE_ID and ids.columns != 0 and
+            ids.indexes != INVALID_PAGE_ID and ids.indexes != 0;
+    }
+
     /// Read the page count from the file header.
     pub fn getPageCount(self: *Self) AllocError!u32 {
         var pg = self.buffer_pool.fetchPage(file_header.FILE_HEADER_PAGE) catch return AllocError.BufferPoolError;
@@ -681,4 +729,69 @@ test "AllocManager allocate many extents" {
         // Each extent should start at (i+1)*EXTENT_SIZE
         try std.testing.expectEqual(@as(PageId, @intCast((i + 1) * EXTENT_SIZE)), extents[i]);
     }
+}
+
+test "openOrInitFile idempotency" {
+    const test_file = "test_alloc_open_or_init.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
+    try dm.open();
+
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 32);
+    defer bp.deinit();
+
+    var am = AllocManager.init(&bp, &dm);
+
+    // First call should initialize (returns true)
+    const is_new = try am.openOrInitFile();
+    try std.testing.expect(is_new);
+
+    // Allocate an extent to prove data exists
+    const ext1 = try am.allocateExtent();
+    try std.testing.expectEqual(@as(PageId, 8), ext1);
+
+    // Flush dirty pages so they persist
+    try bp.flushAllPages();
+
+    // Second call should detect existing file (returns false)
+    const is_new2 = try am.openOrInitFile();
+    try std.testing.expect(!is_new2);
+
+    // Data should be preserved — extent 1 still allocated, next free is extent 2
+    const ext2 = try am.allocateExtent();
+    try std.testing.expectEqual(@as(PageId, 16), ext2);
+}
+
+test "writeCatalogIds roundtrip" {
+    const test_file = "test_alloc_catalog_ids.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
+    try dm.open();
+
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 32);
+    defer bp.deinit();
+
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+
+    // Initially should not have catalog IDs
+    try std.testing.expect(!(try am.hasCatalogIds()));
+
+    // Write some IDs
+    try am.writeCatalogIds(8, 16, 24);
+
+    // Should now have catalog IDs
+    try std.testing.expect(try am.hasCatalogIds());
+
+    // Read them back
+    const ids = try am.readCatalogIds();
+    try std.testing.expectEqual(@as(PageId, 8), ids.tables);
+    try std.testing.expectEqual(@as(PageId, 16), ids.columns);
+    try std.testing.expectEqual(@as(PageId, 24), ids.indexes);
 }
