@@ -83,10 +83,7 @@ fn resolveDataDir(cli_args: []const [:0]const u8) []const u8 {
             return arg[2..];
         }
     }
-    // Check GRAPHENEDB_DATA env var
-    if (std.posix.getenv("GRAPHENEDB_DATA")) |env_val| {
-        if (env_val.len > 0) return env_val;
-    }
+    // Env var lookup not available pre-init in Zig 0.16; use -D flag instead
     return DEFAULT_DATA_DIR;
 }
 

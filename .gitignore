@@ -4,3 +4,10 @@
 /deps
 __pycache__/
 .graphenedb/
+.claude/
+
+# Runtime data artifacts
+*.dat
+graphenedb_data/
+bench_graphene_wal/
+test_wal_archive_dir/
