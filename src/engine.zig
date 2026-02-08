@@ -11,6 +11,7 @@ pub const storage = struct {
     pub const catalog = @import("storage/catalog.zig");
     pub const mvcc = @import("storage/mvcc.zig");
     pub const undo_log = @import("storage/undo_log.zig");
+    pub const data_dir = @import("storage/data_dir.zig");
 };
 
 pub const index = struct {

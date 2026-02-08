@@ -11,6 +11,7 @@ pub const storage = struct {
     pub const catalog = @import("storage/catalog.zig");
     pub const mvcc = @import("storage/mvcc.zig");
     pub const undo_log = @import("storage/undo_log.zig");
+    pub const data_dir = @import("storage/data_dir.zig");
 };
 
 // Index layer
@@ -51,19 +52,38 @@ const BufferPool = storage.buffer_pool.BufferPool;
 const Catalog = storage.catalog.Catalog;
 const TransactionManager = storage.mvcc.TransactionManager;
 const UndoLog = storage.undo_log.UndoLog;
+const DataDir = storage.data_dir.DataDir;
 const Executor = executor_layer.executor_mod.Executor;
 const Server = network.server.Server;
 const Client = network.client.Client;
 const protocol = network.protocol;
 const tls = network.tls;
 
-const DB_FILE = "graphenedb.dat";
 const BUFFER_POOL_SIZE = 1024;
 const DEFAULT_PORT = 4567;
-const DATA_DIR = ".graphenedb";
-const CERT_FILE = DATA_DIR ++ "/server.p12";
+const DEFAULT_DATA_DIR = "graphenedb_data";
 const CERT_PASSWORD = "graphenedb"; // PKCS12 password for on-disk storage
-const KNOWN_SERVERS_FILE = DATA_DIR ++ "/known_servers";
+
+/// Resolve data directory path from CLI args (-D), env var, or default.
+fn resolveDataDir(cli_args: []const [:0]const u8) []const u8 {
+    // Check for -D flag in args
+    var i: usize = 0;
+    while (i < cli_args.len) : (i += 1) {
+        const arg: []const u8 = cli_args[i];
+        if (std.mem.eql(u8, arg, "-D") and i + 1 < cli_args.len) {
+            return cli_args[i + 1];
+        }
+        // Support -D/path/to/dir (no space)
+        if (arg.len > 2 and std.mem.startsWith(u8, arg, "-D")) {
+            return arg[2..];
+        }
+    }
+    // Check GRAPHENEDB_DATA env var
+    if (std.posix.getenv("GRAPHENEDB_DATA")) |env_val| {
+        if (env_val.len > 0) return env_val;
+    }
+    return DEFAULT_DATA_DIR;
+}
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -81,6 +101,31 @@ pub fn main(init: std.process.Init) !void {
 
     // Skip argv[0] (program name)
     const cli_args = if (args.len > 1) args[1..] else args[0..0];
+
+    // Resolve data directory: -D flag > GRAPHENEDB_DATA env > default
+    const data_dir_path = resolveDataDir(cli_args);
+
+    if (cli_args.len > 0 and std.mem.eql(u8, cli_args[0], "init")) {
+        // Init command: create a new data directory
+        var dd = DataDir.initNew(allocator, data_dir_path) catch |err| {
+            switch (err) {
+                error.AlreadyInitialized => {
+                    try out.print("Data directory already initialized: {s}\n", .{data_dir_path});
+                    try out.flush();
+                    return;
+                },
+                else => {
+                    try out.print("Failed to initialize data directory: {s}\n", .{@errorName(err)});
+                    try out.flush();
+                    return;
+                },
+            }
+        };
+        dd.deinit();
+        try out.print("Data directory initialized: {s}\n", .{data_dir_path});
+        try out.flush();
+        return;
+    }
 
     if (cli_args.len > 0 and std.mem.eql(u8, cli_args[0], "serve")) {
         var port: u16 = DEFAULT_PORT;
@@ -141,8 +186,17 @@ pub fn main(init: std.process.Init) !void {
 
             // Auto-generate certificate
             if (tls_mode == .persistent) {
+                // Open/init data dir to get cert path
+                var dd = DataDir.openOrInit(allocator, data_dir_path) catch |err| {
+                    try out.print("Failed to open data directory: {s}\n", .{@errorName(err)});
+                    try out.flush();
+                    return;
+                };
+                defer dd.deinit();
+                const cert_path = dd.cert_file_path;
+
                 // Try to load existing cert from disk
-                if (loadCertFile(allocator, io)) |der| {
+                if (loadCertFile(allocator, io, cert_path)) |der| {
                     cert_bundle = tls.loadFromBytes(allocator, der, CERT_PASSWORD) catch |err| {
                         try out.print("Failed to parse saved certificate: {s}\n", .{@errorName(err)});
                         try out.flush();
@@ -150,7 +204,7 @@ pub fn main(init: std.process.Init) !void {
                         return;
                     };
                     allocator.free(der);
-                    try out.print("Loaded certificate from {s}\n", .{CERT_FILE});
+                    try out.print("Loaded certificate from {s}\n", .{cert_path});
                     try out.flush();
                 } else {
                     // Generate new cert and save
@@ -160,13 +214,13 @@ pub fn main(init: std.process.Init) !void {
                         return;
                     };
 
-                    // Create data directory and save
-                    saveCertFile(cert_bundle.?.pkcs12_der, io) catch |err| {
+                    // Save to data dir
+                    saveCertFile(cert_bundle.?.pkcs12_der, io, cert_path) catch |err| {
                         try out.print("Failed to save certificate: {s}\n", .{@errorName(err)});
                         try out.flush();
                         return;
                     };
-                    try out.print("Generated certificate saved to {s}\n", .{CERT_FILE});
+                    try out.print("Generated certificate saved to {s}\n", .{cert_path});
                     try out.flush();
                 }
             } else {
@@ -196,7 +250,7 @@ pub fn main(init: std.process.Init) !void {
             try out.flush();
         }
 
-        try runServer(allocator, out, port, tls_cert);
+        try runServer(allocator, out, port, tls_cert, data_dir_path);
     } else if (cli_args.len > 0 and std.mem.eql(u8, cli_args[0], "connect")) {
         var host: [*:0]const u8 = "localhost";
         var port: u16 = DEFAULT_PORT;
@@ -223,22 +277,37 @@ pub fn main(init: std.process.Init) !void {
         var stdin = std.Io.File.Reader.initStreaming(std.Io.File.stdin(), io, &read_buf);
         const in = &stdin.interface;
 
-        try runClient(allocator, out, in, io, host, port);
+        try runClient(allocator, out, in, io, host, port, data_dir_path);
     } else {
         // Default: local REPL
         var read_buf: [4096]u8 = undefined;
         var stdin = std.Io.File.Reader.initStreaming(std.Io.File.stdin(), io, &read_buf);
         const in = &stdin.interface;
 
-        try runRepl(allocator, out, in);
+        try runRepl(allocator, out, in, data_dir_path);
     }
 }
 
 // ── Server mode ──────────────────────────────────────────────────────
 
-fn runServer(allocator: std.mem.Allocator, out: *std.Io.Writer, port: u16, tls_cert: Server.TlsCert) !void {
+fn runServer(allocator: std.mem.Allocator, out: *std.Io.Writer, port: u16, tls_cert: Server.TlsCert, data_dir_path: []const u8) !void {
+    // Open/init data directory
+    var dd = DataDir.openOrInit(allocator, data_dir_path) catch |err| {
+        try out.print("Failed to open data directory: {s}\n", .{@errorName(err)});
+        try out.flush();
+        return;
+    };
+    defer dd.deinit();
+
+    // Acquire PID lock
+    dd.acquirePidLock(port) catch |err| {
+        try out.print("Failed to acquire PID lock: {s}\n", .{@errorName(err)});
+        try out.flush();
+        return;
+    };
+
     // Initialize storage engine
-    var dm = DiskManager.init(allocator, DB_FILE);
+    var dm = DiskManager.init(allocator, dd.data_file_path);
     try dm.open();
     defer dm.close();
 
@@ -248,7 +317,7 @@ fn runServer(allocator: std.mem.Allocator, out: *std.Io.Writer, port: u16, tls_c
     var catalog = try Catalog.init(allocator, &bp);
     defer catalog.deinit();
 
-    var wal = storage.wal.Wal.init(allocator, "graphenedb.wal");
+    var wal = storage.wal.Wal.init(allocator, dd.wal_file_path);
     try wal.open();
     defer wal.deinit();
 
@@ -265,6 +334,7 @@ fn runServer(allocator: std.mem.Allocator, out: *std.Io.Writer, port: u16, tls_c
 
     try out.print("GrapheneDB v0.1.0\n", .{});
     try out.print("QUIC server listening on port {d}\n", .{port});
+    try out.print("Data directory: {s}\n", .{data_dir_path});
     try out.print("Press Ctrl+C to stop.\n", .{});
     try out.flush();
 
@@ -282,16 +352,22 @@ fn runClient(
     io: Io,
     host: [*:0]const u8,
     port: u16,
+    data_dir_path: []const u8,
 ) !void {
     var cli = try Client.init(allocator);
     defer cli.deinit();
+
+    // Open/init data dir to get known_hosts path
+    var dd = DataDir.openOrInit(allocator, data_dir_path) catch null;
+    defer if (dd) |*d| d.deinit();
+    const known_hosts_file: []const u8 = if (dd) |d| d.known_hosts_path else "known_hosts";
 
     const host_span = std.mem.span(host);
 
     // Look up known fingerprint for TOFU pinning
     const host_port = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ host_span, port });
     defer allocator.free(host_port);
-    cli.expected_fingerprint = lookupKnownFingerprint(allocator, io, host_port);
+    cli.expected_fingerprint = lookupKnownFingerprint(allocator, io, host_port, known_hosts_file);
 
     try out.print("Connecting to {s}...\n", .{host_port});
     try out.flush();
@@ -310,7 +386,7 @@ fn runClient(
                 const fp_str = tls.formatFingerprint(fp, &fp_buf);
                 try out.print("  Expected:        {s}\n", .{fp_str});
             }
-            try out.print("If you trust this server, delete its entry from {s}\n", .{KNOWN_SERVERS_FILE});
+            try out.print("If you trust this server, delete its entry from {s}\n", .{known_hosts_file});
             try out.flush();
             return;
         }
@@ -327,10 +403,10 @@ fn runClient(
                 const fp_str = tls.formatFingerprint(fp, &fp_buf);
                 try out.print("New server fingerprint: {s}\n", .{fp_str});
                 // Save for future connections (TOFU)
-                saveKnownFingerprint(allocator, host_port, fp, io) catch |err| {
+                saveKnownFingerprint(allocator, host_port, fp, io, known_hosts_file) catch |err| {
                     try out.print("Warning: could not save fingerprint: {s}\n", .{@errorName(err)});
                 };
-                try out.print("Fingerprint saved to {s}\n", .{KNOWN_SERVERS_FILE});
+                try out.print("Fingerprint saved to {s}\n", .{known_hosts_file});
             }
         },
         .trusted => {
@@ -405,9 +481,17 @@ fn runClient(
 
 // ── Local REPL mode ──────────────────────────────────────────────────
 
-fn runRepl(allocator: std.mem.Allocator, out: *std.Io.Writer, in: *std.Io.Reader) !void {
+fn runRepl(allocator: std.mem.Allocator, out: *std.Io.Writer, in: *std.Io.Reader, data_dir_path: []const u8) !void {
+    // Open/init data directory
+    var dd = DataDir.openOrInit(allocator, data_dir_path) catch |err| {
+        try out.print("Failed to open data directory: {s}\n", .{@errorName(err)});
+        try out.flush();
+        return;
+    };
+    defer dd.deinit();
+
     // Initialize storage engine
-    var dm = DiskManager.init(allocator, DB_FILE);
+    var dm = DiskManager.init(allocator, dd.data_file_path);
     try dm.open();
     defer dm.close();
 
@@ -417,7 +501,7 @@ fn runRepl(allocator: std.mem.Allocator, out: *std.Io.Writer, in: *std.Io.Reader
     var catalog = try Catalog.init(allocator, &bp);
     defer catalog.deinit();
 
-    var wal = storage.wal.Wal.init(allocator, "graphenedb.wal");
+    var wal = storage.wal.Wal.init(allocator, dd.wal_file_path);
     try wal.open();
     defer wal.deinit();
 
@@ -631,8 +715,8 @@ const Io = std.Io;
 const Dir = Io.Dir;
 
 /// Try to load the cert file, returns null if not found.
-fn loadCertFile(allocator: std.mem.Allocator, io: Io) ?[]u8 {
-    const file = Dir.openFile(.cwd(), io, CERT_FILE, .{ .mode = .read_only }) catch return null;
+fn loadCertFile(allocator: std.mem.Allocator, io: Io, cert_path: []const u8) ?[]u8 {
+    const file = Dir.openFile(.cwd(), io, cert_path, .{ .mode = .read_only }) catch return null;
     defer file.close(io);
     const stat = file.stat(io) catch return null;
     if (stat.size == 0) return null;
@@ -648,21 +732,16 @@ fn loadCertFile(allocator: std.mem.Allocator, io: Io) ?[]u8 {
     return buf;
 }
 
-/// Save cert file to disk, creating the data directory if needed.
-fn saveCertFile(der: []const u8, io: Io) !void {
-    // Create data directory (ignore if already exists)
-    Dir.createDir(.cwd(), io, DATA_DIR, .default_dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-    const file = try Dir.createFile(.cwd(), io, CERT_FILE, .{ .truncate = true });
+/// Save cert file to disk (data directory already created by DataDir).
+fn saveCertFile(der: []const u8, io: Io, cert_path: []const u8) !void {
+    const file = try Dir.createFile(.cwd(), io, cert_path, .{ .truncate = true });
     defer file.close(io);
     try file.writePositionalAll(io, der, 0);
 }
 
-/// Look up a known fingerprint for a host:port from the known_servers file.
-fn lookupKnownFingerprint(allocator: std.mem.Allocator, io: Io, host_port: []const u8) ?[32]u8 {
-    const content = loadFileContent(allocator, io, KNOWN_SERVERS_FILE) orelse return null;
+/// Look up a known fingerprint for a host:port from the known_hosts file.
+fn lookupKnownFingerprint(allocator: std.mem.Allocator, io: Io, host_port: []const u8, known_hosts_file: []const u8) ?[32]u8 {
+    const content = loadFileContent(allocator, io, known_hosts_file) orelse return null;
     defer allocator.free(content);
 
     var lines = std.mem.splitScalar(u8, content, '\n');
@@ -680,14 +759,9 @@ fn lookupKnownFingerprint(allocator: std.mem.Allocator, io: Io, host_port: []con
     return null;
 }
 
-/// Save a fingerprint for a host:port to the known_servers file.
+/// Save a fingerprint for a host:port to the known_hosts file.
 /// Updates the entry if the host:port already exists.
-fn saveKnownFingerprint(allocator: std.mem.Allocator, host_port: []const u8, fp: [32]u8, io: Io) !void {
-    Dir.createDir(.cwd(), io, DATA_DIR, .default_dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-
+fn saveKnownFingerprint(allocator: std.mem.Allocator, host_port: []const u8, fp: [32]u8, io: Io, known_hosts_file: []const u8) !void {
     // Format fingerprint as 64 hex chars
     const hex_chars = "0123456789ABCDEF";
     var hex_buf: [64]u8 = undefined;
@@ -700,7 +774,7 @@ fn saveKnownFingerprint(allocator: std.mem.Allocator, host_port: []const u8, fp:
     var content = std.ArrayListUnmanaged(u8).empty;
     defer content.deinit(allocator);
 
-    if (loadFileContent(allocator, io, KNOWN_SERVERS_FILE)) |existing| {
+    if (loadFileContent(allocator, io, known_hosts_file)) |existing| {
         defer allocator.free(existing);
         var lines = std.mem.splitScalar(u8, existing, '\n');
         while (lines.next()) |line| {
@@ -722,7 +796,7 @@ fn saveKnownFingerprint(allocator: std.mem.Allocator, host_port: []const u8, fp:
     try content.append(allocator, '\n');
 
     // Write file
-    const file = try Dir.createFile(.cwd(), io, KNOWN_SERVERS_FILE, .{ .truncate = true });
+    const file = try Dir.createFile(.cwd(), io, known_hosts_file, .{ .truncate = true });
     defer file.close(io);
     try file.writePositionalAll(io, content.items, 0);
 }
@@ -781,6 +855,7 @@ test {
     _ = storage.catalog;
     _ = storage.mvcc;
     _ = storage.undo_log;
+    _ = storage.data_dir;
     _ = index.btree_page;
     _ = index.btree;
     _ = parser.lexer;
