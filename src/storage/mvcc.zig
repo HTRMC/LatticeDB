@@ -525,10 +525,10 @@ test "default isolation is snapshot" {
 
 test "WAL records written on commit" {
     const Wal = wal_mod.Wal;
-    const test_file = "test_mvcc_wal_commit.log";
+    const test_dir = "test_mvcc_wal_commit_dir";
 
-    var wal = Wal.init(std.testing.allocator, test_file);
-    defer wal.deleteFile();
+    var wal = Wal.init(std.testing.allocator, test_dir);
+    defer wal.deleteFiles();
     defer wal.deinit();
     try wal.open();
 
@@ -540,6 +540,7 @@ test "WAL records written on commit" {
 
     // Should have BEGIN + COMMIT records in WAL
     var iter = try wal.iterator();
+    defer wal.freeIterator(&iter);
     var count: usize = 0;
     var types: [2]wal_mod.LogRecordType = undefined;
     while (try iter.next()) |record| {
@@ -554,10 +555,10 @@ test "WAL records written on commit" {
 
 test "WAL abort record on rollback" {
     const Wal = wal_mod.Wal;
-    const test_file = "test_mvcc_wal_abort.log";
+    const test_dir = "test_mvcc_wal_abort_dir";
 
-    var wal = Wal.init(std.testing.allocator, test_file);
-    defer wal.deleteFile();
+    var wal = Wal.init(std.testing.allocator, test_dir);
+    defer wal.deleteFiles();
     defer wal.deinit();
     try wal.open();
 
@@ -572,6 +573,7 @@ test "WAL abort record on rollback" {
 
     // Should have BEGIN + ABORT records in WAL
     var iter = try wal.iterator();
+    defer wal.freeIterator(&iter);
     var count: usize = 0;
     var types: [2]wal_mod.LogRecordType = undefined;
     while (try iter.next()) |record| {

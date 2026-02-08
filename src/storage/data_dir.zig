@@ -50,6 +50,7 @@ pub const DataDir = struct {
 
     // Computed absolute paths (owned, freed on deinit)
     data_file_path: []const u8,
+    wal_dir_path: []const u8,
     wal_file_path: []const u8,
     tls_dir_path: []const u8,
     cert_file_path: []const u8,
@@ -73,6 +74,7 @@ pub const DataDir = struct {
 
     fn computePaths(allocator: std.mem.Allocator, root: []const u8) DataDirError!struct {
         data_file_path: []const u8,
+        wal_dir_path: []const u8,
         wal_file_path: []const u8,
         tls_dir_path: []const u8,
         cert_file_path: []const u8,
@@ -83,6 +85,7 @@ pub const DataDir = struct {
     } {
         return .{
             .data_file_path = try joinPath(allocator, root, DATA_FILE),
+            .wal_dir_path = try joinPath(allocator, root, WAL_SUBDIR),
             .wal_file_path = try joinPath(allocator, root, WAL_FILE),
             .tls_dir_path = try joinPath(allocator, root, TLS_SUBDIR),
             .cert_file_path = try joinPath(allocator, root, TLS_CERT_FILE),
@@ -95,6 +98,7 @@ pub const DataDir = struct {
 
     fn freePaths(self: *Self) void {
         self.allocator.free(self.data_file_path);
+        self.allocator.free(self.wal_dir_path);
         self.allocator.free(self.wal_file_path);
         self.allocator.free(self.tls_dir_path);
         self.allocator.free(self.cert_file_path);
@@ -110,6 +114,7 @@ pub const DataDir = struct {
             .allocator = allocator,
             .root_path = root_path,
             .data_file_path = paths.data_file_path,
+            .wal_dir_path = paths.wal_dir_path,
             .wal_file_path = paths.wal_file_path,
             .tls_dir_path = paths.tls_dir_path,
             .cert_file_path = paths.cert_file_path,

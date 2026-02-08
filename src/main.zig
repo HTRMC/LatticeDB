@@ -321,7 +321,7 @@ fn runServer(allocator: std.mem.Allocator, out: *std.Io.Writer, port: u16, tls_c
     var catalog = try Catalog.init(allocator, &bp);
     defer catalog.deinit();
 
-    var wal = storage.wal.Wal.init(allocator, dd.wal_file_path);
+    var wal = storage.wal.Wal.init(allocator, dd.wal_dir_path);
     try wal.open();
     defer wal.deinit();
 
@@ -505,7 +505,7 @@ fn runRepl(allocator: std.mem.Allocator, out: *std.Io.Writer, in: *std.Io.Reader
     var catalog = try Catalog.init(allocator, &bp);
     defer catalog.deinit();
 
-    var wal = storage.wal.Wal.init(allocator, dd.wal_file_path);
+    var wal = storage.wal.Wal.init(allocator, dd.wal_dir_path);
     try wal.open();
     defer wal.deinit();
 

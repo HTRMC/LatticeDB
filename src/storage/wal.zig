@@ -154,11 +154,27 @@ pub const UpdateRecordData = struct {
     }
 };
 
-/// Write-Ahead Log Manager
+/// Default segment size: 64MB
+pub const DEFAULT_SEGMENT_MAX_SIZE: u64 = 64 * 1024 * 1024;
+
+/// Segment file name format: 12-digit zero-padded segment ID + .wal
+/// e.g. "000000000001.wal"
+const SEGMENT_NAME_LEN: usize = 16; // 12 digits + ".wal"
+
+fn formatSegmentName(buf: *[SEGMENT_NAME_LEN]u8, segment_id: u64) []const u8 {
+    _ = std.fmt.bufPrint(buf, "{d:0>12}.wal", .{segment_id}) catch unreachable;
+    return buf[0..SEGMENT_NAME_LEN];
+}
+
+/// Write-Ahead Log Manager with segment-based storage.
+///
+/// WAL records are written to fixed-size segment files under a directory.
+/// When the current segment exceeds `segment_max_size`, it is finalized
+/// and a new segment is created. Completed segments can be archived
+/// for replication shipping.
 pub const Wal = struct {
     allocator: std.mem.Allocator,
-    file_path: []const u8,
-    file: ?File,
+    wal_dir: []const u8,
     threaded: Threaded,
 
     /// Current LSN (next to be assigned)
@@ -167,8 +183,15 @@ pub const Wal = struct {
     flushed_lsn: Lsn,
     /// Log buffer for batching writes
     buffer: std.ArrayList(u8),
-    /// Offset in file where buffer will be written
-    buffer_offset: u64,
+
+    /// Current segment state
+    current_segment_id: u64,
+    current_segment_file: ?File,
+    current_segment_offset: u64,
+    segment_max_size: u64,
+
+    /// Next segment ID to create
+    next_segment_id: u64,
 
     const Self = @This();
     const BUFFER_SIZE: usize = 64 * 1024; // 64KB buffer
@@ -177,60 +200,133 @@ pub const Wal = struct {
         return self.threaded.io();
     }
 
-    /// Create a new WAL manager
-    pub fn init(allocator: std.mem.Allocator, file_path: []const u8) Self {
+    /// Create a new WAL manager for a directory.
+    pub fn init(allocator: std.mem.Allocator, wal_dir: []const u8) Self {
         return .{
             .allocator = allocator,
-            .file_path = file_path,
-            .file = null,
+            .wal_dir = wal_dir,
             .threaded = Threaded.init(allocator, .{ .environ = process.Environ.empty }),
-            .current_lsn = 1, // LSN starts at 1 (0 is invalid)
+            .current_lsn = 1,
             .flushed_lsn = 0,
             .buffer = .empty,
-            .buffer_offset = 0,
+            .current_segment_id = 1,
+            .current_segment_file = null,
+            .current_segment_offset = 0,
+            .segment_max_size = DEFAULT_SEGMENT_MAX_SIZE,
+            .next_segment_id = 2,
         };
     }
 
-    /// Open or create the WAL file
+    /// Build the full path for a segment file.
+    fn segmentPath(self: *Self, segment_id: u64) WalError![]const u8 {
+        var name_buf: [SEGMENT_NAME_LEN]u8 = undefined;
+        const name = formatSegmentName(&name_buf, segment_id);
+        return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.wal_dir, name }) catch return WalError.OutOfMemory;
+    }
+
+    /// Build the full path for an archived segment.
+    fn archiveSegmentPath(self: *Self, segment_id: u64) WalError![]const u8 {
+        var name_buf: [SEGMENT_NAME_LEN]u8 = undefined;
+        const name = formatSegmentName(&name_buf, segment_id);
+        return std.fmt.allocPrint(self.allocator, "{s}/archive/{s}", .{ self.wal_dir, name }) catch return WalError.OutOfMemory;
+    }
+
+    /// Open the WAL directory. Scans for existing segments and resumes
+    /// from the latest one (for recovery). Creates segment 1 if none exist.
     pub fn open(self: *Self) WalError!void {
-        // Try to open existing file
-        self.file = Dir.openFile(.cwd(), self.io(), self.file_path, .{ .mode = .read_write }) catch |err| {
-            if (err == error.FileNotFound) {
-                // Create new file
-                self.file = Dir.createFile(.cwd(), self.io(), self.file_path, .{
-                    .read = true,
-                    .truncate = false,
-                }) catch {
-                    return WalError.WriteError;
-                };
-                self.current_lsn = 1;
-                self.flushed_lsn = 0;
-                self.buffer_offset = 0;
-                return;
-            }
-            return WalError.WriteError;
+        // Ensure the directory exists
+        Dir.createDir(.cwd(), self.io(), self.wal_dir, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return WalError.WriteError,
         };
 
-        // Existing file - scan to find current LSN
-        try self.scanLog();
-    }
+        // Scan for existing segments
+        const segments = try self.listSegments();
+        defer self.allocator.free(segments);
 
-    /// Close the WAL file
-    pub fn close(self: *Self) void {
-        // Flush any remaining buffer
-        self.flush() catch {};
+        if (segments.len == 0) {
+            // No segments — create the first one
+            try self.openSegment(1);
+            self.current_segment_id = 1;
+            self.next_segment_id = 2;
+            self.current_lsn = 1;
+            self.flushed_lsn = 0;
+            return;
+        }
 
-        if (self.file) |f| {
-            f.close(self.io());
-            self.file = null;
+        // Find the highest segment ID
+        var max_seg: u64 = 0;
+        for (segments) |seg_id| {
+            if (seg_id > max_seg) max_seg = seg_id;
+        }
+
+        // Scan all segments to find current LSN
+        try self.scanAllSegments(segments);
+
+        // Open the last segment for appending
+        try self.openSegment(max_seg);
+        self.current_segment_id = max_seg;
+        self.next_segment_id = max_seg + 1;
+
+        // Get the size of the current segment to set offset
+        if (self.current_segment_file) |f| {
+            const stat = f.stat(self.io()) catch return WalError.ReadError;
+            self.current_segment_offset = stat.size;
         }
     }
 
-    /// Deinitialize the WAL
+    /// Open (or create) a segment file for writing.
+    fn openSegment(self: *Self, segment_id: u64) WalError!void {
+        const path = try self.segmentPath(segment_id);
+        defer self.allocator.free(path);
+
+        self.current_segment_file = Dir.openFile(.cwd(), self.io(), path, .{ .mode = .read_write }) catch |err| blk: {
+            if (err == error.FileNotFound) {
+                break :blk Dir.createFile(.cwd(), self.io(), path, .{
+                    .read = true,
+                    .truncate = false,
+                }) catch return WalError.WriteError;
+            }
+            return WalError.WriteError;
+        };
+        self.current_segment_offset = 0;
+    }
+
+    /// Close the current segment file.
+    fn closeCurrentSegment(self: *Self) void {
+        if (self.current_segment_file) |f| {
+            f.close(self.io());
+            self.current_segment_file = null;
+        }
+    }
+
+    /// Close the WAL (flush + close current segment).
+    pub fn close(self: *Self) void {
+        self.flush() catch {};
+        self.closeCurrentSegment();
+    }
+
+    /// Deinitialize the WAL.
     pub fn deinit(self: *Self) void {
         self.close();
         self.buffer.deinit(self.allocator);
         self.threaded.deinit();
+    }
+
+    /// Rotate to a new segment — finalize the current one and create the next.
+    fn rotateSegment(self: *Self) WalError!void {
+        // Flush remaining buffer to current segment
+        try self.flush();
+
+        // Close current segment
+        self.closeCurrentSegment();
+
+        // Create next segment
+        const new_id = self.next_segment_id;
+        self.next_segment_id += 1;
+        try self.openSegment(new_id);
+        self.current_segment_id = new_id;
+        self.current_segment_offset = 0;
     }
 
     /// Append a BEGIN record
@@ -241,7 +337,6 @@ pub const Wal = struct {
     /// Append a COMMIT record
     pub fn logCommit(self: *Self, txn_id: TxnId, prev_lsn: Lsn) WalError!Lsn {
         const lsn = try self.appendRecord(txn_id, prev_lsn, .commit, &.{});
-        // Commit must be durable - force flush
         try self.flush();
         return lsn;
     }
@@ -261,11 +356,8 @@ pub const Wal = struct {
         old_data: []const u8,
         new_data: []const u8,
     ) WalError!Lsn {
-        // Serialize update data
         const data_len = UpdateRecordData.HEADER_SIZE + old_data.len + new_data.len;
-        const data_buf = self.allocator.alloc(u8, data_len) catch {
-            return WalError.OutOfMemory;
-        };
+        const data_buf = self.allocator.alloc(u8, data_len) catch return WalError.OutOfMemory;
         defer self.allocator.free(data_buf);
 
         const update = UpdateRecordData{
@@ -274,9 +366,7 @@ pub const Wal = struct {
             .length = @intCast(old_data.len),
         };
 
-        _ = update.serialize(old_data, new_data, data_buf) catch {
-            return WalError.OutOfMemory;
-        };
+        _ = update.serialize(old_data, new_data, data_buf) catch return WalError.OutOfMemory;
 
         return self.appendRecord(txn_id, prev_lsn, .update, data_buf);
     }
@@ -288,9 +378,9 @@ pub const Wal = struct {
         return lsn;
     }
 
-    /// Append a record to the log
+    /// Append a record to the log.
     fn appendRecord(self: *Self, txn_id: TxnId, prev_lsn: Lsn, record_type: LogRecordType, data: []const u8) WalError!Lsn {
-        _ = self.file orelse return WalError.FileNotOpen;
+        _ = self.current_segment_file orelse return WalError.FileNotOpen;
 
         const lsn = self.current_lsn;
         self.current_lsn += 1;
@@ -305,16 +395,10 @@ pub const Wal = struct {
         };
         header.checksum = header.computeChecksum(data);
 
-        // Append header to buffer
-        self.buffer.appendSlice(self.allocator, std.mem.asBytes(&header)) catch {
-            return WalError.OutOfMemory;
-        };
+        self.buffer.appendSlice(self.allocator, std.mem.asBytes(&header)) catch return WalError.OutOfMemory;
 
-        // Append data to buffer
         if (data.len > 0) {
-            self.buffer.appendSlice(self.allocator, data) catch {
-                return WalError.OutOfMemory;
-            };
+            self.buffer.appendSlice(self.allocator, data) catch return WalError.OutOfMemory;
         }
 
         // Flush if buffer is large enough
@@ -322,101 +406,104 @@ pub const Wal = struct {
             try self.flush();
         }
 
+        // Check if current segment is full — rotate after flush
+        if (self.current_segment_offset + self.buffer.items.len >= self.segment_max_size) {
+            try self.rotateSegment();
+        }
+
         return lsn;
     }
 
-    /// Flush the log buffer to disk
+    /// Flush the log buffer to disk (current segment).
     pub fn flush(self: *Self) WalError!void {
-        const f = self.file orelse return WalError.FileNotOpen;
+        const f = self.current_segment_file orelse return WalError.FileNotOpen;
 
-        if (self.buffer.items.len == 0) {
-            return;
-        }
+        if (self.buffer.items.len == 0) return;
 
-        // Write buffer to file at current offset
-        f.writePositionalAll(self.io(), self.buffer.items, self.buffer_offset) catch {
-            return WalError.WriteError;
-        };
+        f.writePositionalAll(self.io(), self.buffer.items, self.current_segment_offset) catch return WalError.WriteError;
+        f.sync(self.io()) catch return WalError.FlushError;
 
-        // Sync to disk
-        f.sync(self.io()) catch {
-            return WalError.FlushError;
-        };
-
-        // Update state
-        self.buffer_offset += self.buffer.items.len;
+        self.current_segment_offset += self.buffer.items.len;
         self.flushed_lsn = self.current_lsn - 1;
         self.buffer.clearRetainingCapacity();
     }
 
-    /// Scan the log to find the current LSN (for recovery)
-    fn scanLog(self: *Self) WalError!void {
-        const f = self.file orelse return WalError.FileNotOpen;
+    /// List all segment IDs in the WAL directory (sorted ascending).
+    fn listSegments(self: *Self) WalError![]u64 {
+        var result: std.ArrayList(u64) = .empty;
+        errdefer result.deinit(self.allocator);
 
-        // Get file size
-        const stat = f.stat(self.io()) catch {
-            return WalError.ReadError;
-        };
+        // Open the WAL directory and iterate entries
+        var dir = Dir.openDir(.cwd(), self.io(), self.wal_dir, .{ .iterate = true }) catch return WalError.ReadError;
+        defer dir.close(self.io());
 
-        if (stat.size == 0) {
-            self.current_lsn = 1;
-            self.flushed_lsn = 0;
-            self.buffer_offset = 0;
-            return;
-        }
-
-        // Read and validate records to find the last valid LSN
-        var offset: u64 = 0;
-        var last_valid_lsn: Lsn = 0;
-        var header_buf: [LogRecordHeader.SIZE]u8 = undefined;
-
-        while (offset + LogRecordHeader.SIZE <= stat.size) {
-            // Read header
-            const header_bytes = f.readPositionalAll(self.io(), &header_buf, offset) catch {
-                break;
-            };
-
-            if (header_bytes != LogRecordHeader.SIZE) {
-                break;
-            }
-
-            const header: *const LogRecordHeader = @ptrCast(@alignCast(&header_buf));
-
-            // Validate record type
-            if (@intFromEnum(header.record_type) == 0 or @intFromEnum(header.record_type) > 5) {
-                break;
-            }
-
-            // Read data if present
-            var data_buf: []u8 = &.{};
-            if (header.data_len > 0) {
-                data_buf = self.allocator.alloc(u8, header.data_len) catch {
-                    break;
-                };
-                defer self.allocator.free(data_buf);
-
-                const data_bytes = f.readPositionalAll(self.io(), data_buf, offset + LogRecordHeader.SIZE) catch {
-                    break;
-                };
-
-                if (data_bytes != header.data_len) {
-                    break;
+        var iter = dir.iterateAssumeFirstIteration();
+        while (iter.next(self.io()) catch null) |entry| {
+            const name = entry.name;
+            // Match pattern: 12 digits + ".wal"
+            if (name.len == SEGMENT_NAME_LEN and std.mem.endsWith(u8, name, ".wal")) {
+                const digit_part = name[0..12];
+                const seg_id = std.fmt.parseInt(u64, digit_part, 10) catch continue;
+                if (seg_id > 0) {
+                    result.append(self.allocator, seg_id) catch return WalError.OutOfMemory;
                 }
             }
+        }
 
-            // Verify checksum
-            if (!header.verify(data_buf)) {
-                break;
+        // Sort ascending
+        const items = result.items;
+        std.mem.sort(u64, items, {}, std.sort.asc(u64));
+
+        // Return the owned slice — caller frees with allocator.free()
+        // We need to return just the items, not the ArrayList
+        const owned = self.allocator.dupe(u64, items) catch return WalError.OutOfMemory;
+        result.deinit(self.allocator);
+        return owned;
+    }
+
+    /// Scan all segments to find the current LSN.
+    fn scanAllSegments(self: *Self, segment_ids: []const u64) WalError!void {
+        var last_valid_lsn: Lsn = 0;
+
+        for (segment_ids) |seg_id| {
+            const path = try self.segmentPath(seg_id);
+            defer self.allocator.free(path);
+
+            const f = Dir.openFile(.cwd(), self.io(), path, .{ .mode = .read_only }) catch continue;
+            defer f.close(self.io());
+
+            const stat = f.stat(self.io()) catch continue;
+            if (stat.size == 0) continue;
+
+            var offset: u64 = 0;
+            var header_buf: [LogRecordHeader.SIZE]u8 = undefined;
+
+            while (offset + LogRecordHeader.SIZE <= stat.size) {
+                const header_bytes = f.readPositionalAll(self.io(), &header_buf, offset) catch break;
+                if (header_bytes != LogRecordHeader.SIZE) break;
+
+                const header: *const LogRecordHeader = @ptrCast(@alignCast(&header_buf));
+
+                if (@intFromEnum(header.record_type) == 0 or @intFromEnum(header.record_type) > 5) break;
+
+                var data_buf: []u8 = &.{};
+                if (header.data_len > 0) {
+                    data_buf = self.allocator.alloc(u8, header.data_len) catch break;
+                    defer self.allocator.free(data_buf);
+
+                    const data_bytes = f.readPositionalAll(self.io(), data_buf, offset + LogRecordHeader.SIZE) catch break;
+                    if (data_bytes != header.data_len) break;
+                }
+
+                if (!header.verify(data_buf)) break;
+
+                last_valid_lsn = header.lsn;
+                offset += LogRecordHeader.SIZE + header.data_len;
             }
-
-            // Valid record found
-            last_valid_lsn = header.lsn;
-            offset += LogRecordHeader.SIZE + header.data_len;
         }
 
         self.current_lsn = last_valid_lsn + 1;
         self.flushed_lsn = last_valid_lsn;
-        self.buffer_offset = offset;
     }
 
     /// Get the current (next) LSN
@@ -429,77 +516,147 @@ pub const Wal = struct {
         return self.flushed_lsn;
     }
 
-    /// Iterator for reading log records
+    /// Get the current segment ID
+    pub fn getCurrentSegmentId(self: *const Self) u64 {
+        return self.current_segment_id;
+    }
+
+    /// Iterator for reading log records across all segments.
     pub const LogIterator = struct {
-        wal: *Self,
+        allocator: std.mem.Allocator,
+        wal_dir: []const u8,
+        threaded: *Threaded,
+        segment_ids: []const u64,
+        current_seg_idx: usize,
+        current_file: ?File,
+        current_file_size: u64,
         offset: u64,
-        end_offset: u64,
+
+        fn iterIo(self: *LogIterator) Io {
+            return self.threaded.io();
+        }
 
         pub fn next(self: *LogIterator) WalError!?struct { header: LogRecordHeader, data: []const u8 } {
-            if (self.offset >= self.end_offset) {
-                return null;
-            }
+            while (true) {
+                // Open current segment if needed
+                if (self.current_file == null) {
+                    if (self.current_seg_idx >= self.segment_ids.len) return null;
+                    const seg_id = self.segment_ids[self.current_seg_idx];
+                    var name_buf: [SEGMENT_NAME_LEN]u8 = undefined;
+                    const name = formatSegmentName(&name_buf, seg_id);
+                    const path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.wal_dir, name }) catch return WalError.OutOfMemory;
+                    defer self.allocator.free(path);
 
-            const f = self.wal.file orelse return WalError.FileNotOpen;
-
-            // Read header
-            var header_buf: [LogRecordHeader.SIZE]u8 = undefined;
-            const header_bytes = f.readPositionalAll(self.wal.io(), &header_buf, self.offset) catch {
-                return WalError.ReadError;
-            };
-
-            if (header_bytes != LogRecordHeader.SIZE) {
-                return null;
-            }
-
-            const header: LogRecordHeader = @bitCast(header_buf);
-
-            // Read data
-            var data: []u8 = &.{};
-            if (header.data_len > 0) {
-                data = self.wal.allocator.alloc(u8, header.data_len) catch {
-                    return WalError.OutOfMemory;
-                };
-
-                const data_bytes = f.readPositionalAll(self.wal.io(), data, self.offset + LogRecordHeader.SIZE) catch {
-                    self.wal.allocator.free(data);
-                    return WalError.ReadError;
-                };
-
-                if (data_bytes != header.data_len) {
-                    self.wal.allocator.free(data);
-                    return WalError.CorruptedLog;
+                    self.current_file = Dir.openFile(.cwd(), self.iterIo(), path, .{ .mode = .read_only }) catch return WalError.ReadError;
+                    const stat = self.current_file.?.stat(self.iterIo()) catch return WalError.ReadError;
+                    self.current_file_size = stat.size;
+                    self.offset = 0;
                 }
-            }
 
-            // Verify checksum
-            if (!header.verify(data)) {
-                if (data.len > 0) self.wal.allocator.free(data);
-                return WalError.CorruptedLog;
-            }
+                const f = self.current_file.?;
 
-            self.offset += LogRecordHeader.SIZE + header.data_len;
-            return .{ .header = header, .data = data };
+                // Check if we've exhausted this segment
+                if (self.offset + LogRecordHeader.SIZE > self.current_file_size) {
+                    f.close(self.iterIo());
+                    self.current_file = null;
+                    self.current_seg_idx += 1;
+                    continue;
+                }
+
+                // Read header
+                var header_buf: [LogRecordHeader.SIZE]u8 = undefined;
+                const header_bytes = f.readPositionalAll(self.iterIo(), &header_buf, self.offset) catch return WalError.ReadError;
+                if (header_bytes != LogRecordHeader.SIZE) {
+                    // Partial header — move to next segment
+                    f.close(self.iterIo());
+                    self.current_file = null;
+                    self.current_seg_idx += 1;
+                    continue;
+                }
+
+                const header: LogRecordHeader = @bitCast(header_buf);
+
+                // Validate record type
+                if (@intFromEnum(header.record_type) == 0 or @intFromEnum(header.record_type) > 5) {
+                    // Corrupt — stop this segment
+                    f.close(self.iterIo());
+                    self.current_file = null;
+                    self.current_seg_idx += 1;
+                    continue;
+                }
+
+                // Read data
+                var data: []u8 = &.{};
+                if (header.data_len > 0) {
+                    data = self.allocator.alloc(u8, header.data_len) catch return WalError.OutOfMemory;
+                    const data_bytes = f.readPositionalAll(self.iterIo(), data, self.offset + LogRecordHeader.SIZE) catch {
+                        self.allocator.free(data);
+                        return WalError.ReadError;
+                    };
+                    if (data_bytes != header.data_len) {
+                        self.allocator.free(data);
+                        // Incomplete record — move to next segment
+                        f.close(self.iterIo());
+                        self.current_file = null;
+                        self.current_seg_idx += 1;
+                        continue;
+                    }
+                }
+
+                // Verify checksum
+                if (!header.verify(data)) {
+                    if (data.len > 0) self.allocator.free(data);
+                    // Corrupt — move to next segment
+                    f.close(self.iterIo());
+                    self.current_file = null;
+                    self.current_seg_idx += 1;
+                    continue;
+                }
+
+                self.offset += LogRecordHeader.SIZE + header.data_len;
+                return .{ .header = header, .data = data };
+            }
         }
 
         /// Free data returned by next()
         pub fn freeData(self: *LogIterator, data: []const u8) void {
             if (data.len > 0) {
-                self.wal.allocator.free(@constCast(data));
+                self.allocator.free(@constCast(data));
+            }
+        }
+
+        /// Close the iterator (release open file handle).
+        pub fn close(self: *LogIterator) void {
+            if (self.current_file) |f| {
+                f.close(self.iterIo());
+                self.current_file = null;
             }
         }
     };
 
-    /// Create an iterator to read log records
+    /// Create an iterator to read all log records across segments.
     pub fn iterator(self: *Self) WalError!LogIterator {
-        // Flush buffer first to ensure all records are on disk
+        // Flush buffer first
         try self.flush();
 
+        const segments = try self.listSegments();
+
         return .{
-            .wal = self,
+            .allocator = self.allocator,
+            .wal_dir = self.wal_dir,
+            .threaded = &self.threaded,
+            .segment_ids = segments,
+            .current_seg_idx = 0,
+            .current_file = null,
+            .current_file_size = 0,
             .offset = 0,
-            .end_offset = self.buffer_offset,
         };
+    }
+
+    /// Free resources held by an iterator (segment list).
+    pub fn freeIterator(self: *Self, iter: *LogIterator) void {
+        iter.close();
+        self.allocator.free(iter.segment_ids);
     }
 
     /// Recovery result
@@ -514,7 +671,6 @@ pub const Wal = struct {
     /// 2. Redo pass: for committed txns' update records, apply new_data to page
     /// 3. Undo pass: for active (uncommitted) txns' update records, apply old_data
     pub fn recover(self: *Self, buffer_pool: *BufferPool) WalError!RecoveryResult {
-        // Flush any buffered records to disk first
         try self.flush();
 
         // === Analysis pass ===
@@ -524,6 +680,7 @@ pub const Wal = struct {
         defer active_txns.deinit();
 
         var iter = try self.iterator();
+        defer self.freeIterator(&iter);
         while (try iter.next()) |record| {
             defer iter.freeData(record.data);
             switch (record.header.record_type) {
@@ -541,8 +698,9 @@ pub const Wal = struct {
             }
         }
 
-        // === Redo pass: apply committed txns' updates ===
+        // === Redo pass ===
         var redo_iter = try self.iterator();
+        defer self.freeIterator(&redo_iter);
         while (try redo_iter.next()) |record| {
             defer redo_iter.freeData(record.data);
             if (record.header.record_type == .update and committed_txns.contains(record.header.txn_id)) {
@@ -557,8 +715,7 @@ pub const Wal = struct {
             }
         }
 
-        // === Undo pass: reverse active (uncommitted) txns' updates ===
-        // Collect update records for active txns, then apply in reverse
+        // === Undo pass ===
         const UndoEntry = struct { page_id: PageId, offset: u16, old_data: []const u8 };
         var undo_records: std.ArrayList(UndoEntry) = .empty;
         defer {
@@ -569,6 +726,7 @@ pub const Wal = struct {
         }
 
         var undo_scan = try self.iterator();
+        defer self.freeIterator(&undo_scan);
         while (try undo_scan.next()) |record| {
             if (record.header.record_type == .update and active_txns.contains(record.header.txn_id)) {
                 const update_info = UpdateRecordData.deserialize(record.data) catch {
@@ -612,10 +770,67 @@ pub const Wal = struct {
         };
     }
 
-    /// Delete the WAL file (for testing)
-    pub fn deleteFile(self: *Self) void {
+    /// Archive completed segments older than `keep_segment_id`.
+    /// Moves segment files to the `archive/` subdirectory.
+    pub fn archiveOldSegments(self: *Self, keep_segment_id: u64) WalError!u32 {
+        // Ensure archive dir exists
+        const archive_dir = std.fmt.allocPrint(self.allocator, "{s}/archive", .{self.wal_dir}) catch return WalError.OutOfMemory;
+        defer self.allocator.free(archive_dir);
+        Dir.createDir(.cwd(), self.io(), archive_dir, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return WalError.WriteError,
+        };
+
+        const segments = try self.listSegments();
+        defer self.allocator.free(segments);
+
+        var archived: u32 = 0;
+        for (segments) |seg_id| {
+            if (seg_id >= keep_segment_id) continue;
+            // Don't archive the current segment
+            if (seg_id == self.current_segment_id) continue;
+
+            const src_path = try self.segmentPath(seg_id);
+            defer self.allocator.free(src_path);
+            const dst_path = try self.archiveSegmentPath(seg_id);
+            defer self.allocator.free(dst_path);
+
+            // Rename src to dst (move to archive)
+            Dir.rename(.cwd(), src_path, .cwd(), dst_path, self.io()) catch continue;
+            archived += 1;
+        }
+
+        return archived;
+    }
+
+    /// Delete all WAL segment files and archive (for testing).
+    pub fn deleteFiles(self: *Self) void {
         self.close();
-        Dir.deleteFile(.cwd(), self.io(), self.file_path) catch {};
+
+        // Delete active segments
+        const segments = self.listSegments() catch &.{};
+        if (segments.len > 0) {
+            for (segments) |seg_id| {
+                const path = self.segmentPath(seg_id) catch continue;
+                Dir.deleteFile(.cwd(), self.io(), path) catch {};
+                self.allocator.free(path);
+            }
+            self.allocator.free(segments);
+        }
+
+        // Delete archive segments
+        const archive_dir = std.fmt.allocPrint(self.allocator, "{s}/archive", .{self.wal_dir}) catch return;
+        defer self.allocator.free(archive_dir);
+        // Try to delete archive dir (may not exist)
+        Dir.deleteDir(.cwd(), self.io(), archive_dir) catch {};
+
+        // Delete the WAL dir itself
+        Dir.deleteDir(.cwd(), self.io(), self.wal_dir) catch {};
+    }
+
+    /// Delete the WAL file (legacy compat name — calls deleteFiles)
+    pub fn deleteFile(self: *Self) void {
+        self.deleteFiles();
     }
 };
 
@@ -624,15 +839,14 @@ const disk_manager_mod = @import("disk_manager.zig");
 const DiskManager = disk_manager_mod.DiskManager;
 
 test "wal basic operations" {
-    const test_file = "test_wal_basic.log";
+    const test_dir = "test_wal_basic_dir";
 
-    var wal = Wal.init(std.testing.allocator, test_file);
-    defer wal.deleteFile();
+    var wal = Wal.init(std.testing.allocator, test_dir);
+    defer wal.deleteFiles();
     defer wal.deinit();
 
     try wal.open();
 
-    // Log a transaction
     const txn_id: TxnId = 1;
     const begin_lsn = try wal.logBegin(txn_id);
     try std.testing.expectEqual(@as(Lsn, 1), begin_lsn);
@@ -640,15 +854,14 @@ test "wal basic operations" {
     const commit_lsn = try wal.logCommit(txn_id, begin_lsn);
     try std.testing.expectEqual(@as(Lsn, 2), commit_lsn);
 
-    // Verify flushed
     try std.testing.expectEqual(@as(Lsn, 2), wal.getFlushedLsn());
 }
 
 test "wal update records" {
-    const test_file = "test_wal_update.log";
+    const test_dir = "test_wal_update_dir";
 
-    var wal = Wal.init(std.testing.allocator, test_file);
-    defer wal.deleteFile();
+    var wal = Wal.init(std.testing.allocator, test_dir);
+    defer wal.deleteFiles();
     defer wal.deinit();
 
     try wal.open();
@@ -656,7 +869,6 @@ test "wal update records" {
     const txn_id: TxnId = 1;
     const begin_lsn = try wal.logBegin(txn_id);
 
-    // Log an update
     const old_data = "old value";
     const new_data = "new value";
     const update_lsn = try wal.logUpdate(txn_id, begin_lsn, 42, 100, old_data, new_data);
@@ -667,11 +879,11 @@ test "wal update records" {
 }
 
 test "wal persistence and recovery" {
-    const test_file = "test_wal_persist.log";
+    const test_dir = "test_wal_persist_dir";
 
-    // First session - write some records
+    // First session
     {
-        var wal = Wal.init(std.testing.allocator, test_file);
+        var wal = Wal.init(std.testing.allocator, test_dir);
         defer wal.deinit();
 
         try wal.open();
@@ -684,36 +896,34 @@ test "wal persistence and recovery" {
         try std.testing.expectEqual(@as(Lsn, 4), wal.getFlushedLsn());
     }
 
-    // Second session - should recover state
+    // Second session — should recover state
     {
-        var wal = Wal.init(std.testing.allocator, test_file);
-        defer wal.deleteFile();
+        var wal = Wal.init(std.testing.allocator, test_dir);
+        defer wal.deleteFiles();
         defer wal.deinit();
 
         try wal.open();
 
-        // Should continue from where we left off
         try std.testing.expectEqual(@as(Lsn, 5), wal.getCurrentLsn());
         try std.testing.expectEqual(@as(Lsn, 4), wal.getFlushedLsn());
     }
 }
 
 test "wal iterator" {
-    const test_file = "test_wal_iterator.log";
+    const test_dir = "test_wal_iterator_dir";
 
-    var wal = Wal.init(std.testing.allocator, test_file);
-    defer wal.deleteFile();
+    var wal = Wal.init(std.testing.allocator, test_dir);
+    defer wal.deleteFiles();
     defer wal.deinit();
 
     try wal.open();
 
-    // Write some records
     _ = try wal.logBegin(1);
     _ = try wal.logUpdate(1, 1, 10, 0, "old", "new");
     _ = try wal.logCommit(1, 2);
 
-    // Read them back
     var iter = try wal.iterator();
+    defer wal.freeIterator(&iter);
     var count: usize = 0;
     var types: [3]LogRecordType = undefined;
 
@@ -732,10 +942,10 @@ test "wal iterator" {
 }
 
 test "wal checkpoint" {
-    const test_file = "test_wal_checkpoint.log";
+    const test_dir = "test_wal_checkpoint_dir";
 
-    var wal = Wal.init(std.testing.allocator, test_file);
-    defer wal.deleteFile();
+    var wal = Wal.init(std.testing.allocator, test_dir);
+    defer wal.deleteFiles();
     defer wal.deinit();
 
     try wal.open();
@@ -743,24 +953,21 @@ test "wal checkpoint" {
     _ = try wal.logBegin(1);
     _ = try wal.logCommit(1, 1);
 
-    // Log checkpoint
     const cp_lsn = try wal.logCheckpoint();
     try std.testing.expectEqual(@as(Lsn, 3), cp_lsn);
 
-    // Checkpoint should force flush
     try std.testing.expectEqual(@as(Lsn, 3), wal.getFlushedLsn());
 }
 
 test "wal multiple transactions" {
-    const test_file = "test_wal_multi_txn.log";
+    const test_dir = "test_wal_multi_txn_dir";
 
-    var wal = Wal.init(std.testing.allocator, test_file);
-    defer wal.deleteFile();
+    var wal = Wal.init(std.testing.allocator, test_dir);
+    defer wal.deleteFiles();
     defer wal.deinit();
 
     try wal.open();
 
-    // Interleaved transactions
     const t1_begin = try wal.logBegin(1);
     const t2_begin = try wal.logBegin(2);
     const t1_update = try wal.logUpdate(1, t1_begin, 1, 0, "a", "b");
@@ -768,13 +975,12 @@ test "wal multiple transactions" {
     _ = try wal.logCommit(1, t1_update);
     _ = try wal.logAbort(2, t2_update);
 
-    // Commit flushes up to LSN 5, abort (LSN 6) is still in buffer
     try std.testing.expectEqual(@as(Lsn, 5), wal.getFlushedLsn());
     try wal.flush();
     try std.testing.expectEqual(@as(Lsn, 6), wal.getFlushedLsn());
 
-    // Verify via iterator
     var iter = try wal.iterator();
+    defer wal.freeIterator(&iter);
     var count: usize = 0;
     while (try iter.next()) |record| {
         defer iter.freeData(record.data);
@@ -783,9 +989,111 @@ test "wal multiple transactions" {
     try std.testing.expectEqual(@as(usize, 6), count);
 }
 
+test "wal segment rotation" {
+    const test_dir = "test_wal_rotation_dir";
+
+    var wal = Wal.init(std.testing.allocator, test_dir);
+    defer wal.deleteFiles();
+    defer wal.deinit();
+
+    // Use a tiny segment size to force rotation
+    wal.segment_max_size = 128; // 128 bytes — a single record + header is ~40+ bytes
+
+    try wal.open();
+
+    try std.testing.expectEqual(@as(u64, 1), wal.getCurrentSegmentId());
+
+    // Write enough records to trigger rotation
+    _ = try wal.logBegin(1);
+    _ = try wal.logUpdate(1, 1, 10, 0, "old_data_here!", "new_data_here!");
+    _ = try wal.logUpdate(1, 2, 11, 0, "more_old_data!", "more_new_data!");
+    _ = try wal.logCommit(1, 3);
+
+    // Should have rotated to a new segment
+    try std.testing.expect(wal.getCurrentSegmentId() > 1);
+
+    // All records should still be readable via iterator
+    var iter = try wal.iterator();
+    defer wal.freeIterator(&iter);
+    var count: usize = 0;
+    while (try iter.next()) |record| {
+        defer iter.freeData(record.data);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), count);
+}
+
+test "wal segment rotation persistence" {
+    const test_dir = "test_wal_rot_persist_dir";
+
+    // First session — write across multiple segments
+    {
+        var wal = Wal.init(std.testing.allocator, test_dir);
+        defer wal.deinit();
+        wal.segment_max_size = 128;
+        try wal.open();
+
+        _ = try wal.logBegin(1);
+        _ = try wal.logUpdate(1, 1, 10, 0, "old_data_here!", "new_data_here!");
+        _ = try wal.logUpdate(1, 2, 11, 0, "more_old_data!", "more_new_data!");
+        _ = try wal.logCommit(1, 3);
+    }
+
+    // Second session — should recover all records across segments
+    {
+        var wal = Wal.init(std.testing.allocator, test_dir);
+        defer wal.deleteFiles();
+        defer wal.deinit();
+        try wal.open();
+
+        try std.testing.expectEqual(@as(Lsn, 5), wal.getCurrentLsn());
+
+        var iter = try wal.iterator();
+        defer wal.freeIterator(&iter);
+        var count: usize = 0;
+        while (try iter.next()) |record| {
+            defer iter.freeData(record.data);
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 4), count);
+    }
+}
+
+test "wal archive old segments" {
+    const test_dir = "test_wal_archive_dir";
+
+    var wal = Wal.init(std.testing.allocator, test_dir);
+    defer wal.deleteFiles();
+    defer wal.deinit();
+    wal.segment_max_size = 128;
+    try wal.open();
+
+    // Write enough to create multiple segments
+    _ = try wal.logBegin(1);
+    _ = try wal.logUpdate(1, 1, 10, 0, "old_data_here!", "new_data_here!");
+    _ = try wal.logUpdate(1, 2, 11, 0, "more_old_data!", "more_new_data!");
+    _ = try wal.logCommit(1, 3);
+    _ = try wal.logBegin(2);
+    _ = try wal.logUpdate(2, 5, 12, 0, "aaaa_old_data!", "aaaa_new_data!");
+    _ = try wal.logCommit(2, 6);
+
+    const current_seg = wal.getCurrentSegmentId();
+    try std.testing.expect(current_seg > 1);
+
+    // Archive all segments before the current one
+    const archived = try wal.archiveOldSegments(current_seg);
+    try std.testing.expect(archived > 0);
+
+    // Only current segment should remain in active list
+    const remaining = try wal.listSegments();
+    defer std.testing.allocator.free(remaining);
+    try std.testing.expectEqual(@as(usize, 1), remaining.len);
+    try std.testing.expectEqual(current_seg, remaining[0]);
+}
+
 test "recovery redo committed" {
     const db_file = "test_recovery_redo.db";
-    const wal_file = "test_recovery_redo.log";
+    const wal_dir = "test_recovery_redo_wal";
 
     var dm = DiskManager.init(std.testing.allocator, db_file);
     defer dm.deleteFile();
@@ -795,19 +1103,16 @@ test "recovery redo committed" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
     defer bp.deinit();
 
-    // Allocate a page and write initial data
     const result = bp.newPage() catch unreachable;
     const page_id = result.page_id;
 
-    // Write "AAAA" at offset 100 in the page
     const old_data = "AAAA";
     const new_data = "BBBB";
     @memcpy(result.page.data[100..104], old_data);
     bp.unpinPage(page_id, true) catch {};
 
-    // Create WAL and log a committed update: old_data → new_data at offset 100
-    var wal = Wal.init(std.testing.allocator, wal_file);
-    defer wal.deleteFile();
+    var wal = Wal.init(std.testing.allocator, wal_dir);
+    defer wal.deleteFiles();
     defer wal.deinit();
     try wal.open();
 
@@ -815,17 +1120,14 @@ test "recovery redo committed" {
     const update_lsn = try wal.logUpdate(1, begin_lsn, page_id, 100, old_data, new_data);
     _ = try wal.logCommit(1, update_lsn);
 
-    // Simulate crash: reset the page data back to old value
     var pg = bp.fetchPage(page_id) catch unreachable;
     @memcpy(pg.data[100..104], old_data);
     bp.unpinPage(page_id, true) catch {};
 
-    // Run recovery — should redo the committed update
     const recovery_result = try wal.recover(&bp);
     try std.testing.expectEqual(@as(u32, 1), recovery_result.committed_count);
     try std.testing.expectEqual(@as(u32, 0), recovery_result.aborted_count);
 
-    // Verify the page has the new data
     var pg2 = bp.fetchPage(page_id) catch unreachable;
     try std.testing.expectEqualSlices(u8, new_data, pg2.data[100..104]);
     bp.unpinPage(page_id, false) catch {};
@@ -833,7 +1135,7 @@ test "recovery redo committed" {
 
 test "recovery undo active" {
     const db_file = "test_recovery_undo.db";
-    const wal_file = "test_recovery_undo.log";
+    const wal_dir = "test_recovery_undo_wal";
 
     var dm = DiskManager.init(std.testing.allocator, db_file);
     defer dm.deleteFile();
@@ -843,7 +1145,6 @@ test "recovery undo active" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
     defer bp.deinit();
 
-    // Allocate a page and write initial data
     const result = bp.newPage() catch unreachable;
     const page_id = result.page_id;
 
@@ -852,27 +1153,22 @@ test "recovery undo active" {
     @memcpy(result.page.data[200..204], old_data);
     bp.unpinPage(page_id, true) catch {};
 
-    // Create WAL: BEGIN + UPDATE but NO COMMIT (active/uncommitted txn)
-    var wal = Wal.init(std.testing.allocator, wal_file);
-    defer wal.deleteFile();
+    var wal = Wal.init(std.testing.allocator, wal_dir);
+    defer wal.deleteFiles();
     defer wal.deinit();
     try wal.open();
 
     const begin_lsn = try wal.logBegin(1);
     _ = try wal.logUpdate(1, begin_lsn, page_id, 200, old_data, new_data);
-    // No commit! Txn 1 is still active.
 
-    // Simulate the uncommitted change being applied to the page
     var pg = bp.fetchPage(page_id) catch unreachable;
     @memcpy(pg.data[200..204], new_data);
     bp.unpinPage(page_id, true) catch {};
 
-    // Run recovery — should undo the active txn's update
     const recovery_result = try wal.recover(&bp);
     try std.testing.expectEqual(@as(u32, 0), recovery_result.committed_count);
     try std.testing.expectEqual(@as(u32, 1), recovery_result.aborted_count);
 
-    // Verify the page has been restored to old data
     var pg2 = bp.fetchPage(page_id) catch unreachable;
     try std.testing.expectEqualSlices(u8, old_data, pg2.data[200..204]);
     bp.unpinPage(page_id, false) catch {};
@@ -880,7 +1176,7 @@ test "recovery undo active" {
 
 test "recovery mixed committed and active" {
     const db_file = "test_recovery_mixed.db";
-    const wal_file = "test_recovery_mixed.log";
+    const wal_dir = "test_recovery_mixed_wal";
 
     var dm = DiskManager.init(std.testing.allocator, db_file);
     defer dm.deleteFile();
@@ -893,38 +1189,31 @@ test "recovery mixed committed and active" {
     const result = bp.newPage() catch unreachable;
     const page_id = result.page_id;
 
-    // Initial state: "1111" at offset 100, "aaaa" at offset 200
     @memcpy(result.page.data[100..104], "1111");
     @memcpy(result.page.data[200..204], "aaaa");
     bp.unpinPage(page_id, true) catch {};
 
-    var wal = Wal.init(std.testing.allocator, wal_file);
-    defer wal.deleteFile();
+    var wal = Wal.init(std.testing.allocator, wal_dir);
+    defer wal.deleteFiles();
     defer wal.deinit();
     try wal.open();
 
-    // Txn 1: committed — updates offset 100 from "1111" to "2222"
     const t1_begin = try wal.logBegin(1);
     const t1_update = try wal.logUpdate(1, t1_begin, page_id, 100, "1111", "2222");
     _ = try wal.logCommit(1, t1_update);
 
-    // Txn 2: active (no commit) — updates offset 200 from "aaaa" to "bbbb"
     const t2_begin = try wal.logBegin(2);
     _ = try wal.logUpdate(2, t2_begin, page_id, 200, "aaaa", "bbbb");
-    // No commit for txn 2
 
-    // Simulate crash: page has old values (committed change lost, uncommitted applied)
     var pg = bp.fetchPage(page_id) catch unreachable;
-    @memcpy(pg.data[100..104], "1111"); // committed change lost
-    @memcpy(pg.data[200..204], "bbbb"); // uncommitted change applied
+    @memcpy(pg.data[100..104], "1111");
+    @memcpy(pg.data[200..204], "bbbb");
     bp.unpinPage(page_id, true) catch {};
 
-    // Run recovery
     const recovery_result = try wal.recover(&bp);
     try std.testing.expectEqual(@as(u32, 1), recovery_result.committed_count);
     try std.testing.expectEqual(@as(u32, 1), recovery_result.aborted_count);
 
-    // Verify: offset 100 should be "2222" (redone), offset 200 should be "aaaa" (undone)
     var pg2 = bp.fetchPage(page_id) catch unreachable;
     try std.testing.expectEqualSlices(u8, "2222", pg2.data[100..104]);
     try std.testing.expectEqualSlices(u8, "aaaa", pg2.data[200..204]);
@@ -933,7 +1222,7 @@ test "recovery mixed committed and active" {
 
 test "recovery empty WAL" {
     const db_file = "test_recovery_empty.db";
-    const wal_file = "test_recovery_empty.log";
+    const wal_dir = "test_recovery_empty_wal";
 
     var dm = DiskManager.init(std.testing.allocator, db_file);
     defer dm.deleteFile();
@@ -943,12 +1232,11 @@ test "recovery empty WAL" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
     defer bp.deinit();
 
-    var wal = Wal.init(std.testing.allocator, wal_file);
-    defer wal.deleteFile();
+    var wal = Wal.init(std.testing.allocator, wal_dir);
+    defer wal.deleteFiles();
     defer wal.deinit();
     try wal.open();
 
-    // Recovery on empty WAL should succeed with zero counts
     const result = try wal.recover(&bp);
     try std.testing.expectEqual(@as(u32, 0), result.committed_count);
     try std.testing.expectEqual(@as(u32, 0), result.aborted_count);
@@ -956,7 +1244,7 @@ test "recovery empty WAL" {
 
 test "recovery idempotent run twice" {
     const db_file = "test_recovery_idempotent.db";
-    const wal_file = "test_recovery_idempotent.log";
+    const wal_dir = "test_recovery_idempotent_wal";
 
     var dm = DiskManager.init(std.testing.allocator, db_file);
     defer dm.deleteFile();
@@ -971,8 +1259,8 @@ test "recovery idempotent run twice" {
     @memcpy(new_page.page.data[50..54], "AAAA");
     bp.unpinPage(page_id, true) catch {};
 
-    var wal = Wal.init(std.testing.allocator, wal_file);
-    defer wal.deleteFile();
+    var wal = Wal.init(std.testing.allocator, wal_dir);
+    defer wal.deleteFiles();
     defer wal.deinit();
     try wal.open();
 
@@ -980,16 +1268,13 @@ test "recovery idempotent run twice" {
     const update_lsn = try wal.logUpdate(1, begin_lsn, page_id, 50, "AAAA", "BBBB");
     _ = try wal.logCommit(1, update_lsn);
 
-    // First recovery
     const r1 = try wal.recover(&bp);
     try std.testing.expectEqual(@as(u32, 1), r1.committed_count);
 
-    // Verify data after first recovery
     var pg1 = bp.fetchPage(page_id) catch unreachable;
     try std.testing.expectEqualSlices(u8, "BBBB", pg1.data[50..54]);
     bp.unpinPage(page_id, false) catch {};
 
-    // Second recovery — should be idempotent, data still "BBBB"
     const r2 = try wal.recover(&bp);
     try std.testing.expectEqual(@as(u32, 1), r2.committed_count);
 
@@ -1000,7 +1285,7 @@ test "recovery idempotent run twice" {
 
 test "recovery all active no commits" {
     const db_file = "test_recovery_all_active.db";
-    const wal_file = "test_recovery_all_active.log";
+    const wal_dir = "test_recovery_all_active_wal";
 
     var dm = DiskManager.init(std.testing.allocator, db_file);
     defer dm.deleteFile();
@@ -1015,29 +1300,25 @@ test "recovery all active no commits" {
     @memcpy(new_page.page.data[0..4], "ORIG");
     bp.unpinPage(page_id, true) catch {};
 
-    var wal = Wal.init(std.testing.allocator, wal_file);
-    defer wal.deleteFile();
+    var wal = Wal.init(std.testing.allocator, wal_dir);
+    defer wal.deleteFiles();
     defer wal.deinit();
     try wal.open();
 
-    // Two BEGINs with updates, no commits
     const b1 = try wal.logBegin(1);
     _ = try wal.logUpdate(1, b1, page_id, 0, "ORIG", "AAA1");
     const b2 = try wal.logBegin(2);
     _ = try wal.logUpdate(2, b2, page_id, 4, "ORIG", "BBB2");
 
-    // Simulate the uncommitted writes being applied
     var pg = bp.fetchPage(page_id) catch unreachable;
     @memcpy(pg.data[0..4], "AAA1");
     @memcpy(pg.data[4..8], "BBB2");
     bp.unpinPage(page_id, true) catch {};
 
-    // Recovery should undo both
     const result = try wal.recover(&bp);
     try std.testing.expectEqual(@as(u32, 0), result.committed_count);
     try std.testing.expectEqual(@as(u32, 2), result.aborted_count);
 
-    // Verify both restored
     var pg2 = bp.fetchPage(page_id) catch unreachable;
     try std.testing.expectEqualSlices(u8, "ORIG", pg2.data[0..4]);
     try std.testing.expectEqualSlices(u8, "ORIG", pg2.data[4..8]);
@@ -1046,7 +1327,7 @@ test "recovery all active no commits" {
 
 test "recovery multiple updates same page" {
     const db_file = "test_recovery_multi_update.db";
-    const wal_file = "test_recovery_multi_update.log";
+    const wal_dir = "test_recovery_multi_update_wal";
 
     var dm = DiskManager.init(std.testing.allocator, db_file);
     defer dm.deleteFile();
@@ -1061,24 +1342,21 @@ test "recovery multiple updates same page" {
     @memcpy(new_page.page.data[100..104], "AAAA");
     bp.unpinPage(page_id, true) catch {};
 
-    var wal = Wal.init(std.testing.allocator, wal_file);
-    defer wal.deleteFile();
+    var wal = Wal.init(std.testing.allocator, wal_dir);
+    defer wal.deleteFiles();
     defer wal.deinit();
     try wal.open();
 
-    // Chain of updates: AAAA → BBBB → CCCC → DDDD (all committed)
     const b = try wal.logBegin(1);
     const upd1 = try wal.logUpdate(1, b, page_id, 100, "AAAA", "BBBB");
     const upd2 = try wal.logUpdate(1, upd1, page_id, 100, "BBBB", "CCCC");
     const upd3 = try wal.logUpdate(1, upd2, page_id, 100, "CCCC", "DDDD");
     _ = try wal.logCommit(1, upd3);
 
-    // Simulate crash: page still has AAAA
     var pg = bp.fetchPage(page_id) catch unreachable;
     @memcpy(pg.data[100..104], "AAAA");
     bp.unpinPage(page_id, true) catch {};
 
-    // Recovery should replay all 3 updates, ending with DDDD
     const result = try wal.recover(&bp);
     try std.testing.expectEqual(@as(u32, 1), result.committed_count);
 
@@ -1089,7 +1367,7 @@ test "recovery multiple updates same page" {
 
 test "recovery abort with no updates" {
     const db_file = "test_recovery_abort_noop.db";
-    const wal_file = "test_recovery_abort_noop.log";
+    const wal_dir = "test_recovery_abort_noop_wal";
 
     var dm = DiskManager.init(std.testing.allocator, db_file);
     defer dm.deleteFile();
@@ -1099,20 +1377,63 @@ test "recovery abort with no updates" {
     var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
     defer bp.deinit();
 
-    var wal = Wal.init(std.testing.allocator, wal_file);
-    defer wal.deleteFile();
+    var wal = Wal.init(std.testing.allocator, wal_dir);
+    defer wal.deleteFiles();
     defer wal.deinit();
     try wal.open();
 
-    // BEGIN with no updates, then abort
     _ = try wal.logBegin(1);
-    // txn 1 is active (no commit, no abort logged before crash)
 
-    // BEGIN + COMMIT with no updates
     _ = try wal.logBegin(2);
     _ = try wal.logCommit(2, 0);
 
     const result = try wal.recover(&bp);
     try std.testing.expectEqual(@as(u32, 1), result.committed_count);
     try std.testing.expectEqual(@as(u32, 1), result.aborted_count);
+}
+
+test "recovery across multiple segments" {
+    const db_file = "test_recovery_multi_seg.db";
+    const wal_dir = "test_recovery_multi_seg_wal";
+
+    var dm = DiskManager.init(std.testing.allocator, db_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 20);
+    defer bp.deinit();
+
+    const new_page = bp.newPage() catch unreachable;
+    const page_id = new_page.page_id;
+    @memcpy(new_page.page.data[100..104], "AAAA");
+    bp.unpinPage(page_id, true) catch {};
+
+    var wal = Wal.init(std.testing.allocator, wal_dir);
+    defer wal.deleteFiles();
+    defer wal.deinit();
+    wal.segment_max_size = 128; // Tiny segments
+    try wal.open();
+
+    // Write a committed txn — updates should span multiple segments
+    const b = try wal.logBegin(1);
+    const upd1 = try wal.logUpdate(1, b, page_id, 100, "AAAA", "BBBB");
+    const upd2 = try wal.logUpdate(1, upd1, page_id, 100, "BBBB", "CCCC");
+    _ = try wal.logCommit(1, upd2);
+
+    // Should have rotated past segment 1
+    try std.testing.expect(wal.getCurrentSegmentId() > 1);
+
+    // Simulate crash
+    var pg = bp.fetchPage(page_id) catch unreachable;
+    @memcpy(pg.data[100..104], "AAAA");
+    bp.unpinPage(page_id, true) catch {};
+
+    // Recovery should replay from all segments
+    const result = try wal.recover(&bp);
+    try std.testing.expectEqual(@as(u32, 1), result.committed_count);
+
+    var pg2 = bp.fetchPage(page_id) catch unreachable;
+    try std.testing.expectEqualSlices(u8, "CCCC", pg2.data[100..104]);
+    bp.unpinPage(page_id, false) catch {};
 }
