@@ -26,6 +26,7 @@ const Snapshot = mvcc_mod.Snapshot;
 const UndoLog = undo_log_mod.UndoLog;
 const UndoRecordHeader = undo_log_mod.UndoRecordHeader;
 const AllocManager = alloc_map_mod.AllocManager;
+const Pfs = alloc_map_mod.Pfs;
 const Iam = iam_mod.Iam;
 const IamChainIterator = iam_mod.IamChainIterator;
 const EXTENT_SIZE = alloc_map_mod.EXTENT_SIZE;
@@ -136,6 +137,44 @@ pub const Table = struct {
             buffer_pool.unpinPage(iam_page_id, true) catch {};
         }
 
+        // Initialize data pages 2-7 to prevent stale buffer pool data
+        for (2..EXTENT_SIZE) |offset| {
+            const data_page_id: PageId = first_page + @as(PageId, @intCast(offset));
+            var pg = buffer_pool.fetchPage(data_page_id) catch return TableError.BufferPoolError;
+            pg = Page.init(pg.data, data_page_id);
+            buffer_pool.unpinPage(data_page_id, true) catch {};
+        }
+
+        // Set PFS entries for all pages in this extent
+        {
+            const file_header_mod = @import("file_header.zig");
+            var pfs_pg = buffer_pool.fetchPage(file_header_mod.PFS_PAGE) catch return TableError.BufferPoolError;
+            // Meta page: compute actual free space category
+            {
+                var meta_pg = buffer_pool.fetchPage(table_id) catch {
+                    buffer_pool.unpinPage(file_header_mod.PFS_PAGE, false) catch {};
+                    return TableError.BufferPoolError;
+                };
+                const meta_free = meta_pg.getFreeSpace();
+                buffer_pool.unpinPage(table_id, false) catch {};
+                Pfs.updateFreeSpace(pfs_pg.data, table_id, Pfs.freeSpaceCategory(meta_free));
+            }
+            // IAM page: full from data perspective
+            Pfs.setEntry(pfs_pg.data, iam_page_id, .{
+                .allocated = true,
+                .free_space = 4,
+                .page_type = 0,
+                .iam_page = true,
+                .mixed_extent = false,
+            });
+            // Data pages 2-7: empty (category 0)
+            for (2..EXTENT_SIZE) |offset| {
+                const data_page_id: PageId = first_page + @as(PageId, @intCast(offset));
+                Pfs.updateFreeSpace(pfs_pg.data, data_page_id, 0);
+            }
+            buffer_pool.unpinPage(file_header_mod.PFS_PAGE, true) catch {};
+        }
+
         return Self{
             .allocator = allocator,
             .buffer_pool = buffer_pool,
@@ -215,10 +254,15 @@ pub const Table = struct {
         // Read metadata to get IAM page ID
         const meta = try self.readMeta();
 
-        // Walk IAM chain to find a page with free space
+        // Walk IAM chain to find a page with free space (PFS-aware)
         var iam_iter = IamChainIterator.init(self.buffer_pool, meta.iam_page_id);
         while (iam_iter.next()) |extent_id| {
             const ext_start: PageId = @intCast(extent_id * EXTENT_SIZE);
+
+            // Batch-read PFS entries for this extent
+            const pfs_entries = self.alloc_manager.getExtentPfsEntries(ext_start) catch {
+                return TableError.BufferPoolError;
+            };
 
             for (0..EXTENT_SIZE) |offset| {
                 const page_id: PageId = ext_start + @as(PageId, @intCast(offset));
@@ -226,11 +270,14 @@ pub const Table = struct {
                 // Skip IAM page
                 if (page_id == meta.iam_page_id) continue;
 
+                // Skip pages marked full in PFS
+                if (pfs_entries[offset].free_space == 4) continue;
+
                 var pg = self.buffer_pool.fetchPage(page_id) catch {
                     return TableError.BufferPoolError;
                 };
 
-                // Check if page is uninitialized (allocated but never written)
+                // Defense-in-depth: init truly uninitialized pages
                 const pg_header = pg.getHeader();
                 if (pg_header.free_space_end == 0) {
                     pg = Page.init(pg.data, page_id);
@@ -238,6 +285,8 @@ pub const Table = struct {
 
                 const slot_id = pg.insertTuple(tuple_data);
                 if (slot_id) |sid| {
+                    // Update PFS with actual free space after insert
+                    self.alloc_manager.updatePfsFreeSpace(page_id, pg.getFreeSpace()) catch {};
                     self.buffer_pool.unpinPage(page_id, true) catch {};
                     try self.incrementTupleCount();
 
@@ -250,6 +299,8 @@ pub const Table = struct {
                     return tid;
                 }
 
+                // Page is full — update PFS to category 4
+                self.alloc_manager.updatePfsFreeSpace(page_id, 0) catch {};
                 self.buffer_pool.unpinPage(page_id, false) catch {};
             }
         }
@@ -265,17 +316,28 @@ pub const Table = struct {
             self.buffer_pool.unpinPage(meta.iam_page_id, true) catch {};
         }
 
-        // Initialize and insert into first page of new extent
+        // Initialize ALL pages in the new extent and set PFS to empty
+        for (0..EXTENT_SIZE) |offset| {
+            const data_page_id: PageId = new_start + @as(PageId, @intCast(offset));
+            var pg = self.buffer_pool.fetchPage(data_page_id) catch return TableError.BufferPoolError;
+            pg = Page.init(pg.data, data_page_id);
+            const free_space = pg.getFreeSpace();
+            self.buffer_pool.unpinPage(data_page_id, true) catch {};
+            self.alloc_manager.updatePfsFreeSpace(data_page_id, free_space) catch {};
+        }
+
+        // Insert into first page of new extent
         var new_pg = self.buffer_pool.fetchPage(new_start) catch {
             return TableError.BufferPoolError;
         };
-        new_pg = Page.init(new_pg.data, new_start);
 
         const slot_id = new_pg.insertTuple(tuple_data) orelse {
             self.buffer_pool.unpinPage(new_start, false) catch {};
             return TableError.TupleTooBig;
         };
 
+        // Update PFS for the page we just inserted into
+        self.alloc_manager.updatePfsFreeSpace(new_start, new_pg.getFreeSpace()) catch {};
         self.buffer_pool.unpinPage(new_start, true) catch {};
         try self.incrementTupleCount();
 
@@ -1787,4 +1849,126 @@ test "freeAllExtents releases to GAM" {
         defer bp.unpinPage(file_header.GAM_PAGE, false) catch {};
         try std.testing.expect(Gam.isExtentFree(gam_pg.data, table_extent_id));
     }
+}
+
+test "create/drop/create extent reuse no crash" {
+    const test_file = "test_table_extent_reuse.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
+    try dm.open();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 128);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+            .{ .name = "data", .col_type = .text, .max_length = 0, .nullable = false },
+        },
+    };
+
+    // Create table A and insert rows
+    var table_a = try Table.create(std.testing.allocator, &bp, &schema, &am);
+    var i: i32 = 0;
+    while (i < 10) : (i += 1) {
+        var name_buf: [64]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "row_a_{}", .{i}) catch unreachable;
+        _ = try table_a.insertTuple(null, &.{ .{ .integer = i }, .{ .bytes = name } });
+    }
+    try std.testing.expectEqual(@as(u64, 10), try table_a.tupleCount());
+
+    // Drop table A (free all its extents)
+    try table_a.freeAllExtents();
+
+    // Create table B — should reuse the freed extent
+    var table_b = try Table.create(std.testing.allocator, &bp, &schema, &am);
+
+    // Insert into B — must not crash from stale data
+    i = 0;
+    while (i < 10) : (i += 1) {
+        var name_buf: [64]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "row_b_{}", .{i}) catch unreachable;
+        _ = try table_b.insertTuple(null, &.{ .{ .integer = i + 100 }, .{ .bytes = name } });
+    }
+    try std.testing.expectEqual(@as(u64, 10), try table_b.tupleCount());
+
+    // Scan B and verify correct data
+    var iter = try table_b.scan();
+    var count: usize = 0;
+    while (try iter.next()) |row| {
+        defer iter.freeValues(row.values);
+        try std.testing.expect(row.values[0].integer >= 100);
+        try std.testing.expect(row.values[0].integer < 110);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 10), count);
+}
+
+test "PFS marks full pages as category 4" {
+    const file_header_mod = @import("file_header.zig");
+
+    const test_file = "test_table_pfs_full.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
+    try dm.open();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 128);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+            .{ .name = "data", .col_type = .text, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var table = try Table.create(std.testing.allocator, &bp, &schema, &am);
+
+    // Insert large rows to fill pages — 512-byte data per row
+    var large_buf: [512]u8 = undefined;
+    @memset(&large_buf, 'X');
+
+    // Insert enough to fill the first extent (6 data pages) and overflow into second
+    var i: i32 = 0;
+    while (i < 80) : (i += 1) {
+        _ = try table.insertTuple(null, &.{ .{ .integer = i }, .{ .bytes = &large_buf } });
+    }
+
+    // Check PFS: data pages in first extent that are full should have category 4
+    {
+        var pfs_pg = try bp.fetchPage(file_header_mod.PFS_PAGE);
+        defer bp.unpinPage(file_header_mod.PFS_PAGE, false) catch {};
+
+        // Meta page (table.table_id) should not be category 4 (has few tuples)
+        const meta_entry = Pfs.getEntry(pfs_pg.data, table.table_id);
+        try std.testing.expect(meta_entry.allocated);
+
+        // At least some data pages should be full (category 4)
+        var full_count: usize = 0;
+        const ext_start = table.table_id;
+        for (2..EXTENT_SIZE) |offset| {
+            const entry = Pfs.getEntry(pfs_pg.data, ext_start + offset);
+            if (entry.free_space == 4) full_count += 1;
+        }
+        // With 512-byte rows and 8KB pages, each page fits ~14 rows
+        // 80 rows across 6 data pages should fill most of them
+        try std.testing.expect(full_count >= 3);
+    }
+
+    // Scan to verify all 80 rows are accessible
+    var iter = try table.scan();
+    var count: usize = 0;
+    while (try iter.next()) |row| {
+        defer iter.freeValues(row.values);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 80), count);
 }

@@ -84,6 +84,30 @@ pub const Pfs = struct {
         buf[PFS_HEADER_SIZE + page_offset] = 0;
     }
 
+    /// Compute the free-space category (0-4) from actual free bytes.
+    /// 0 = empty (100% free), 1 = 1-50% used, 2 = 51-80% used,
+    /// 3 = 81-95% used, 4 = 96-100% used (full).
+    pub fn freeSpaceCategory(free_bytes: usize) u3 {
+        const usable = PAGE_SIZE - page_mod.PageHeader.SIZE;
+        if (free_bytes >= usable) return 0; // empty
+        if (usable == 0) return 4;
+        const used = usable - free_bytes;
+        const pct = (used * 100) / usable;
+        if (pct == 0) return 0;
+        if (pct <= 50) return 1;
+        if (pct <= 80) return 2;
+        if (pct <= 95) return 3;
+        return 4;
+    }
+
+    /// Update just the free_space bits of a PFS entry, preserving all other flags.
+    pub fn updateFreeSpace(buf: *[PAGE_SIZE]u8, page_offset: usize, category: u3) void {
+        if (page_offset >= PFS_ENTRIES_PER_PAGE) return;
+        var entry: PfsEntry = @bitCast(buf[PFS_HEADER_SIZE + page_offset]);
+        entry.free_space = category;
+        buf[PFS_HEADER_SIZE + page_offset] = @bitCast(entry);
+    }
+
     /// Find a free (unallocated) page within a range.
     pub fn findFreePage(buf: *const [PAGE_SIZE]u8, start: usize, end: usize) ?usize {
         const actual_end = @min(end, PFS_ENTRIES_PER_PAGE);
@@ -474,6 +498,25 @@ pub const AllocManager = struct {
         return hdr.page_count;
     }
 
+    /// Update PFS free-space category for a given page, computed from actual free bytes.
+    pub fn updatePfsFreeSpace(self: *Self, page_id: PageId, free_bytes: usize) AllocError!void {
+        var pfs_pg = self.buffer_pool.fetchPage(file_header.PFS_PAGE) catch return AllocError.BufferPoolError;
+        defer self.buffer_pool.unpinPage(file_header.PFS_PAGE, true) catch {};
+        const category = Pfs.freeSpaceCategory(free_bytes);
+        Pfs.updateFreeSpace(pfs_pg.data, page_id, category);
+    }
+
+    /// Batch-read all 8 PFS entries for an extent in one PFS page fetch.
+    pub fn getExtentPfsEntries(self: *Self, extent_start: PageId) AllocError![EXTENT_SIZE]PfsEntry {
+        var pfs_pg = self.buffer_pool.fetchPage(file_header.PFS_PAGE) catch return AllocError.BufferPoolError;
+        defer self.buffer_pool.unpinPage(file_header.PFS_PAGE, false) catch {};
+        var entries: [EXTENT_SIZE]PfsEntry = undefined;
+        for (0..EXTENT_SIZE) |i| {
+            entries[i] = Pfs.getEntry(pfs_pg.data, extent_start + i);
+        }
+        return entries;
+    }
+
     /// Update the page count in the file header.
     fn updatePageCount(self: *Self, new_count: u32) void {
         var pg = self.buffer_pool.fetchPage(file_header.FILE_HEADER_PAGE) catch return;
@@ -794,4 +837,85 @@ test "writeCatalogIds roundtrip" {
     try std.testing.expectEqual(@as(PageId, 8), ids.tables);
     try std.testing.expectEqual(@as(PageId, 16), ids.columns);
     try std.testing.expectEqual(@as(PageId, 24), ids.indexes);
+}
+
+test "Pfs.freeSpaceCategory boundaries" {
+    const usable = PAGE_SIZE - page_mod.PageHeader.SIZE;
+
+    // Empty page (100% free) → category 0
+    try std.testing.expectEqual(@as(u3, 0), Pfs.freeSpaceCategory(usable));
+
+    // 50% used → category 1
+    try std.testing.expectEqual(@as(u3, 1), Pfs.freeSpaceCategory(usable / 2));
+
+    // 80% used (20% free) → category 2
+    try std.testing.expectEqual(@as(u3, 2), Pfs.freeSpaceCategory(usable / 5));
+
+    // 95% used (5% free) → category 3
+    try std.testing.expectEqual(@as(u3, 3), Pfs.freeSpaceCategory(usable / 20));
+
+    // Completely full → category 4
+    try std.testing.expectEqual(@as(u3, 4), Pfs.freeSpaceCategory(0));
+}
+
+test "Pfs.updateFreeSpace preserves flags" {
+    var buf: [PAGE_SIZE]u8 = undefined;
+    Pfs.initPage(&buf);
+
+    // Set an entry with iam_page=true
+    Pfs.setEntry(&buf, 10, .{
+        .allocated = true,
+        .free_space = 0,
+        .page_type = 0,
+        .iam_page = true,
+        .mixed_extent = false,
+    });
+
+    // Update free_space
+    Pfs.updateFreeSpace(&buf, 10, 3);
+
+    // Verify free_space changed but iam_page is still true
+    const entry = Pfs.getEntry(&buf, 10);
+    try std.testing.expectEqual(@as(u3, 3), entry.free_space);
+    try std.testing.expect(entry.allocated);
+    try std.testing.expect(entry.iam_page);
+}
+
+test "AllocManager getExtentPfsEntries batch read" {
+    const test_file = "test_alloc_pfs_batch.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
+    try dm.open();
+
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 32);
+    defer bp.deinit();
+
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+
+    // Allocate an extent (starts at page 8)
+    const ext_start = try am.allocateExtent();
+    try std.testing.expectEqual(@as(PageId, 8), ext_start);
+
+    // Set varying PFS entries manually
+    {
+        var pfs_pg = try bp.fetchPage(file_header.PFS_PAGE);
+        Pfs.updateFreeSpace(pfs_pg.data, ext_start + 0, 0);
+        Pfs.updateFreeSpace(pfs_pg.data, ext_start + 1, 2);
+        Pfs.updateFreeSpace(pfs_pg.data, ext_start + 2, 4);
+        bp.unpinPage(file_header.PFS_PAGE, true) catch {};
+    }
+
+    // Batch read
+    const entries = try am.getExtentPfsEntries(ext_start);
+    try std.testing.expectEqual(@as(u3, 0), entries[0].free_space);
+    try std.testing.expectEqual(@as(u3, 2), entries[1].free_space);
+    try std.testing.expectEqual(@as(u3, 4), entries[2].free_space);
+    // All should be allocated
+    try std.testing.expect(entries[0].allocated);
+    try std.testing.expect(entries[1].allocated);
+    try std.testing.expect(entries[2].allocated);
 }
