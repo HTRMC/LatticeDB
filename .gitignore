@@ -2,3 +2,5 @@
 /.zig-cache
 /zig-out
 /deps
+__pycache__/
+.graphenedb/
