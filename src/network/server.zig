@@ -326,15 +326,15 @@ pub const Server = struct {
     }
 
     fn sendResponse(self: *Server, stream: msquic.HQUIC, stream_ctx: *StreamContext, response: []u8) void {
-        // Store response in stream context so it lives until SEND_COMPLETE
+        // Store response and QUIC_BUFFER in stream context so they live until SEND_COMPLETE
         stream_ctx.send_buf = response;
-        var send_quic_buf = msquic.QUIC_BUFFER{
+        stream_ctx.send_quic_buf = .{
             .length = @intCast(response.len),
             .buffer = response.ptr,
         };
         _ = self.api.stream_send(
             stream,
-            @ptrCast(&send_quic_buf),
+            @ptrCast(&stream_ctx.send_quic_buf),
             1,
             msquic.QUIC_SEND_FLAG_FIN,
             null,
@@ -378,12 +378,14 @@ const StreamContext = struct {
     conn_ctx: *ConnectionContext,
     recv_buf: std.ArrayListUnmanaged(u8),
     send_buf: ?[]u8,
+    send_quic_buf: msquic.QUIC_BUFFER,
 
     fn init(conn_ctx: *ConnectionContext) StreamContext {
         return .{
             .conn_ctx = conn_ctx,
             .recv_buf = .empty,
             .send_buf = null,
+            .send_quic_buf = undefined,
         };
     }
 
