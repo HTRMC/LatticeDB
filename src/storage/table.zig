@@ -4,6 +4,7 @@ const buffer_pool_mod = @import("buffer_pool.zig");
 const tuple_mod = @import("tuple.zig");
 const mvcc_mod = @import("mvcc.zig");
 const undo_log_mod = @import("undo_log.zig");
+const alloc_map_mod = @import("alloc_map.zig");
 
 const Page = page_mod.Page;
 const PageId = page_mod.PageId;
@@ -23,6 +24,7 @@ const TransactionManager = mvcc_mod.TransactionManager;
 const Snapshot = mvcc_mod.Snapshot;
 const UndoLog = undo_log_mod.UndoLog;
 const UndoRecordHeader = undo_log_mod.UndoRecordHeader;
+const AllocManager = alloc_map_mod.AllocManager;
 
 pub const TableError = error{
     BufferPoolError,
@@ -83,6 +85,8 @@ pub const Table = struct {
     txn_manager: ?*TransactionManager,
     /// Undo log for version chain (null = legacy mode, no undo)
     undo_log: ?*UndoLog,
+    /// Allocation manager for extent-based allocation (null = legacy buffer_pool allocation)
+    alloc_manager: ?*AllocManager,
 
     const Self = @This();
 
@@ -106,6 +110,18 @@ pub const Table = struct {
         txn_manager: ?*TransactionManager,
         undo_log: ?*UndoLog,
     ) TableError!Self {
+        return createFull(allocator, buffer_pool, schema, txn_manager, undo_log, null);
+    }
+
+    /// Create a new table with full configuration (MVCC + AllocManager)
+    pub fn createFull(
+        allocator: std.mem.Allocator,
+        buffer_pool: *BufferPool,
+        schema: *const Schema,
+        txn_manager: ?*TransactionManager,
+        undo_log: ?*UndoLog,
+        alloc_manager: ?*AllocManager,
+    ) TableError!Self {
         // Allocate the first page for this table
         const result = buffer_pool.newPage() catch {
             return TableError.BufferPoolError;
@@ -118,6 +134,7 @@ pub const Table = struct {
             .table_id = result.page_id,
             .txn_manager = txn_manager,
             .undo_log = undo_log,
+            .alloc_manager = alloc_manager,
         };
 
         // Build meta blob: header + 1 extent + zero-padding to META_RESERVED_SIZE
@@ -158,6 +175,19 @@ pub const Table = struct {
         txn_manager: ?*TransactionManager,
         undo_log: ?*UndoLog,
     ) Self {
+        return openFull(allocator, buffer_pool, schema, table_id, txn_manager, undo_log, null);
+    }
+
+    /// Open an existing table with full configuration
+    pub fn openFull(
+        allocator: std.mem.Allocator,
+        buffer_pool: *BufferPool,
+        schema: *const Schema,
+        table_id: PageId,
+        txn_manager: ?*TransactionManager,
+        undo_log: ?*UndoLog,
+        alloc_manager: ?*AllocManager,
+    ) Self {
         return .{
             .allocator = allocator,
             .buffer_pool = buffer_pool,
@@ -165,6 +195,7 @@ pub const Table = struct {
             .table_id = table_id,
             .txn_manager = txn_manager,
             .undo_log = undo_log,
+            .alloc_manager = alloc_manager,
         };
     }
 
@@ -232,9 +263,13 @@ pub const Table = struct {
         }
 
         // No space found — allocate a new extent
-        const new_start = self.buffer_pool.allocateExtent(EXTENT_GROWTH_SIZE) catch {
-            return TableError.BufferPoolError;
+        const new_start = blk: {
+            if (self.alloc_manager) |am| {
+                break :blk am.allocateExtent() catch return TableError.BufferPoolError;
+            }
+            break :blk self.buffer_pool.allocateExtent(EXTENT_GROWTH_SIZE) catch return TableError.BufferPoolError;
         };
+        const new_extent_size: u32 = if (self.alloc_manager != null) alloc_map_mod.EXTENT_SIZE else EXTENT_GROWTH_SIZE;
 
         // Fetch first page of new extent, initialize it, insert tuple
         var new_pg = self.buffer_pool.fetchPage(new_start) catch {
@@ -252,7 +287,7 @@ pub const Table = struct {
         // Add the new extent to meta and increment tuple count
         try self.addExtent(meta_full, ExtentEntry{
             .start_page = new_start,
-            .page_count = EXTENT_GROWTH_SIZE,
+            .page_count = new_extent_size,
         });
 
         const tid = TupleId{ .page_id = new_start, .slot_id = slot_id };
@@ -1560,4 +1595,151 @@ test "three tables interleaved with large rows" {
         }
         try std.testing.expectEqual(@as(usize, 30), count);
     }
+}
+
+test "table with AllocManager basic insert and scan" {
+    const test_file = "test_table_alloc_mgr.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
+    try dm.open();
+
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 64);
+    defer bp.deinit();
+
+    // Initialize the file with allocation maps
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+            .{ .name = "name", .col_type = .text, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var table = try Table.createFull(std.testing.allocator, &bp, &schema, null, null, &am);
+
+    // Insert rows
+    var i: i32 = 0;
+    while (i < 10) : (i += 1) {
+        var name_buf: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "row_{}", .{i}) catch unreachable;
+        _ = try table.insertTuple(null, &.{ .{ .integer = i }, .{ .bytes = name } });
+    }
+
+    // Scan should return all 10
+    var iter = try table.scan();
+    var count: usize = 0;
+    while (try iter.next()) |row| {
+        defer iter.freeValues(row.values);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 10), count);
+    try std.testing.expectEqual(@as(u64, 10), try table.tupleCount());
+}
+
+test "table with AllocManager multi-extent allocation" {
+    const test_file = "test_table_alloc_multi_ext.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
+    try dm.open();
+
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 128);
+    defer bp.deinit();
+
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+            .{ .name = "data", .col_type = .text, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var table = try Table.createFull(std.testing.allocator, &bp, &schema, null, null, &am);
+
+    // Insert large rows to force multiple extent allocations
+    var large_buf: [512]u8 = undefined;
+    @memset(&large_buf, 'A');
+
+    var i: i32 = 0;
+    while (i < 80) : (i += 1) {
+        _ = try table.insertTuple(null, &.{ .{ .integer = i }, .{ .bytes = &large_buf } });
+    }
+
+    // Should have multiple extents
+    const meta = try table.readMetaFull();
+    try std.testing.expect(meta.extent_count > 1);
+
+    // Scan all rows
+    var iter = try table.scan();
+    var count: usize = 0;
+    while (try iter.next()) |row| {
+        defer iter.freeValues(row.values);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 80), count);
+}
+
+test "two tables with AllocManager no corruption" {
+    const test_file = "test_table_alloc_two.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer {
+        dm.deleteFile();
+        dm.deinit();
+    }
+    try dm.open();
+
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 128);
+    defer bp.deinit();
+
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+
+    const schema = Schema{
+        .columns = &.{
+            .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+            .{ .name = "payload", .col_type = .text, .max_length = 0, .nullable = false },
+        },
+    };
+
+    var t1 = try Table.createFull(std.testing.allocator, &bp, &schema, null, null, &am);
+    var t2 = try Table.createFull(std.testing.allocator, &bp, &schema, null, null, &am);
+
+    var large_buf: [400]u8 = undefined;
+    @memset(&large_buf, 'B');
+
+    // Interleave inserts
+    var i: i32 = 0;
+    while (i < 50) : (i += 1) {
+        _ = try t1.insertTuple(null, &.{ .{ .integer = i }, .{ .bytes = &large_buf } });
+        _ = try t2.insertTuple(null, &.{ .{ .integer = i + 1000 }, .{ .bytes = &large_buf } });
+    }
+
+    // Scan t1
+    var iter1 = try t1.scan();
+    var c1: usize = 0;
+    while (try iter1.next()) |row| {
+        defer iter1.freeValues(row.values);
+        try std.testing.expect(row.values[0].integer < 1000);
+        c1 += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 50), c1);
+
+    // Scan t2
+    var iter2 = try t2.scan();
+    var c2: usize = 0;
+    while (try iter2.next()) |row| {
+        defer iter2.freeValues(row.values);
+        try std.testing.expect(row.values[0].integer >= 1000);
+        c2 += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 50), c2);
 }

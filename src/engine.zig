@@ -12,6 +12,8 @@ pub const storage = struct {
     pub const mvcc = @import("storage/mvcc.zig");
     pub const undo_log = @import("storage/undo_log.zig");
     pub const data_dir = @import("storage/data_dir.zig");
+    pub const file_header = @import("storage/file_header.zig");
+    pub const alloc_map = @import("storage/alloc_map.zig");
 };
 
 pub const index = struct {
