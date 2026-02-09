@@ -97,4 +97,5 @@ fn linkDeps(b: *std.Build, compile: *std.Build.Step.Compile, msquic_path: ?[]con
         compile.root_module.addLibraryPath(.{ .cwd_relative = ssl_lib_dir });
         compile.root_module.addLibraryPath(.{ .cwd_relative = ssl_bin_dir });
     }
+    compile.root_module.linkSystemLibrary("crypto", .{});
 }

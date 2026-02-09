@@ -13,9 +13,10 @@ pub const Client = struct {
     connection: msquic.HQUIC,
 
     // Synchronization for request/response
-    response_event: std.Thread.ResetEvent,
+    response_event: std.Io.Event,
     response_data: std.ArrayListUnmanaged(u8),
-    connected_event: std.Thread.ResetEvent,
+    connected_event: std.Io.Event,
+    io: std.Io,
     connect_status: ?msquic.QUIC_STATUS,
 
     // Certificate pinning (TOFU)
@@ -30,7 +31,7 @@ pub const Client = struct {
         mismatch, // WARNING: fingerprint changed
     };
 
-    pub fn init(allocator: std.mem.Allocator) !Client {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) !Client {
         var api: *const msquic.QUIC_API_TABLE = undefined;
         const open_status = msquic.MsQuicOpenVersion(msquic.QUIC_API_VERSION_2, &api);
         if (!msquic.statusSucceeded(open_status)) return error.MsQuicOpenFailed;
@@ -92,6 +93,7 @@ pub const Client = struct {
             .response_event = .unset,
             .response_data = .empty,
             .connected_event = .unset,
+            .io = io,
             .connect_status = null,
             .expected_fingerprint = null,
             .server_fingerprint = null,
@@ -118,7 +120,7 @@ pub const Client = struct {
         if (!msquic.statusSucceeded(start_status)) return error.ConnectionStartFailed;
 
         // Wait for connection to establish
-        self.connected_event.wait();
+        self.connected_event.waitUncancelable(self.io);
 
         if (self.connect_status) |cs| {
             if (!msquic.statusSucceeded(cs)) return error.ConnectionFailed;
@@ -133,7 +135,7 @@ pub const Client = struct {
 
         // Reset response state
         self.response_data.clearRetainingCapacity();
-        self.response_event = .unset;
+        self.response_event.reset();
 
         // Open a new stream for this query
         var stream: msquic.HQUIC = null;
@@ -170,7 +172,7 @@ pub const Client = struct {
         }
 
         // Wait for response
-        self.response_event.wait();
+        self.response_event.waitUncancelable(self.io);
 
         // Decode response
         const data = self.response_data.items;
@@ -210,16 +212,16 @@ pub const Client = struct {
         switch (event.event_type) {
             .connected => {
                 self.connect_status = msquic.QUIC_STATUS_SUCCESS;
-                self.connected_event.set();
+                self.connected_event.set(self.io);
             },
             .shutdown_initiated_by_transport => {
                 self.connect_status = event.payload.shutdown_initiated_by_transport.status;
-                self.connected_event.set();
-                self.response_event.set(); // Unblock any pending query
+                self.connected_event.set(self.io);
+                self.response_event.set(self.io); // Unblock any pending query
             },
             .shutdown_initiated_by_peer => {
-                self.connected_event.set();
-                self.response_event.set();
+                self.connected_event.set(self.io);
+                self.response_event.set(self.io);
             },
             .peer_certificate_received => {
                 const cert = event.payload.peer_certificate_received.certificate orelse {
@@ -269,10 +271,10 @@ pub const Client = struct {
             },
             .peer_send_shutdown => {
                 // Server finished sending — response complete
-                self.response_event.set();
+                self.response_event.set(self.io);
             },
             .shutdown_complete => {
-                self.response_event.set();
+                self.response_event.set(self.io);
                 self.api.stream_close(stream);
             },
             else => {},

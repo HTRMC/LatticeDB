@@ -196,7 +196,7 @@ pub fn main(init: std.process.Init) !void {
             try out.flush();
         }
 
-        try runServer(allocator, out, port, tls_cert);
+        try runServer(allocator, out, port, tls_cert, io);
     } else if (cli_args.len > 0 and std.mem.eql(u8, cli_args[0], "connect")) {
         var host: [*:0]const u8 = "localhost";
         var port: u16 = DEFAULT_PORT;
@@ -236,7 +236,7 @@ pub fn main(init: std.process.Init) !void {
 
 // ── Server mode ──────────────────────────────────────────────────────
 
-fn runServer(allocator: std.mem.Allocator, out: *std.Io.Writer, port: u16, tls_cert: Server.TlsCert) !void {
+fn runServer(allocator: std.mem.Allocator, out: *std.Io.Writer, port: u16, tls_cert: Server.TlsCert, io: Io) !void {
     // Initialize storage engine
     var dm = DiskManager.init(allocator, DB_FILE);
     try dm.open();
@@ -258,7 +258,7 @@ fn runServer(allocator: std.mem.Allocator, out: *std.Io.Writer, port: u16, tls_c
     var undo_log = UndoLog.init(allocator);
     defer undo_log.deinit();
 
-    var srv = try Server.init(allocator, &catalog, &txn_manager, &undo_log, tls_cert);
+    var srv = try Server.init(allocator, &catalog, &txn_manager, &undo_log, tls_cert, io);
     defer srv.deinit();
 
     try srv.listen(port);
@@ -269,8 +269,8 @@ fn runServer(allocator: std.mem.Allocator, out: *std.Io.Writer, port: u16, tls_c
     try out.flush();
 
     // Block forever (msquic handles connections in background threads)
-    var stop_event: std.Thread.ResetEvent = .unset;
-    stop_event.wait();
+    var stop_event: std.Io.Event = .unset;
+    stop_event.waitUncancelable(io);
 }
 
 // ── Client mode ──────────────────────────────────────────────────────
@@ -283,7 +283,7 @@ fn runClient(
     host: [*:0]const u8,
     port: u16,
 ) !void {
-    var cli = try Client.init(allocator);
+    var cli = try Client.init(allocator, io);
     defer cli.deinit();
 
     const host_span = std.mem.span(host);
