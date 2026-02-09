@@ -252,7 +252,7 @@ pub fn main(init: std.process.Init) !void {
             try out.flush();
         }
 
-        try runServer(allocator, out, port, tls_cert, data_dir_path);
+        try runServer(allocator, out, port, tls_cert, data_dir_path, io);
     } else if (cli_args.len > 0 and std.mem.eql(u8, cli_args[0], "connect")) {
         var host: [*:0]const u8 = "localhost";
         var port: u16 = DEFAULT_PORT;
@@ -292,7 +292,7 @@ pub fn main(init: std.process.Init) !void {
 
 // ── Server mode ──────────────────────────────────────────────────────
 
-fn runServer(allocator: std.mem.Allocator, out: *std.Io.Writer, port: u16, tls_cert: Server.TlsCert, data_dir_path: []const u8) !void {
+fn runServer(allocator: std.mem.Allocator, out: *std.Io.Writer, port: u16, tls_cert: Server.TlsCert, data_dir_path: []const u8, io: Io) !void {
     // Open/init data directory
     var dd = DataDir.openOrInit(allocator, data_dir_path) catch |err| {
         try out.print("Failed to open data directory: {s}\n", .{@errorName(err)});
@@ -343,7 +343,7 @@ fn runServer(allocator: std.mem.Allocator, out: *std.Io.Writer, port: u16, tls_c
     var undo_log = UndoLog.init(allocator);
     defer undo_log.deinit();
 
-    var srv = try Server.init(allocator, &catalog, &txn_manager, &undo_log, tls_cert);
+    var srv = try Server.init(allocator, &catalog, &txn_manager, &undo_log, tls_cert, io);
     defer srv.deinit();
 
     try srv.listen(port);
@@ -355,8 +355,8 @@ fn runServer(allocator: std.mem.Allocator, out: *std.Io.Writer, port: u16, tls_c
     try out.flush();
 
     // Block forever (msquic handles connections in background threads)
-    var stop_event: std.Thread.ResetEvent = .unset;
-    stop_event.wait();
+    var stop_event: std.Io.Event = .unset;
+    stop_event.waitUncancelable(io);
 }
 
 // ── Client mode ──────────────────────────────────────────────────────
@@ -370,7 +370,7 @@ fn runClient(
     port: u16,
     data_dir_path: []const u8,
 ) !void {
-    var cli = try Client.init(allocator);
+    var cli = try Client.init(allocator, io);
     defer cli.deinit();
 
     // Open/init data dir to get known_hosts path

@@ -24,7 +24,8 @@ pub const Server = struct {
     catalog: *Catalog,
     txn_manager: ?*TransactionManager,
     undo_log: ?*UndoLog,
-    exec_mutex: std.Thread.Mutex,
+    exec_mutex: std.Io.Mutex,
+    io: std.Io,
 
     pub const TlsCert = union(enum) {
         hash: [20]u8, // Windows Schannel: SHA-1 thumbprint from cert store
@@ -39,6 +40,7 @@ pub const Server = struct {
         txn_manager: ?*TransactionManager,
         undo_log: ?*UndoLog,
         tls_cert: TlsCert,
+        io: std.Io,
     ) !Server {
         // Open msquic API
         var api: *const msquic.QUIC_API_TABLE = undefined;
@@ -136,7 +138,8 @@ pub const Server = struct {
             .catalog = catalog,
             .txn_manager = txn_manager,
             .undo_log = undo_log,
-            .exec_mutex = .{},
+            .exec_mutex = .init,
+            .io = io,
         };
     }
 
@@ -180,8 +183,8 @@ pub const Server = struct {
 
     /// Execute a query through a connection's executor (thread-safe)
     fn executeQuery(self: *Server, conn_ctx: *ConnectionContext, sql: []const u8) ![]u8 {
-        self.exec_mutex.lock();
-        defer self.exec_mutex.unlock();
+        self.exec_mutex.lockUncancelable(self.io);
+        defer self.exec_mutex.unlock(self.io);
 
         const result = conn_ctx.executor.execute(sql) catch |err| {
             return protocol.makeError(@errorName(err), self.allocator);
@@ -270,9 +273,9 @@ pub const Server = struct {
             },
             .shutdown_complete => {
                 // Auto-rollback any open transaction on disconnect
-                self.exec_mutex.lock();
+                self.exec_mutex.lockUncancelable(self.io);
                 conn_ctx.executor.abortCurrentTxn();
-                self.exec_mutex.unlock();
+                self.exec_mutex.unlock(self.io);
 
                 self.allocator.destroy(conn_ctx);
                 self.api.connection_close(connection);

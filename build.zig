@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
     });
 
@@ -97,4 +98,5 @@ fn linkDeps(b: *std.Build, compile: *std.Build.Step.Compile, msquic_path: ?[]con
         compile.root_module.addLibraryPath(.{ .cwd_relative = ssl_lib_dir });
         compile.root_module.addLibraryPath(.{ .cwd_relative = ssl_bin_dir });
     }
+    compile.root_module.linkSystemLibrary("crypto", .{});
 }
