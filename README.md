@@ -4,17 +4,24 @@ A database built from scratch in Zig with QUIC networking via msquic.
 
 ## Build
 
+**Windows**:
 ```
 zig build -Dmsquic-path=deps/msquic/build/native
 zig build test -Dmsquic-path=deps/msquic/build/native
 ```
 
+**Linux**:
+```bash
+zig build
+zig build test
+```
+
 ## Usage
 
 ```
-graphenedb                      # local REPL
-graphenedb serve [options]      # start QUIC server (default port: 4567)
-graphenedb connect [host:port]  # connect to server (default: localhost:4567)
+GrapheneDB                      # local REPL
+GrapheneDB serve [options]      # start QUIC server (default port: 4567)
+GrapheneDB connect [host:port]  # connect to server (default: localhost:4567)
 ```
 
 ### Server options
@@ -27,8 +34,8 @@ QUIC requires TLS, so the server needs a certificate.
 New-SelfSignedCertificate -DnsName localhost -CertStoreLocation cert:\CurrentUser\My -FriendlyName "GrapheneDB Dev"
 
 # Start server with the thumbprint from the output
-graphenedb serve --cert-hash THUMBPRINT
-graphenedb serve 4567 --cert-hash THUMBPRINT  # custom port
+GrapheneDB serve --cert-hash THUMBPRINT
+GrapheneDB serve 4567 --cert-hash THUMBPRINT  # custom port
 ```
 
 **Linux** (OpenSSL — uses PEM files):
@@ -37,8 +44,8 @@ graphenedb serve 4567 --cert-hash THUMBPRINT  # custom port
 openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj '/CN=localhost'
 
 # Start server
-graphenedb serve --cert cert.pem --key key.pem
-graphenedb serve 4567 --cert cert.pem --key key.pem  # custom port
+GrapheneDB serve --cert cert.pem --key key.pem
+GrapheneDB serve 4567 --cert cert.pem --key key.pem  # custom port
 ```
 
 ## msquic Setup
@@ -53,7 +60,17 @@ Invoke-WebRequest -Uri 'https://www.nuget.org/api/v2/package/Microsoft.Native.Qu
 
 **Linux**:
 ```bash
-sudo apt install libmsquic
+# Add Microsoft's repo (libmsquic is not in Ubuntu's default repos)
+curl -s https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft.gpg
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/$(lsb_release -rs)/prod $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/microsoft.list
+sudo apt update
+
+# Install msquic and OpenSSL dev headers
+sudo apt install libmsquic libssl-dev
+
+# Create the linker symlink (the package doesn't include one)
+sudo ln -s /usr/lib/x86_64-linux-gnu/libmsquic.so.2 /usr/lib/x86_64-linux-gnu/libmsquic.so
+
 zig build  # no -Dmsquic-path needed, uses system lib
 ```
 
