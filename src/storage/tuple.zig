@@ -171,6 +171,91 @@ pub const Value = union(enum) {
             .bytes => |v| return v,
         }
     }
+
+    /// Hash a value for use in hash joins. Canonicalizes numeric types so that
+    /// integer(5), bigint(5), and float(5.0) all produce the same hash.
+    pub fn hash(self: Value) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        switch (self) {
+            .null_value => hasher.update(&[_]u8{0}),
+            .boolean => |v| {
+                hasher.update(&[_]u8{1});
+                hasher.update(&[_]u8{@intFromBool(v)});
+            },
+            .integer => |v| {
+                hasher.update(&[_]u8{2});
+                hasher.update(std.mem.asBytes(&@as(i64, v)));
+            },
+            .bigint => |v| {
+                hasher.update(&[_]u8{2});
+                hasher.update(std.mem.asBytes(&v));
+            },
+            .float => |v| {
+                // Canonicalize exact-integer floats to match integer/bigint hash
+                if (v == v and v >= -9223372036854775808.0 and v < 9223372036854775808.0) {
+                    const as_int: i64 = @intFromFloat(v);
+                    if (@as(f64, @floatFromInt(as_int)) == v) {
+                        hasher.update(&[_]u8{2});
+                        hasher.update(std.mem.asBytes(&as_int));
+                        return hasher.final();
+                    }
+                }
+                hasher.update(&[_]u8{3});
+                hasher.update(std.mem.asBytes(&v));
+            },
+            .bytes => |v| {
+                hasher.update(&[_]u8{4});
+                hasher.update(v);
+            },
+        }
+        return hasher.final();
+    }
+
+    /// Equality check consistent with hash() and compareValues(.eq).
+    /// NULL never equals anything (including NULL).
+    pub fn eqlForJoin(a: Value, b: Value) bool {
+        if (a == .null_value or b == .null_value) return false;
+
+        switch (a) {
+            .integer => |ai| {
+                return switch (b) {
+                    .integer => |bi| ai == bi,
+                    .bigint => |bi| @as(i64, ai) == bi,
+                    .float => |bf| @as(f64, @floatFromInt(ai)) == bf,
+                    else => false,
+                };
+            },
+            .bigint => |ai| {
+                return switch (b) {
+                    .integer => |bi| ai == @as(i64, bi),
+                    .bigint => |bi| ai == bi,
+                    .float => |bf| @as(f64, @floatFromInt(ai)) == bf,
+                    else => false,
+                };
+            },
+            .float => |af| {
+                return switch (b) {
+                    .float => |bf| af == bf,
+                    .integer => |bi| af == @as(f64, @floatFromInt(bi)),
+                    .bigint => |bi| af == @as(f64, @floatFromInt(bi)),
+                    else => false,
+                };
+            },
+            .bytes => |as| {
+                return switch (b) {
+                    .bytes => |bs| std.mem.eql(u8, as, bs),
+                    else => false,
+                };
+            },
+            .boolean => |ab| {
+                return switch (b) {
+                    .boolean => |bb| ab == bb,
+                    else => false,
+                };
+            },
+            .null_value => return false,
+        }
+    }
 };
 
 /// Tuple - a row of values

@@ -1641,6 +1641,36 @@ pub const Executor = struct {
         return null;
     }
 
+    const EquiJoinKeys = struct {
+        left_col_idx: usize,
+        right_col_idx: usize,
+    };
+
+    /// Try to extract equi-join column indices from a simple ON condition (e.g. a.id = b.id).
+    /// Returns left and right column indices if the ON is a simple equality comparison.
+    fn tryExtractEquiJoinKeys(
+        self: *Self,
+        on_condition: *const ast.Expression,
+        left_table_name: []const u8,
+        right_table_name: []const u8,
+        left_schema: *const Schema,
+        right_schema: *const Schema,
+    ) ?EquiJoinKeys {
+        if (on_condition.* != .comparison) return null;
+        const cmp = on_condition.comparison;
+        if (cmp.op != .eq) return null;
+
+        const left_col = self.extractJoinColumn(cmp.left, cmp.right, left_table_name, right_table_name, left_schema, right_schema);
+        if (left_col == null) return null;
+        const right_col = self.extractJoinColumn(cmp.left, cmp.right, right_table_name, left_table_name, right_schema, left_schema);
+        if (right_col == null) return null;
+
+        return .{
+            .left_col_idx = left_col.?,
+            .right_col_idx = right_col.?,
+        };
+    }
+
     /// From an ON condition `expr_a op expr_b`, extract the column index for `target_table`.
     /// Returns the column ordinal in target_schema if one side references target_table.
     fn extractJoinColumn(
@@ -1844,6 +1874,22 @@ pub const Executor = struct {
 
                 self.allocator.free(combined_values);
             }
+        } else if (self.tryExtractEquiJoinKeys(join.on_condition, sel.table_name, join.table_name, left_schema, right_schema)) |eq_keys| {
+            // Hash join: O(n+m) for equi-joins without an index
+            try self.execHashJoin(
+                eq_keys,
+                join,
+                sel,
+                &left_table,
+                &right_table,
+                left_schema,
+                right_schema,
+                combined_schema,
+                combined_count,
+                col_indices,
+                txn,
+                &rows,
+            );
         } else {
             // Fallback: materialize right table rows for nested loop
             var right_rows: std.ArrayList([]Value) = .empty;
@@ -1946,6 +1992,166 @@ pub const Executor = struct {
                 return ExecError.OutOfMemory;
             },
         } };
+    }
+
+    /// Execute a hash join for equi-join conditions.
+    /// Build phase: hash the smaller table's join keys into a hash map.
+    /// Probe phase: scan the larger table and look up matches.
+    /// For LEFT JOIN, the left table is always the probe side.
+    fn execHashJoin(
+        self: *Self,
+        eq_keys: EquiJoinKeys,
+        join: ast.JoinClause,
+        sel: ast.Select,
+        left_table: *Table,
+        right_table: *Table,
+        left_schema: *const Schema,
+        right_schema: *const Schema,
+        combined_schema: *const Schema,
+        combined_count: usize,
+        col_indices: []const usize,
+        txn: ?*Transaction,
+        rows: *std.ArrayList(ResultRow),
+    ) ExecError!void {
+        // Decide build vs probe side.
+        // LEFT JOIN: always build right, probe left (to preserve all left rows).
+        // INNER JOIN: build the smaller table.
+        const build_right = if (join.join_type == .left)
+            true
+        else blk: {
+            const left_count = left_table.tupleCount() catch 0;
+            const right_count = right_table.tupleCount() catch 0;
+            break :blk right_count <= left_count;
+        };
+
+        const build_col_idx = if (build_right) eq_keys.right_col_idx else eq_keys.left_col_idx;
+        const probe_col_idx = if (build_right) eq_keys.left_col_idx else eq_keys.right_col_idx;
+        var build_table = if (build_right) right_table else left_table;
+        var probe_table = if (build_right) left_table else right_table;
+
+        // Build phase: scan build table, hash join keys into a HashMap.
+        // Key: hash of join column value, Value: list of row value arrays.
+        var hash_map = std.AutoHashMap(u64, std.ArrayListUnmanaged([]Value)).init(self.allocator);
+        defer {
+            var it = hash_map.iterator();
+            while (it.next()) |entry| {
+                for (entry.value_ptr.items) |row_vals| {
+                    self.allocator.free(row_vals);
+                }
+                entry.value_ptr.deinit(self.allocator);
+            }
+            hash_map.deinit();
+        }
+
+        {
+            var build_iter = build_table.scanWithTxn(txn) catch return ExecError.StorageError;
+            while (build_iter.next() catch return ExecError.StorageError) |row| {
+                const key_val = row.values[build_col_idx];
+                if (key_val == .null_value) {
+                    // NULL never matches in SQL; skip
+                    self.allocator.free(row.values);
+                    continue;
+                }
+                const h = key_val.hash();
+                const gop = hash_map.getOrPut(h) catch {
+                    self.allocator.free(row.values);
+                    return ExecError.OutOfMemory;
+                };
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = .empty;
+                }
+                gop.value_ptr.append(self.allocator, row.values) catch {
+                    self.allocator.free(row.values);
+                    return ExecError.OutOfMemory;
+                };
+            }
+        }
+
+        // Probe phase: scan probe table, look up matching buckets.
+        {
+            var probe_iter = probe_table.scanWithTxn(txn) catch return ExecError.StorageError;
+            while (probe_iter.next() catch return ExecError.StorageError) |probe_row| {
+                defer probe_iter.freeValues(probe_row.values);
+
+                const probe_key = probe_row.values[probe_col_idx];
+                var matched = false;
+
+                if (probe_key != .null_value) {
+                    const h = probe_key.hash();
+                    if (hash_map.get(h)) |bucket| {
+                        for (bucket.items) |build_vals| {
+                            // Verify equality (handle hash collisions)
+                            if (!Value.eqlForJoin(probe_key, build_vals[build_col_idx])) continue;
+
+                            // Assemble combined row: left first, right second
+                            const combined_values = self.allocator.alloc(Value, combined_count) catch return ExecError.OutOfMemory;
+                            if (build_right) {
+                                // probe=left, build=right
+                                @memcpy(combined_values[0..left_schema.columns.len], probe_row.values);
+                                @memcpy(combined_values[left_schema.columns.len..], build_vals);
+                            } else {
+                                // probe=right, build=left
+                                @memcpy(combined_values[0..left_schema.columns.len], build_vals);
+                                @memcpy(combined_values[left_schema.columns.len..], probe_row.values);
+                            }
+
+                            // Evaluate residual ON condition
+                            const left_vals = combined_values[0..left_schema.columns.len];
+                            const right_vals = combined_values[left_schema.columns.len..];
+                            const on_match = self.evalJoinCondition(
+                                join.on_condition,
+                                sel.table_name,
+                                join.table_name,
+                                left_schema,
+                                right_schema,
+                                left_vals,
+                                right_vals,
+                            );
+
+                            if (on_match) {
+                                const emit = if (sel.where_clause) |where|
+                                    self.evalWhere(where, combined_schema, combined_values)
+                                else
+                                    true;
+
+                                if (emit) {
+                                    matched = true;
+                                    self.formatAndAppendJoinRow(col_indices, combined_values, rows) catch {
+                                        self.allocator.free(combined_values);
+                                        return ExecError.OutOfMemory;
+                                    };
+                                }
+                            }
+
+                            self.allocator.free(combined_values);
+                        }
+                    }
+                }
+
+                // LEFT JOIN: emit row with NULLs for right side if no match
+                if (join.join_type == .left and !matched and build_right) {
+                    const combined_values = self.allocator.alloc(Value, combined_count) catch return ExecError.OutOfMemory;
+                    @memcpy(combined_values[0..left_schema.columns.len], probe_row.values);
+                    for (combined_values[left_schema.columns.len..]) |*v| {
+                        v.* = .{ .null_value = {} };
+                    }
+
+                    const emit = if (sel.where_clause) |where|
+                        self.evalWhere(where, combined_schema, combined_values)
+                    else
+                        true;
+
+                    if (emit) {
+                        self.formatAndAppendJoinRow(col_indices, combined_values, rows) catch {
+                            self.allocator.free(combined_values);
+                            return ExecError.OutOfMemory;
+                        };
+                    }
+
+                    self.allocator.free(combined_values);
+                }
+            }
+        }
     }
 
     /// Format selected columns from combined values and append to result rows.
