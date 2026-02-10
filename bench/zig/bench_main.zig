@@ -129,6 +129,7 @@ fn runSuiteIsolated(
         .allocator = allocator,
         .exec = &exec,
         .scale_factor = scale,
+        .io = io,
     };
 
     suite_fn(&ctx, results);

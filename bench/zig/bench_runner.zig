@@ -32,6 +32,7 @@ pub const BenchContext = struct {
     allocator: std.mem.Allocator,
     exec: *Executor,
     scale_factor: u32,
+    io: Io,
 };
 
 pub const BenchmarkFn = *const fn (ctx: *BenchContext) void;
@@ -47,12 +48,12 @@ pub fn runBenchmark(config: BenchmarkConfig, ctx: *BenchContext, func: Benchmark
     // Measure
     var latencies: [1000]u64 = undefined;
     const iters: u64 = @min(config.measure_iters, 1000);
-    var timer = std.time.Timer.start() catch unreachable;
 
     for (0..iters) |i| {
-        timer.reset();
+        const start = Io.Clock.Timestamp.now(ctx.io, .awake);
         func(ctx);
-        latencies[i] = timer.read();
+        const elapsed = start.untilNow(ctx.io);
+        latencies[i] = @intCast(elapsed.raw.nanoseconds);
     }
 
     // Sort for percentile calculations
