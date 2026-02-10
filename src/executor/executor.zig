@@ -219,6 +219,140 @@ pub const Executor = struct {
     }
 
     // ============================================================
+    // Shared index-scan row collection helper
+    // ============================================================
+
+    const CollectedRow = struct { tid: page_mod.TupleId, values: []Value };
+
+    /// Use planner to decide seq scan vs index scan, collect (TupleId, []Value) pairs.
+    /// Caller must free each entry's .values and deinit the list.
+    fn collectMatchingRows(
+        self: *Self,
+        table_name: []const u8,
+        table: *Table,
+        schema: *const Schema,
+        where_clause: ?*const ast.Expression,
+        txn: ?*Transaction,
+        out: *std.ArrayList(CollectedRow),
+    ) ExecError!void {
+        // Build minimal Select for planner (only table_name + where_clause matter)
+        const empty_cols = [_]ast.SelectColumn{.all_columns};
+        const sel = ast.Select{
+            .columns = &empty_cols,
+            .aliases = null,
+            .distinct = false,
+            .table_name = table_name,
+            .joins = null,
+            .where_clause = where_clause,
+            .group_by = null,
+            .having_clause = null,
+            .order_by = null,
+            .limit = null,
+        };
+
+        // Run planner
+        var planner = planner_mod.Planner.init(self.allocator, self.catalog);
+        const plan = planner.planSelect(sel) catch {
+            // Planner failed, fall back to seq scan
+            return self.collectViaSeqScan(table, schema, where_clause, txn, out);
+        };
+        defer planner.freePlan(plan);
+
+        const base = getBasePlanNode(plan);
+        if (base.* == .index_scan) {
+            const is = base.index_scan;
+            var btree = btree_mod.BTree.open(table.buffer_pool, is.index_id, self.catalog.alloc_manager);
+
+            switch (is.scan_type) {
+                .point => |key| {
+                    const tid = btree.search(key) catch return ExecError.StorageError;
+                    if (tid) |t| try self.fetchAndCollectRow(table, t, txn, schema, where_clause, out);
+                },
+                .range => |r| {
+                    var range_iter = btree.rangeScan(r.low, r.high) catch return ExecError.StorageError;
+                    while (range_iter.next() catch return ExecError.StorageError) |entry| {
+                        try self.fetchAndCollectRow(table, entry.tid, txn, schema, where_clause, out);
+                    }
+                },
+                .range_from => |key| {
+                    var range_iter = btree.rangeScan(key, std.math.maxInt(i32)) catch return ExecError.StorageError;
+                    while (range_iter.next() catch return ExecError.StorageError) |entry| {
+                        try self.fetchAndCollectRow(table, entry.tid, txn, schema, where_clause, out);
+                    }
+                },
+                .range_to => |key| {
+                    var range_iter = btree.rangeScan(std.math.minInt(i32), key) catch return ExecError.StorageError;
+                    while (range_iter.next() catch return ExecError.StorageError) |entry| {
+                        try self.fetchAndCollectRow(table, entry.tid, txn, schema, where_clause, out);
+                    }
+                },
+            }
+        } else {
+            return self.collectViaSeqScan(table, schema, where_clause, txn, out);
+        }
+    }
+
+    /// Fetch a single tuple by TID, apply WHERE, and append to collected rows.
+    fn fetchAndCollectRow(
+        self: *Self,
+        table: *Table,
+        tid: page_mod.TupleId,
+        txn: ?*Transaction,
+        schema: *const Schema,
+        where_clause: ?*const ast.Expression,
+        out: *std.ArrayList(CollectedRow),
+    ) ExecError!void {
+        const values = if (txn) |t|
+            (table.getTupleTxn(tid, t) catch return ExecError.StorageError)
+        else
+            (table.getTuple(tid, null) catch return ExecError.StorageError);
+
+        if (values == null) return;
+        const vals = values.?;
+
+        // Apply residual WHERE filter
+        if (where_clause) |where| {
+            if (!self.evalWhere(where, schema, vals)) {
+                self.allocator.free(vals);
+                return;
+            }
+        }
+
+        out.append(self.allocator, .{ .tid = tid, .values = vals }) catch {
+            self.allocator.free(vals);
+            return ExecError.OutOfMemory;
+        };
+    }
+
+    /// Sequential scan fallback for collectMatchingRows.
+    fn collectViaSeqScan(
+        self: *Self,
+        table: *Table,
+        schema: *const Schema,
+        where_clause: ?*const ast.Expression,
+        txn: ?*Transaction,
+        out: *std.ArrayList(CollectedRow),
+    ) ExecError!void {
+        var iter = table.scanWithTxn(txn) catch return ExecError.StorageError;
+
+        while (iter.next() catch return ExecError.StorageError) |row| {
+            const matches = if (where_clause) |where|
+                self.evalWhere(where, schema, row.values)
+            else
+                true;
+
+            if (matches) {
+                out.append(self.allocator, .{ .tid = row.tid, .values = row.values }) catch {
+                    iter.freeValues(row.values);
+                    return ExecError.OutOfMemory;
+                };
+            } else {
+                iter.freeValues(row.values);
+            }
+        }
+    }
+
+    // ============================================================
     // Transaction control
     // ============================================================
 
@@ -868,6 +1002,9 @@ pub const Executor = struct {
         self.commitImplicitTxn(txn);
 
         // ORDER BY: sort result rows
+        var order_by_applied = false;
+        var limit_applied = false;
+
         if (sel.order_by) |order_clauses| {
             // Resolve ORDER BY column indices within the selected columns
             const order_indices = self.allocator.alloc(usize, order_clauses.len) catch {
@@ -893,18 +1030,92 @@ pub const Executor = struct {
                 }
             }
 
-            // Insertion sort on result rows
-            const items = rows.items;
-            var si: usize = 1;
-            while (si < items.len) : (si += 1) {
-                var j = si;
-                while (j > 0) {
-                    if (orderCompareRows(items[j - 1], items[j], order_clauses, order_indices) == .gt) {
-                        const tmp = items[j];
-                        items[j] = items[j - 1];
-                        items[j - 1] = tmp;
-                        j -= 1;
-                    } else break;
+            // Top-N optimization: when ORDER BY + LIMIT, use bounded partial sort
+            if (sel.limit) |limit_val| {
+                const n: usize = @intCast(@min(limit_val, rows.items.len));
+                if (n > 0 and n < rows.items.len) {
+                    // Bounded sort: maintain a sorted window of size N
+                    // First, sort the first N elements (initial window)
+                    const items = rows.items;
+                    {
+                        var si: usize = 1;
+                        while (si < n) : (si += 1) {
+                            var j = si;
+                            while (j > 0) {
+                                if (orderCompareRows(items[j - 1], items[j], order_clauses, order_indices) == .gt) {
+                                    const tmp = items[j];
+                                    items[j] = items[j - 1];
+                                    items[j - 1] = tmp;
+                                    j -= 1;
+                                } else break;
+                            }
+                        }
+                    }
+
+                    // For each remaining row, check if it beats the worst (last) in the window
+                    for (items[n..]) |*item| {
+                        if (orderCompareRows(item.*, items[n - 1], order_clauses, order_indices) == .lt) {
+                            // Swap out the worst element and free it
+                            const evicted = items[n - 1];
+                            items[n - 1] = item.*;
+                            item.* = evicted;
+
+                            // Re-sort: bubble the new element to its correct position
+                            var j: usize = n - 1;
+                            while (j > 0) {
+                                if (orderCompareRows(items[j - 1], items[j], order_clauses, order_indices) == .gt) {
+                                    const tmp = items[j];
+                                    items[j] = items[j - 1];
+                                    items[j - 1] = tmp;
+                                    j -= 1;
+                                } else break;
+                            }
+                        }
+                    }
+
+                    // Free rows beyond the window
+                    for (items[n..]) |row| {
+                        for (row.values) |v| self.allocator.free(v);
+                        self.allocator.free(row.values);
+                    }
+                    rows.shrinkRetainingCapacity(n);
+
+                    order_by_applied = true;
+                    limit_applied = true;
+                } else {
+                    // N >= rows.len: just sort everything, limit is a no-op
+                    const items = rows.items;
+                    var si: usize = 1;
+                    while (si < items.len) : (si += 1) {
+                        var j = si;
+                        while (j > 0) {
+                            if (orderCompareRows(items[j - 1], items[j], order_clauses, order_indices) == .gt) {
+                                const tmp = items[j];
+                                items[j] = items[j - 1];
+                                items[j - 1] = tmp;
+                                j -= 1;
+                            } else break;
+                        }
+                    }
+                    order_by_applied = true;
+                    limit_applied = true;
+                }
+            }
+
+            // Standard full sort (no LIMIT or Top-N not applicable)
+            if (!order_by_applied) {
+                const items = rows.items;
+                var si: usize = 1;
+                while (si < items.len) : (si += 1) {
+                    var j = si;
+                    while (j > 0) {
+                        if (orderCompareRows(items[j - 1], items[j], order_clauses, order_indices) == .gt) {
+                            const tmp = items[j];
+                            items[j] = items[j - 1];
+                            items[j - 1] = tmp;
+                            j -= 1;
+                        } else break;
+                    }
                 }
             }
         }
@@ -953,15 +1164,17 @@ pub const Executor = struct {
             rows.shrinkRetainingCapacity(write_idx);
         }
 
-        // LIMIT: truncate
-        if (sel.limit) |limit_val| {
-            const limit: usize = @intCast(@min(limit_val, rows.items.len));
-            // Free excess rows
-            for (rows.items[limit..]) |row| {
-                for (row.values) |v| self.allocator.free(v);
-                self.allocator.free(row.values);
+        // LIMIT: truncate (skip if already applied by Top-N)
+        if (!limit_applied) {
+            if (sel.limit) |limit_val| {
+                const limit: usize = @intCast(@min(limit_val, rows.items.len));
+                // Free excess rows
+                for (rows.items[limit..]) |row| {
+                    for (row.values) |v| self.allocator.free(v);
+                    self.allocator.free(row.values);
+                }
+                rows.shrinkRetainingCapacity(limit);
             }
-            rows.shrinkRetainingCapacity(limit);
         }
 
         return .{ .rows = .{
@@ -1163,21 +1376,20 @@ pub const Executor = struct {
             groups.put(key, state) catch return ExecError.OutOfMemory;
         }
 
-        var iter = table.scanWithTxn(txn) catch {
+        // Collect matching rows via index scan or seq scan
+        var collected: std.ArrayList(CollectedRow) = .empty;
+        defer {
+            for (collected.items) |entry| self.allocator.free(entry.values);
+            collected.deinit(self.allocator);
+        }
+
+        self.collectMatchingRows(sel.table_name, table, schema, sel.where_clause, txn, &collected) catch {
             self.abortImplicitTxn(txn);
             return ExecError.StorageError;
         };
 
-        while (iter.next() catch {
-            self.abortImplicitTxn(txn);
-            return ExecError.StorageError;
-        }) |row| {
-            defer iter.freeValues(row.values);
-
-            // Apply WHERE filter
-            if (sel.where_clause) |where| {
-                if (!self.evalWhere(where, schema, row.values)) continue;
-            }
+        for (collected.items) |entry| {
+            const row_values = entry.values;
 
             // Build group key
             var group_key: []u8 = undefined;
@@ -1189,7 +1401,7 @@ pub const Executor = struct {
                         self.abortImplicitTxn(txn);
                         return ExecError.OutOfMemory;
                     };
-                    const fv = formatValue(self.allocator, row.values[gi]) catch {
+                    const fv = formatValue(self.allocator, row_values[gi]) catch {
                         key_parts.deinit(self.allocator);
                         self.abortImplicitTxn(txn);
                         return ExecError.OutOfMemory;
@@ -1222,7 +1434,7 @@ pub const Executor = struct {
                     return ExecError.OutOfMemory;
                 };
                 for (group_by_indices, 0..) |gi, idx| {
-                    gv[idx] = formatValue(self.allocator, row.values[gi]) catch {
+                    gv[idx] = formatValue(self.allocator, row_values[gi]) catch {
                         for (gv[0..idx]) |v| self.allocator.free(v);
                         self.allocator.free(gv);
                         self.allocator.free(group_key);
@@ -1256,7 +1468,7 @@ pub const Executor = struct {
                         self.abortImplicitTxn(txn);
                         return ExecError.OutOfMemory;
                     };
-                    const fv2 = formatValue(self.allocator, row.values[gi]) catch {
+                    const fv2 = formatValue(self.allocator, row_values[gi]) catch {
                         key_parts2.deinit(self.allocator);
                         self.abortImplicitTxn(txn);
                         return ExecError.OutOfMemory;
@@ -1281,7 +1493,7 @@ pub const Executor = struct {
 
             for (0..num_cols) |i| {
                 const ci = agg_col_indices[i] orelse continue;
-                self.accumulateAgg(state_ptr, i, row.values[ci]);
+                self.accumulateAgg(state_ptr, i, row_values[ci]);
             }
         }
 
@@ -1376,8 +1588,102 @@ pub const Executor = struct {
     }
 
     // ============================================================
-    // JOIN execution (nested loop join)
+    // JOIN execution (nested loop join with optional index lookup)
     // ============================================================
+
+    const IndexJoinInfo = struct {
+        index_id: PageId,
+        left_col_idx: usize, // column index in left schema
+        right_col_idx: usize, // column index in right schema (the indexed one)
+    };
+
+    /// Check if the right table has an index on the join column from the ON condition.
+    /// Returns IndexJoinInfo if an index nested-loop join is possible.
+    fn tryIndexNestedLoopJoin(
+        self: *Self,
+        on_condition: *const ast.Expression,
+        left_table_name: []const u8,
+        right_table_name: []const u8,
+        left_schema: *const Schema,
+        right_schema: *const Schema,
+        right_table_id: PageId,
+    ) ?IndexJoinInfo {
+        // ON condition must be a simple equality comparison
+        if (on_condition.* != .comparison) return null;
+        const cmp = on_condition.comparison;
+        if (cmp.op != .eq) return null;
+
+        // Extract column names and their table associations
+        const left_col = self.extractJoinColumn(cmp.left, cmp.right, left_table_name, right_table_name, left_schema, right_schema);
+        if (left_col == null) return null;
+        const right_col = self.extractJoinColumn(cmp.left, cmp.right, right_table_name, left_table_name, right_schema, left_schema);
+        if (right_col == null) return null;
+
+        // Check if right table has an index on right_col
+        const indexes = self.catalog.getIndexesForTable(right_table_id) catch return null;
+        defer self.catalog.freeIndexList(indexes);
+
+        for (indexes) |idx| {
+            if (idx.column_ordinal == right_col.?) {
+                // Only support integer indexes for now (matches btree key type)
+                if (idx.column_ordinal < right_schema.columns.len and
+                    right_schema.columns[idx.column_ordinal].col_type == .integer)
+                {
+                    return .{
+                        .index_id = idx.index_id,
+                        .left_col_idx = left_col.?,
+                        .right_col_idx = right_col.?,
+                    };
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// From an ON condition `expr_a op expr_b`, extract the column index for `target_table`.
+    /// Returns the column ordinal in target_schema if one side references target_table.
+    fn extractJoinColumn(
+        _: *Self,
+        expr_a: *const ast.Expression,
+        expr_b: *const ast.Expression,
+        target_table: []const u8,
+        other_table: []const u8,
+        target_schema: *const Schema,
+        other_schema: *const Schema,
+    ) ?usize {
+        // Try expr_a as target_table column
+        if (getJoinColumnIdx(expr_a, target_table, target_schema)) |idx| {
+            // Verify expr_b references the other table
+            if (getJoinColumnIdx(expr_b, other_table, other_schema) != null) {
+                return idx;
+            }
+        }
+        // Try expr_b as target_table column
+        if (getJoinColumnIdx(expr_b, target_table, target_schema)) |idx| {
+            if (getJoinColumnIdx(expr_a, other_table, other_schema) != null) {
+                return idx;
+            }
+        }
+        return null;
+    }
+
+    fn getJoinColumnIdx(expr: *const ast.Expression, table_name: []const u8, schema: *const Schema) ?usize {
+        switch (expr.*) {
+            .qualified_ref => |qr| {
+                if (std.ascii.eqlIgnoreCase(qr.table, table_name)) {
+                    return resolveColumnIndex(schema, qr.column);
+                }
+            },
+            .column_ref => |name| {
+                // Unqualified: try to resolve in the given schema
+                return resolveColumnIndex(schema, name);
+            },
+            else => {},
+        }
+        return null;
+    }
+
     fn execSelectJoin(self: *Self, sel: ast.Select) ExecError!ExecResult {
         const join_list = sel.joins orelse return ExecError.StorageError;
         if (join_list.len == 0) return ExecError.StorageError;
@@ -1440,153 +1746,194 @@ pub const Executor = struct {
             rows.deinit(self.allocator);
         }
 
-        // Materialize right table rows for nested loop
-        var right_rows: std.ArrayList([]Value) = .empty;
-        defer {
-            for (right_rows.items) |rv| {
-                self.allocator.free(rv);
-            }
-            right_rows.deinit(self.allocator);
-        }
+        // Try index nested-loop join: if right table has an index on the join column,
+        // use btree point lookup instead of materializing all right rows.
+        const index_join = self.tryIndexNestedLoopJoin(
+            join.on_condition,
+            sel.table_name,
+            join.table_name,
+            left_schema,
+            right_schema,
+            right_table.table_id,
+        );
 
-        {
-            var riter = right_table.scanWithTxn(txn) catch {
+        if (index_join) |ij| {
+            // Index nested-loop join: scan left, lookup right via index
+            var btree = btree_mod.BTree.open(right_table.buffer_pool, ij.index_id, self.catalog.alloc_manager);
+
+            var liter = left_table.scanWithTxn(txn) catch {
                 for (col_names) |cn| self.allocator.free(cn);
                 self.allocator.free(col_names);
                 self.abortImplicitTxn(txn);
                 return ExecError.StorageError;
             };
-            while (riter.next() catch {
+
+            while (liter.next() catch {
                 for (col_names) |cn| self.allocator.free(cn);
                 self.allocator.free(col_names);
                 self.abortImplicitTxn(txn);
                 return ExecError.StorageError;
-            }) |row| {
-                // Keep the values (don't free via iterator)
-                right_rows.append(self.allocator, row.values) catch {
-                    riter.freeValues(row.values);
+            }) |left_row| {
+                defer liter.freeValues(left_row.values);
+
+                // Extract join key from left row
+                const left_val = left_row.values[ij.left_col_idx];
+                const key: i32 = switch (left_val) {
+                    .integer => |v| v,
+                    else => continue, // non-integer key, skip
+                };
+
+                // Lookup in right table's index
+                const right_tid = btree.search(key) catch continue;
+
+                const combined_values = self.allocator.alloc(Value, combined_count) catch {
                     for (col_names) |cn| self.allocator.free(cn);
                     self.allocator.free(col_names);
                     self.abortImplicitTxn(txn);
                     return ExecError.OutOfMemory;
                 };
-            }
-        }
+                @memcpy(combined_values[0..left_schema.columns.len], left_row.values);
 
-        // Nested loop: for each left row, scan all right rows
-        var liter = left_table.scanWithTxn(txn) catch {
-            for (col_names) |cn| self.allocator.free(cn);
-            self.allocator.free(col_names);
-            self.abortImplicitTxn(txn);
-            return ExecError.StorageError;
-        };
+                var matched = false;
 
-        while (liter.next() catch {
-            for (col_names) |cn| self.allocator.free(cn);
-            self.allocator.free(col_names);
-            self.abortImplicitTxn(txn);
-            return ExecError.StorageError;
-        }) |left_row| {
-            defer liter.freeValues(left_row.values);
+                if (right_tid) |rtid| {
+                    // Fetch right row by TID
+                    const right_vals_opt = if (txn) |t|
+                        (right_table.getTupleTxn(rtid, t) catch null)
+                    else
+                        (right_table.getTuple(rtid, null) catch null);
 
-            // Build combined values array
-            const combined_values = self.allocator.alloc(Value, combined_count) catch {
-                for (col_names) |cn| self.allocator.free(cn);
-                self.allocator.free(col_names);
-                self.abortImplicitTxn(txn);
-                return ExecError.OutOfMemory;
-            };
-            @memcpy(combined_values[0..left_schema.columns.len], left_row.values);
+                    if (right_vals_opt) |right_vals| {
+                        defer self.allocator.free(right_vals);
+                        @memcpy(combined_values[left_schema.columns.len..], right_vals);
 
-            var matched = false;
-            for (right_rows.items) |right_vals| {
-                @memcpy(combined_values[left_schema.columns.len..], right_vals);
+                        // Verify ON condition (handles residual checks beyond the index key)
+                        const on_match = self.evalJoinCondition(join.on_condition, sel.table_name, join.table_name, left_schema, right_schema, left_row.values, right_vals);
 
-                // Evaluate ON condition with combined schema
-                const on_match = self.evalJoinCondition(join.on_condition, sel.table_name, join.table_name, left_schema, right_schema, left_row.values, right_vals);
-                if (!on_match) continue;
-
-                // Apply WHERE filter on combined row
-                if (sel.where_clause) |where| {
-                    if (!self.evalWhere(where, combined_schema, combined_values)) continue;
-                }
-
-                matched = true;
-
-                // Format output columns
-                const formatted = self.allocator.alloc([]const u8, col_indices.len) catch {
-                    self.allocator.free(combined_values);
-                    for (col_names) |cn| self.allocator.free(cn);
-                    self.allocator.free(col_names);
-                    self.abortImplicitTxn(txn);
-                    return ExecError.OutOfMemory;
-                };
-                for (col_indices, 0..) |ci, i| {
-                    formatted[i] = formatValue(self.allocator, combined_values[ci]) catch {
-                        for (formatted[0..i]) |f| self.allocator.free(f);
-                        self.allocator.free(formatted);
-                        self.allocator.free(combined_values);
-                        for (col_names) |cn| self.allocator.free(cn);
-                        self.allocator.free(col_names);
-                        self.abortImplicitTxn(txn);
-                        return ExecError.OutOfMemory;
-                    };
-                }
-                rows.append(self.allocator, .{ .values = formatted }) catch {
-                    for (formatted) |f| self.allocator.free(f);
-                    self.allocator.free(formatted);
-                    self.allocator.free(combined_values);
-                    for (col_names) |cn| self.allocator.free(cn);
-                    self.allocator.free(col_names);
-                    self.abortImplicitTxn(txn);
-                    return ExecError.OutOfMemory;
-                };
-            }
-
-            // LEFT JOIN: emit row with NULLs for right side if no match
-            if (join.join_type == .left and !matched) {
-                // Fill right side with nulls
-                for (combined_values[left_schema.columns.len..]) |*v| {
-                    v.* = .{ .null_value = {} };
-                }
-
-                if (sel.where_clause) |where| {
-                    if (!self.evalWhere(where, combined_schema, combined_values)) {
-                        self.allocator.free(combined_values);
-                        continue;
+                        if (on_match) {
+                            if (sel.where_clause) |where| {
+                                if (!self.evalWhere(where, combined_schema, combined_values)) {
+                                    // WHERE failed, not a match
+                                } else {
+                                    matched = true;
+                                    try self.formatAndAppendJoinRow(col_indices, combined_values, &rows);
+                                }
+                            } else {
+                                matched = true;
+                                try self.formatAndAppendJoinRow(col_indices, combined_values, &rows);
+                            }
+                        }
                     }
                 }
 
-                const formatted = self.allocator.alloc([]const u8, col_indices.len) catch {
-                    self.allocator.free(combined_values);
+                // LEFT JOIN: emit row with NULLs for right side if no match
+                if (join.join_type == .left and !matched) {
+                    for (combined_values[left_schema.columns.len..]) |*v| {
+                        v.* = .{ .null_value = {} };
+                    }
+
+                    const emit = if (sel.where_clause) |where|
+                        self.evalWhere(where, combined_schema, combined_values)
+                    else
+                        true;
+
+                    if (emit) {
+                        try self.formatAndAppendJoinRow(col_indices, combined_values, &rows);
+                    }
+                }
+
+                self.allocator.free(combined_values);
+            }
+        } else {
+            // Fallback: materialize right table rows for nested loop
+            var right_rows: std.ArrayList([]Value) = .empty;
+            defer {
+                for (right_rows.items) |rv| {
+                    self.allocator.free(rv);
+                }
+                right_rows.deinit(self.allocator);
+            }
+
+            {
+                var riter = right_table.scanWithTxn(txn) catch {
                     for (col_names) |cn| self.allocator.free(cn);
                     self.allocator.free(col_names);
                     self.abortImplicitTxn(txn);
-                    return ExecError.OutOfMemory;
+                    return ExecError.StorageError;
                 };
-                for (col_indices, 0..) |ci, i| {
-                    formatted[i] = formatValue(self.allocator, combined_values[ci]) catch {
-                        for (formatted[0..i]) |f| self.allocator.free(f);
-                        self.allocator.free(formatted);
-                        self.allocator.free(combined_values);
+                while (riter.next() catch {
+                    for (col_names) |cn| self.allocator.free(cn);
+                    self.allocator.free(col_names);
+                    self.abortImplicitTxn(txn);
+                    return ExecError.StorageError;
+                }) |row| {
+                    right_rows.append(self.allocator, row.values) catch {
+                        riter.freeValues(row.values);
                         for (col_names) |cn| self.allocator.free(cn);
                         self.allocator.free(col_names);
                         self.abortImplicitTxn(txn);
                         return ExecError.OutOfMemory;
                     };
                 }
-                rows.append(self.allocator, .{ .values = formatted }) catch {
-                    for (formatted) |f| self.allocator.free(f);
-                    self.allocator.free(formatted);
-                    self.allocator.free(combined_values);
+            }
+
+            // Nested loop: for each left row, scan all right rows
+            var liter = left_table.scanWithTxn(txn) catch {
+                for (col_names) |cn| self.allocator.free(cn);
+                self.allocator.free(col_names);
+                self.abortImplicitTxn(txn);
+                return ExecError.StorageError;
+            };
+
+            while (liter.next() catch {
+                for (col_names) |cn| self.allocator.free(cn);
+                self.allocator.free(col_names);
+                self.abortImplicitTxn(txn);
+                return ExecError.StorageError;
+            }) |left_row| {
+                defer liter.freeValues(left_row.values);
+
+                const combined_values = self.allocator.alloc(Value, combined_count) catch {
                     for (col_names) |cn| self.allocator.free(cn);
                     self.allocator.free(col_names);
                     self.abortImplicitTxn(txn);
                     return ExecError.OutOfMemory;
                 };
-            }
+                @memcpy(combined_values[0..left_schema.columns.len], left_row.values);
 
-            self.allocator.free(combined_values);
+                var matched = false;
+                for (right_rows.items) |right_vals| {
+                    @memcpy(combined_values[left_schema.columns.len..], right_vals);
+
+                    const on_match = self.evalJoinCondition(join.on_condition, sel.table_name, join.table_name, left_schema, right_schema, left_row.values, right_vals);
+                    if (!on_match) continue;
+
+                    if (sel.where_clause) |where| {
+                        if (!self.evalWhere(where, combined_schema, combined_values)) continue;
+                    }
+
+                    matched = true;
+                    try self.formatAndAppendJoinRow(col_indices, combined_values, &rows);
+                }
+
+                // LEFT JOIN: emit row with NULLs for right side if no match
+                if (join.join_type == .left and !matched) {
+                    for (combined_values[left_schema.columns.len..]) |*v| {
+                        v.* = .{ .null_value = {} };
+                    }
+
+                    const emit = if (sel.where_clause) |where|
+                        self.evalWhere(where, combined_schema, combined_values)
+                    else
+                        true;
+
+                    if (emit) {
+                        try self.formatAndAppendJoinRow(col_indices, combined_values, &rows);
+                    }
+                }
+
+                self.allocator.free(combined_values);
+            }
         }
 
         self.commitImplicitTxn(txn);
@@ -1599,6 +1946,29 @@ pub const Executor = struct {
                 return ExecError.OutOfMemory;
             },
         } };
+    }
+
+    /// Format selected columns from combined values and append to result rows.
+    fn formatAndAppendJoinRow(
+        self: *Self,
+        col_indices: []const usize,
+        combined_values: []const Value,
+        rows: *std.ArrayList(ResultRow),
+    ) ExecError!void {
+        const formatted = self.allocator.alloc([]const u8, col_indices.len) catch return ExecError.OutOfMemory;
+        errdefer self.allocator.free(formatted);
+        for (col_indices, 0..) |ci, i| {
+            formatted[i] = formatValue(self.allocator, combined_values[ci]) catch {
+                for (formatted[0..i]) |f| self.allocator.free(f);
+                self.allocator.free(formatted);
+                return ExecError.OutOfMemory;
+            };
+        }
+        rows.append(self.allocator, .{ .values = formatted }) catch {
+            for (formatted) |f| self.allocator.free(f);
+            self.allocator.free(formatted);
+            return ExecError.OutOfMemory;
+        };
     }
 
     /// Evaluate a JOIN ON condition, resolving qualified refs to the correct table
@@ -1729,37 +2099,16 @@ pub const Executor = struct {
         }
 
         // Collect TIDs and values to delete (can't delete while scanning)
-        const DeleteEntry = struct { tid: page_mod.TupleId, values: []Value };
-        var to_delete: std.ArrayList(DeleteEntry) = .empty;
+        var to_delete: std.ArrayList(CollectedRow) = .empty;
         defer {
             for (to_delete.items) |entry| self.allocator.free(entry.values);
             to_delete.deinit(self.allocator);
         }
 
-        var iter = table.scanWithTxn(txn) catch {
+        self.collectMatchingRows(del.table_name, &table, schema, del.where_clause, txn, &to_delete) catch {
             self.abortImplicitTxn(txn);
             return ExecError.StorageError;
         };
-
-        while (iter.next() catch {
-            self.abortImplicitTxn(txn);
-            return ExecError.StorageError;
-        }) |row| {
-            const should_delete = if (del.where_clause) |where|
-                self.evalWhere(where, schema, row.values)
-            else
-                true;
-
-            if (should_delete) {
-                to_delete.append(self.allocator, .{ .tid = row.tid, .values = row.values }) catch {
-                    iter.freeValues(row.values);
-                    self.abortImplicitTxn(txn);
-                    return ExecError.OutOfMemory;
-                };
-            } else {
-                iter.freeValues(row.values);
-            }
-        }
 
         // Now delete collected tuples
         var deleted: u64 = 0;
@@ -1836,8 +2185,7 @@ pub const Executor = struct {
         }
 
         // Scan and collect rows to update (TID + current values)
-        const UpdateEntry = struct { tid: page_mod.TupleId, values: []Value };
-        var to_update: std.ArrayList(UpdateEntry) = .empty;
+        var to_update: std.ArrayList(CollectedRow) = .empty;
         defer {
             for (to_update.items) |entry| {
                 self.allocator.free(entry.values);
@@ -1845,31 +2193,10 @@ pub const Executor = struct {
             to_update.deinit(self.allocator);
         }
 
-        var iter = table.scanWithTxn(txn) catch {
+        self.collectMatchingRows(upd.table_name, &table, schema, upd.where_clause, txn, &to_update) catch {
             self.abortImplicitTxn(txn);
             return ExecError.StorageError;
         };
-
-        while (iter.next() catch {
-            self.abortImplicitTxn(txn);
-            return ExecError.StorageError;
-        }) |row| {
-            const matches = if (upd.where_clause) |where|
-                self.evalWhere(where, schema, row.values)
-            else
-                true;
-
-            if (matches) {
-                to_update.append(self.allocator, .{ .tid = row.tid, .values = row.values }) catch {
-                    iter.freeValues(row.values);
-                    self.abortImplicitTxn(txn);
-                    return ExecError.OutOfMemory;
-                };
-                // Don't free row.values — we're keeping them
-            } else {
-                iter.freeValues(row.values);
-            }
-        }
 
         // Apply updates: delete old tuple, insert new one
         var updated: u64 = 0;
