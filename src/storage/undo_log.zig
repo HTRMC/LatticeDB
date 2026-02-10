@@ -51,10 +51,12 @@ pub const UndoLog = struct {
     allocator: std.mem.Allocator,
     /// In-memory buffer acting as the undo log
     buffer: std.ArrayListUnmanaged(u8),
-    /// Current write position (= logical file size)
+    /// Current write position (= logical file size, relative to buffer start)
     write_pos: u64,
-    /// GC watermark: records before this offset are logically dead
+    /// GC watermark: records before this offset are logically dead (global offset)
     gc_watermark: u64,
+    /// Bytes compacted out from the start of the buffer
+    base_offset: u64 = 0,
 
     const Self = @This();
 
@@ -64,6 +66,7 @@ pub const UndoLog = struct {
             .buffer = .empty,
             .write_pos = 0,
             .gc_watermark = 0,
+            .base_offset = 0,
         };
     }
 
@@ -71,9 +74,9 @@ pub const UndoLog = struct {
         self.buffer.deinit(self.allocator);
     }
 
-    /// Append an undo record and return its offset (= undo_ptr)
+    /// Append an undo record and return its global offset (= undo_ptr)
     pub fn appendRecord(self: *Self, header: UndoRecordHeader, data: []const u8) !u64 {
-        const offset = self.write_pos;
+        const global_offset = self.base_offset + self.write_pos;
         const total_size = UndoRecordHeader.SIZE + data.len;
 
         // Ensure capacity
@@ -94,21 +97,23 @@ pub const UndoLog = struct {
         }
 
         self.write_pos += @intCast(total_size);
-        return offset;
+        return global_offset;
     }
 
-    /// Read an undo record at the given offset
+    /// Read an undo record at the given global offset
     pub fn readRecord(self: *const Self, offset: u64) !struct { header: UndoRecordHeader, data: []const u8 } {
         if (offset == NO_UNDO_PTR) return error.InvalidOffset;
+        if (offset < self.base_offset) return error.InvalidOffset;
 
-        const pos: usize = @intCast(offset);
-        if (pos + UndoRecordHeader.SIZE > self.buffer.items.len) return error.InvalidOffset;
+        const local: usize = @intCast(offset - self.base_offset);
+        const buf_len = @as(usize, @intCast(self.write_pos));
+        if (local + UndoRecordHeader.SIZE > buf_len) return error.InvalidOffset;
 
-        const header = std.mem.bytesToValue(UndoRecordHeader, self.buffer.items[pos..][0..UndoRecordHeader.SIZE]);
-        const data_start = pos + UndoRecordHeader.SIZE;
+        const header = std.mem.bytesToValue(UndoRecordHeader, self.buffer.items[local..][0..UndoRecordHeader.SIZE]);
+        const data_start = local + UndoRecordHeader.SIZE;
         const data_end = data_start + header.data_len;
 
-        if (data_end > self.buffer.items.len) return error.InvalidOffset;
+        if (data_end > buf_len) return error.InvalidOffset;
 
         return .{
             .header = header,
@@ -116,21 +121,23 @@ pub const UndoLog = struct {
         };
     }
 
-    /// Get the current write position (for GC boundary calculations)
+    /// Get the current global write position (for GC boundary calculations)
     pub fn currentOffset(self: *const Self) u64 {
-        return self.write_pos;
+        return self.base_offset + self.write_pos;
     }
 
     /// GC: Advance watermark past records whose txn_id < oldest_visible_txn_id.
-    /// Records before the watermark are logically dead (offsets remain stable).
+    /// Records before the watermark are logically dead.
     pub fn gc(self: *Self, oldest_visible_txn_id: TxnId) void {
         var offset = self.gc_watermark;
+        const global_end = self.base_offset + self.write_pos;
 
-        while (offset < self.write_pos) {
-            const pos: usize = @intCast(offset);
-            if (pos + UndoRecordHeader.SIZE > self.buffer.items.len) break;
+        while (offset < global_end) {
+            const local: usize = @intCast(offset - self.base_offset);
+            const buf_len = @as(usize, @intCast(self.write_pos));
+            if (local + UndoRecordHeader.SIZE > buf_len) break;
 
-            const header = std.mem.bytesToValue(UndoRecordHeader, self.buffer.items[pos..][0..UndoRecordHeader.SIZE]);
+            const header = std.mem.bytesToValue(UndoRecordHeader, self.buffer.items[local..][0..UndoRecordHeader.SIZE]);
             const record_size = UndoRecordHeader.SIZE + header.data_len;
 
             // Stop at the first record that might still be visible
@@ -142,9 +149,30 @@ pub const UndoLog = struct {
         self.gc_watermark = offset;
     }
 
+    /// Compact: reclaim memory for GC'd records by shifting live data to the
+    /// start of the buffer. External offsets remain valid via base_offset tracking.
+    pub fn compact(self: *Self) void {
+        const dead = self.gc_watermark - self.base_offset;
+        if (dead == 0) return;
+
+        const dead_bytes: usize = @intCast(dead);
+        const live_bytes: usize = @intCast(self.write_pos - dead);
+
+        // Move live data to the front
+        if (live_bytes > 0) {
+            std.mem.copyForwards(u8, self.buffer.items[0..live_bytes], self.buffer.items[dead_bytes..][0..live_bytes]);
+        }
+
+        self.base_offset = self.gc_watermark;
+        self.write_pos = @intCast(live_bytes);
+
+        // Shrink backing memory
+        self.buffer.shrinkRetainingCapacity(live_bytes);
+    }
+
     /// Returns the number of bytes that are logically dead (before watermark)
     pub fn reclaimableBytes(self: *const Self) u64 {
-        return self.gc_watermark;
+        return self.gc_watermark - self.base_offset;
     }
 };
 
@@ -518,4 +546,111 @@ test "UndoLog mixed record types with data then GC" {
     log.gc(3);
     const expected = UndoRecordHeader.SIZE + UndoRecordHeader.SIZE + 8;
     try std.testing.expectEqual(@as(u64, expected), log.reclaimableBytes());
+}
+
+test "UndoLog compact reclaims memory" {
+    var log = UndoLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    // Txn 1: insert (32 bytes)
+    const h1 = UndoRecordHeader{
+        .record_type = .insert,
+        .slot_id = 1,
+        .txn_id = 1,
+        .prev_undo_ptr = NO_UNDO_PTR,
+        .txn_prev_undo = NO_UNDO_PTR,
+        .table_page_id = 5,
+        .data_len = 0,
+    };
+    _ = try log.appendRecord(h1, &.{});
+
+    // Txn 2: insert (32 bytes)
+    const h2 = UndoRecordHeader{
+        .record_type = .insert,
+        .slot_id = 2,
+        .txn_id = 2,
+        .prev_undo_ptr = NO_UNDO_PTR,
+        .txn_prev_undo = NO_UNDO_PTR,
+        .table_page_id = 5,
+        .data_len = 0,
+    };
+    const offset2 = try log.appendRecord(h2, &.{});
+
+    // GC txn 1
+    log.gc(2);
+    try std.testing.expectEqual(@as(u64, UndoRecordHeader.SIZE), log.reclaimableBytes());
+
+    // Compact — memory should shrink
+    log.compact();
+    try std.testing.expectEqual(@as(u64, 0), log.reclaimableBytes());
+    try std.testing.expectEqual(@as(u64, UndoRecordHeader.SIZE), log.write_pos);
+    try std.testing.expectEqual(@as(u64, UndoRecordHeader.SIZE), log.base_offset);
+
+    // Reading the compacted record should fail
+    try std.testing.expectError(error.InvalidOffset, log.readRecord(0));
+
+    // Reading the live record should still work
+    const rec = try log.readRecord(offset2);
+    try std.testing.expectEqual(UndoRecordType.insert, rec.header.record_type);
+    try std.testing.expectEqual(@as(TxnId, 2), rec.header.txn_id);
+
+    // New records should get correct global offsets
+    const h3 = UndoRecordHeader{
+        .record_type = .insert,
+        .slot_id = 3,
+        .txn_id = 3,
+        .prev_undo_ptr = NO_UNDO_PTR,
+        .txn_prev_undo = NO_UNDO_PTR,
+        .table_page_id = 5,
+        .data_len = 0,
+    };
+    const offset3 = try log.appendRecord(h3, &.{});
+    try std.testing.expectEqual(@as(u64, 2 * UndoRecordHeader.SIZE), offset3);
+
+    // Can read the new record
+    const rec3 = try log.readRecord(offset3);
+    try std.testing.expectEqual(@as(TxnId, 3), rec3.header.txn_id);
+}
+
+test "UndoLog compact on empty log is no-op" {
+    var log = UndoLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    log.compact();
+    try std.testing.expectEqual(@as(u64, 0), log.write_pos);
+    try std.testing.expectEqual(@as(u64, 0), log.base_offset);
+}
+
+test "UndoLog gc then compact then gc again" {
+    var log = UndoLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    // Write 3 records
+    var offsets: [3]u64 = undefined;
+    for (0..3) |i| {
+        const h = UndoRecordHeader{
+            .record_type = .insert,
+            .slot_id = @intCast(i),
+            .txn_id = @as(u32, @intCast(i)) + 1,
+            .prev_undo_ptr = NO_UNDO_PTR,
+            .txn_prev_undo = NO_UNDO_PTR,
+            .table_page_id = 5,
+            .data_len = 0,
+        };
+        offsets[i] = try log.appendRecord(h, &.{});
+    }
+
+    // GC past txn 1, compact
+    log.gc(2);
+    log.compact();
+
+    // GC past txn 2, compact again
+    log.gc(3);
+    log.compact();
+    try std.testing.expectEqual(@as(u64, UndoRecordHeader.SIZE), log.write_pos);
+    try std.testing.expectEqual(@as(u64, 2 * UndoRecordHeader.SIZE), log.base_offset);
+
+    // Record 3 still readable
+    const rec = try log.readRecord(offsets[2]);
+    try std.testing.expectEqual(@as(TxnId, 3), rec.header.txn_id);
 }
