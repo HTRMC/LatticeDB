@@ -37,6 +37,7 @@ pub const LiteralValue = union(enum) {
     string: []const u8,
     boolean: bool,
     null_value: void,
+    parameter: u32, // 0-based parameter index
 };
 
 /// Expression node for WHERE clauses

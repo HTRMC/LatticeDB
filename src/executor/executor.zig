@@ -65,6 +65,8 @@ pub const Executor = struct {
     undo_log: ?*UndoLog,
     /// Current explicit transaction (null = auto-commit mode)
     current_txn: ?*Transaction,
+    /// Bound parameters for current prepared statement execution (null = no params)
+    current_params: ?[]const ast.LiteralValue = null,
 
     const Self = @This();
 
@@ -84,6 +86,52 @@ pub const Executor = struct {
             .txn_manager = txn_manager,
             .undo_log = undo_log,
             .current_txn = null,
+        };
+    }
+
+    /// A prepared statement that can be executed multiple times with different parameters.
+    pub const PreparedStatement = struct {
+        arena_state: std.heap.ArenaAllocator,
+        statement: ast.Statement,
+        param_count: u32,
+
+        pub fn deinit(self: *PreparedStatement) void {
+            self.arena_state.deinit();
+        }
+    };
+
+    /// Parse SQL into a prepared statement. Caller must call stmt.deinit() when done.
+    pub fn prepare(self: *Self, sql: []const u8) ExecError!PreparedStatement {
+        var parser = Parser.init(self.allocator, sql);
+        // Do NOT call parser.deinit() — we transfer arena ownership to PreparedStatement
+        const stmt = parser.parse() catch {
+            parser.deinit();
+            return ExecError.ParseError;
+        };
+        return .{
+            .arena_state = parser.arena_state,
+            .statement = stmt,
+            .param_count = parser.param_count,
+        };
+    }
+
+    /// Execute a prepared statement with bound parameter values.
+    pub fn executePrepared(self: *Self, stmt: *const PreparedStatement, params: []const ast.LiteralValue) ExecError!ExecResult {
+        if (params.len < stmt.param_count) return ExecError.ColumnCountMismatch;
+        return switch (stmt.statement) {
+            .create_table => |ct| self.execCreateTable(ct),
+            .create_index => |ci| self.execCreateIndex(ci),
+            .insert => |ins| self.execInsertWithParams(ins, params),
+            .select => |sel| self.execSelectWithParams(sel, params),
+            .update => |upd| self.execUpdateWithParams(upd, params),
+            .delete => |del| self.execDeleteWithParams(del, params),
+            .drop_table => |dt| self.execDropTable(dt),
+            .drop_index => |di| self.execDropIndex(di),
+            .alter_table => |at| self.execAlterTable(at),
+            .explain => |ex| self.execExplain(ex),
+            .begin_txn => self.execBegin(),
+            .commit_txn => self.execCommit(),
+            .rollback_txn => self.execRollback(),
         };
     }
 
@@ -615,6 +663,16 @@ pub const Executor = struct {
     // INSERT INTO
     // ============================================================
     fn execInsert(self: *Self, ins: ast.Insert) ExecError!ExecResult {
+        return self.execInsertImpl(ins);
+    }
+
+    fn execInsertWithParams(self: *Self, ins: ast.Insert, params: []const ast.LiteralValue) ExecError!ExecResult {
+        self.current_params = params;
+        defer self.current_params = null;
+        return self.execInsertImpl(ins);
+    }
+
+    fn execInsertImpl(self: *Self, ins: ast.Insert) ExecError!ExecResult {
         const result = self.catalog.openTable(ins.table_name) catch {
             return ExecError.StorageError;
         } orelse return ExecError.TableNotFound;
@@ -639,7 +697,8 @@ pub const Executor = struct {
         defer self.allocator.free(values);
 
         for (ins.values, schema.columns, 0..) |lit, col, i| {
-            values[i] = litToValue(lit, col.col_type) catch {
+            const resolved = resolveParam(lit, self.current_params);
+            values[i] = litToValue(resolved, col.col_type) catch {
                 return ExecError.TypeMismatch;
             };
         }
@@ -662,6 +721,12 @@ pub const Executor = struct {
     // ============================================================
     // SELECT
     // ============================================================
+    fn execSelectWithParams(self: *Self, sel: ast.Select, params: []const ast.LiteralValue) ExecError!ExecResult {
+        self.current_params = params;
+        defer self.current_params = null;
+        return self.execSelect(sel);
+    }
+
     fn execSelect(self: *Self, sel: ast.Select) ExecError!ExecResult {
         // Route to JOIN handler if joins are present
         if (sel.joins) |join_list| {
@@ -1432,7 +1497,7 @@ pub const Executor = struct {
 
                 // Apply WHERE filter on combined row
                 if (sel.where_clause) |where| {
-                    if (!self.evalExpr(where, combined_schema, combined_values)) continue;
+                    if (!self.evalWhere(where, combined_schema, combined_values)) continue;
                 }
 
                 matched = true;
@@ -1475,7 +1540,7 @@ pub const Executor = struct {
                 }
 
                 if (sel.where_clause) |where| {
-                    if (!self.evalExpr(where, combined_schema, combined_values)) {
+                    if (!self.evalWhere(where, combined_schema, combined_values)) {
                         self.allocator.free(combined_values);
                         continue;
                     }
@@ -1587,7 +1652,7 @@ pub const Executor = struct {
                 }
                 return .{ .null_value = {} };
             },
-            .literal => |lit| return litToStorageValue(lit),
+            .literal => |lit| return litToStorageValue(lit, null),
             else => return .{ .null_value = {} },
         }
     }
@@ -1621,6 +1686,12 @@ pub const Executor = struct {
     // ============================================================
     // DELETE
     // ============================================================
+    fn execDeleteWithParams(self: *Self, del: ast.Delete, params: []const ast.LiteralValue) ExecError!ExecResult {
+        self.current_params = params;
+        defer self.current_params = null;
+        return self.execDelete(del);
+    }
+
     fn execDelete(self: *Self, del: ast.Delete) ExecError!ExecResult {
         const result = self.catalog.openTable(del.table_name) catch {
             return ExecError.StorageError;
@@ -1704,6 +1775,12 @@ pub const Executor = struct {
     // UPDATE table SET col = val [, ...] [WHERE expr]
     // Implemented as delete + insert (reuses existing MVCC undo)
     // ============================================================
+    fn execUpdateWithParams(self: *Self, upd: ast.Update, params: []const ast.LiteralValue) ExecError!ExecResult {
+        self.current_params = params;
+        defer self.current_params = null;
+        return self.execUpdate(upd);
+    }
+
     fn execUpdate(self: *Self, upd: ast.Update) ExecError!ExecResult {
         const result = self.catalog.openTable(upd.table_name) catch {
             return ExecError.StorageError;
@@ -1797,7 +1874,8 @@ pub const Executor = struct {
 
             // Apply SET assignments
             for (upd.assignments, set_indices) |assign, ci| {
-                new_values[ci] = litToValue(assign.value, schema.columns[ci].col_type) catch {
+                const resolved_val = resolveParam(assign.value, self.current_params);
+                new_values[ci] = litToValue(resolved_val, schema.columns[ci].col_type) catch {
                     self.abortImplicitTxn(txn);
                     return ExecError.TypeMismatch;
                 };
@@ -1835,34 +1913,34 @@ pub const Executor = struct {
     // WHERE evaluation
     // ============================================================
     fn evalWhere(self: *Self, expr: *const ast.Expression, schema: *const Schema, values: []const Value) bool {
-        return self.evalExpr(expr, schema, values);
+        return self.evalExprWithParams(expr, schema, values, self.current_params);
     }
 
-    fn evalExpr(self: *Self, expr: *const ast.Expression, schema: *const Schema, values: []const Value) bool {
+    fn evalExprWithParams(self: *Self, expr: *const ast.Expression, schema: *const Schema, values: []const Value, params: ?[]const ast.LiteralValue) bool {
         switch (expr.*) {
             .comparison => |cmp| {
-                const left_val = resolveExprValue(cmp.left, schema, values);
-                const right_val = resolveExprValue(cmp.right, schema, values);
+                const left_val = resolveExprValue(cmp.left, schema, values, params);
+                const right_val = resolveExprValue(cmp.right, schema, values, params);
                 return compareValues(left_val, cmp.op, right_val);
             },
             .and_expr => |a| {
-                return self.evalExpr(a.left, schema, values) and self.evalExpr(a.right, schema, values);
+                return self.evalExprWithParams(a.left, schema, values, params) and self.evalExprWithParams(a.right, schema, values, params);
             },
             .or_expr => |o| {
-                return self.evalExpr(o.left, schema, values) or self.evalExpr(o.right, schema, values);
+                return self.evalExprWithParams(o.left, schema, values, params) or self.evalExprWithParams(o.right, schema, values, params);
             },
             .not_expr => |n| {
-                return !self.evalExpr(n.operand, schema, values);
+                return !self.evalExprWithParams(n.operand, schema, values, params);
             },
             .between_expr => |b| {
-                const val = resolveExprValue(b.value, schema, values);
-                const low = resolveExprValue(b.low, schema, values);
-                const high = resolveExprValue(b.high, schema, values);
+                const val = resolveExprValue(b.value, schema, values, params);
+                const low = resolveExprValue(b.low, schema, values, params);
+                const high = resolveExprValue(b.high, schema, values, params);
                 return compareValues(val, .gte, low) and compareValues(val, .lte, high);
             },
             .like_expr => |l| {
-                const val = resolveExprValue(l.value, schema, values);
-                const pat = resolveExprValue(l.pattern, schema, values);
+                const val = resolveExprValue(l.value, schema, values, params);
+                const pat = resolveExprValue(l.pattern, schema, values, params);
                 const text = switch (val) {
                     .bytes => |s| s,
                     else => return false,
@@ -1874,15 +1952,15 @@ pub const Executor = struct {
                 return matchLike(text, pattern);
             },
             .in_list => |il| {
-                const val = resolveExprValue(il.value, schema, values);
+                const val = resolveExprValue(il.value, schema, values, params);
                 for (il.items) |item| {
-                    const item_val = resolveExprValue(item, schema, values);
+                    const item_val = resolveExprValue(item, schema, values, params);
                     if (compareValues(val, .eq, item_val)) return true;
                 }
                 return false;
             },
             .in_subquery => |isq| {
-                const val = resolveExprValue(isq.value, schema, values);
+                const val = resolveExprValue(isq.value, schema, values, params);
                 const sub_result = self.execSelect(isq.subquery.*) catch return false;
                 defer self.freeResult(.{ .rows = sub_result.rows });
                 for (sub_result.rows.rows) |row| {
@@ -1900,8 +1978,9 @@ pub const Executor = struct {
                 return sub_result.rows.rows.len > 0;
             },
             .literal => |lit| {
+                const resolved = resolveParam(lit, params);
                 // Bare literal in WHERE - treat as truthy
-                return switch (lit) {
+                return switch (resolved) {
                     .boolean => |b| b,
                     .null_value => false,
                     .integer => |i| i != 0,
@@ -1993,7 +2072,7 @@ pub const Executor = struct {
         return pi == pattern.len;
     }
 
-    fn resolveExprValue(expr: *const ast.Expression, schema: *const Schema, values: []const Value) Value {
+    fn resolveExprValue(expr: *const ast.Expression, schema: *const Schema, values: []const Value, params: ?[]const ast.LiteralValue) Value {
         switch (expr.*) {
             .column_ref => |name| {
                 // Find column index
@@ -2013,18 +2092,20 @@ pub const Executor = struct {
                 }
                 return .{ .null_value = {} };
             },
-            .literal => |lit| return litToStorageValue(lit),
+            .literal => |lit| return litToStorageValue(lit, params),
             else => return .{ .null_value = {} },
         }
     }
 
-    fn litToStorageValue(lit: ast.LiteralValue) Value {
-        return switch (lit) {
+    fn litToStorageValue(lit: ast.LiteralValue, params: ?[]const ast.LiteralValue) Value {
+        const resolved = resolveParam(lit, params);
+        return switch (resolved) {
             .integer => |i| .{ .integer = @intCast(i) },
             .float => |f| .{ .float = f },
             .string => |s| .{ .bytes = s },
             .boolean => |b| .{ .boolean = b },
             .null_value => .{ .null_value = {} },
+            .parameter => .{ .null_value = {} }, // unresolved — shouldn't happen
         };
     }
 
@@ -2200,6 +2281,14 @@ pub const Executor = struct {
         };
     }
 
+    /// Resolve a parameter reference to its bound value, or return the literal as-is.
+    fn resolveParam(lit: ast.LiteralValue, params: ?[]const ast.LiteralValue) ast.LiteralValue {
+        return switch (lit) {
+            .parameter => |idx| if (params) |p| p[idx] else lit,
+            else => lit,
+        };
+    }
+
     fn litToValue(lit: ast.LiteralValue, col_type: ColumnType) !Value {
         return switch (lit) {
             .integer => |i| switch (col_type) {
@@ -2221,6 +2310,7 @@ pub const Executor = struct {
                 else => error.TypeMismatch,
             },
             .null_value => Value{ .null_value = {} },
+            .parameter => error.TypeMismatch, // unresolved parameter
         };
     }
 

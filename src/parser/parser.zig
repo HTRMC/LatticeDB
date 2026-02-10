@@ -21,6 +21,13 @@ pub const Parser = struct {
     // Arena for AST allocations - caller frees everything at once
     arena_state: std.heap.ArenaAllocator,
 
+    // Parameter tracking for prepared statements
+    param_count: u32 = 0,
+    param_names: [32][]const u8 = undefined,
+    param_name_count: u32 = 0,
+    has_positional: bool = false,
+    has_named: bool = false,
+
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, input: []const u8) Self {
@@ -689,6 +696,14 @@ pub const Parser = struct {
                 sub_ptr.* = subquery;
                 expr.* = .{ .exists_subquery = .{ .subquery = sub_ptr } };
             },
+            .positional_param => {
+                const idx = try self.resolvePositionalParam();
+                expr.* = .{ .literal = .{ .parameter = idx } };
+            },
+            .named_param => {
+                const idx = try self.resolveNamedParam();
+                expr.* = .{ .literal = .{ .parameter = idx } };
+            },
             .left_paren => {
                 self.advance();
                 const inner = try self.parseExpression();
@@ -734,8 +749,44 @@ pub const Parser = struct {
                 self.advance();
                 return .{ .null_value = {} };
             },
+            .positional_param => return .{ .parameter = try self.resolvePositionalParam() },
+            .named_param => return .{ .parameter = try self.resolveNamedParam() },
             else => return ParseError.UnexpectedToken,
         }
+    }
+
+    /// Resolve $N positional param: $1 -> index 0, $2 -> index 1, etc.
+    fn resolvePositionalParam(self: *Self) ParseError!u32 {
+        if (self.has_named) return ParseError.InvalidSyntax; // no mixing
+        self.has_positional = true;
+        const n = std.fmt.parseInt(u32, self.current.text, 10) catch return ParseError.InvalidSyntax;
+        if (n == 0) return ParseError.InvalidSyntax; // $0 is invalid
+        const idx = n - 1;
+        if (n > self.param_count) self.param_count = n;
+        self.advance();
+        return idx;
+    }
+
+    /// Resolve @name named param: first occurrence assigns next index, subsequent reuses it.
+    fn resolveNamedParam(self: *Self) ParseError!u32 {
+        if (self.has_positional) return ParseError.InvalidSyntax; // no mixing
+        self.has_named = true;
+        const name = self.current.text;
+        // Check if already seen
+        for (self.param_names[0..self.param_name_count], 0..) |existing, i| {
+            if (std.mem.eql(u8, existing, name)) {
+                self.advance();
+                return @intCast(i);
+            }
+        }
+        // New named param
+        if (self.param_name_count >= 32) return ParseError.InvalidSyntax;
+        const idx = self.param_name_count;
+        self.param_names[idx] = name;
+        self.param_name_count += 1;
+        self.param_count = self.param_name_count;
+        self.advance();
+        return idx;
     }
 
     fn advance(self: *Self) void {
@@ -1214,4 +1265,46 @@ test "parse EXPLAIN" {
     const ex = stmt.explain;
     try std.testing.expectEqualStrings("users", ex.select.table_name);
     try std.testing.expect(ex.select.where_clause != null);
+}
+
+test "parse INSERT with positional params" {
+    var p = Parser.init(std.testing.allocator, "INSERT INTO t VALUES ($1, $2, $3)");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const ins = stmt.insert;
+    try std.testing.expectEqual(@as(usize, 3), ins.values.len);
+    try std.testing.expectEqual(@as(u32, 0), ins.values[0].parameter);
+    try std.testing.expectEqual(@as(u32, 1), ins.values[1].parameter);
+    try std.testing.expectEqual(@as(u32, 2), ins.values[2].parameter);
+    try std.testing.expectEqual(@as(u32, 3), p.param_count);
+}
+
+test "parse SELECT with positional param in WHERE" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t WHERE id = $1");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    const where = sel.where_clause.?;
+    try std.testing.expectEqual(@as(u32, 0), where.comparison.right.literal.parameter);
+    try std.testing.expectEqual(@as(u32, 1), p.param_count);
+}
+
+test "parse named params with reuse" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t WHERE a = @x OR b = @x");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    const where = sel.where_clause.?;
+    // Both @x should map to the same index 0
+    const left_cmp = where.or_expr.left.comparison.right.literal.parameter;
+    const right_cmp = where.or_expr.right.comparison.right.literal.parameter;
+    try std.testing.expectEqual(@as(u32, 0), left_cmp);
+    try std.testing.expectEqual(@as(u32, 0), right_cmp);
+    try std.testing.expectEqual(@as(u32, 1), p.param_count);
+}
+
+test "parse mixing positional and named params fails" {
+    var p = Parser.init(std.testing.allocator, "INSERT INTO t VALUES ($1, @name)");
+    defer p.deinit();
+    try std.testing.expectError(ParseError.InvalidSyntax, p.parse());
 }

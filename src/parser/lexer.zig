@@ -89,6 +89,10 @@ pub const TokenType = enum {
     float_literal,
     string_literal,
 
+    // Parameter placeholders
+    positional_param, // $1, $2, ...
+    named_param, // @name
+
     // Operators
     op_eq, // =
     op_neq, // != or <>
@@ -279,6 +283,8 @@ pub const Lexer = struct {
                 return .{ .type = .invalid, .text = self.input[start..self.pos], .position = start };
             },
             '\'' => return self.readString(),
+            '$' => return self.readPositionalParam(),
+            '@' => return self.readNamedParam(),
             else => {},
         }
 
@@ -295,6 +301,39 @@ pub const Lexer = struct {
         // Unknown character
         self.pos += 1;
         return .{ .type = .invalid, .text = self.input[start..self.pos], .position = start };
+    }
+
+    fn readPositionalParam(self: *Self) Token {
+        const start = self.pos;
+        self.pos += 1; // skip '$'
+        const digit_start = self.pos;
+        while (self.pos < self.input.len and std.ascii.isDigit(self.input[self.pos])) {
+            self.pos += 1;
+        }
+        if (self.pos == digit_start) {
+            // '$' with no digits
+            return .{ .type = .invalid, .text = self.input[start..self.pos], .position = start };
+        }
+        return .{ .type = .positional_param, .text = self.input[digit_start..self.pos], .position = start };
+    }
+
+    fn readNamedParam(self: *Self) Token {
+        const start = self.pos;
+        self.pos += 1; // skip '@'
+        const name_start = self.pos;
+        while (self.pos < self.input.len) {
+            const ch = self.input[self.pos];
+            if (std.ascii.isAlphanumeric(ch) or ch == '_') {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        if (self.pos == name_start) {
+            // '@' with no identifier
+            return .{ .type = .invalid, .text = self.input[start..self.pos], .position = start };
+        }
+        return .{ .type = .named_param, .text = self.input[name_start..self.pos], .position = start };
     }
 
     fn skipWhitespace(self: *Self) void {
@@ -520,9 +559,43 @@ test "lexer whitespace only" {
 }
 
 test "lexer unknown character" {
-    var lexer = Lexer.init("@");
+    var lexer = Lexer.init("#");
     const tok = lexer.nextToken();
     try std.testing.expectEqual(TokenType.invalid, tok.type);
+}
+
+test "lexer positional param" {
+    var lexer = Lexer.init("$1 $23");
+    const t1 = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.positional_param, t1.type);
+    try std.testing.expectEqualStrings("1", t1.text);
+
+    const t2 = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.positional_param, t2.type);
+    try std.testing.expectEqualStrings("23", t2.text);
+}
+
+test "lexer named param" {
+    var lexer = Lexer.init("@id @user_name");
+    const t1 = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.named_param, t1.type);
+    try std.testing.expectEqualStrings("id", t1.text);
+
+    const t2 = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.named_param, t2.type);
+    try std.testing.expectEqualStrings("user_name", t2.text);
+}
+
+test "lexer bare dollar sign" {
+    var lexer = Lexer.init("$ abc");
+    const t1 = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.invalid, t1.type);
+}
+
+test "lexer bare at sign" {
+    var lexer = Lexer.init("@ abc");
+    const t1 = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.invalid, t1.type);
 }
 
 test "lexer bang without equals" {
