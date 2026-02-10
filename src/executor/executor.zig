@@ -327,6 +327,17 @@ pub const Executor = struct {
         if (self.current_txn != null) return; // Explicit transaction — don't auto-commit
         const tm = self.txn_manager orelse return;
         tm.commit(txn.?) catch {};
+
+        // Opportunistic background checkpoint: flush a few dirty pages
+        self.catalog.buffer_pool.checkpoint(8);
+
+        // Opportunistic undo log GC + compaction
+        if (self.undo_log) |undo| {
+            undo.gc(tm.oldestActiveTxnId());
+            if (undo.reclaimableBytes() >= 64 * 1024) {
+                undo.compact();
+            }
+        }
     }
 
     fn abortImplicitTxn(self: *Self, txn: ?*Transaction) void {
