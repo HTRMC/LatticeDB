@@ -183,6 +183,9 @@ pub const BufferPool = struct {
     /// Free list of frames
     free_list: std.ArrayList(FrameId),
 
+    /// Background checkpoint state
+    checkpoint_cursor: u32 = 0,
+
     const Self = @This();
 
     /// Create a new buffer pool with the specified number of frames
@@ -428,6 +431,28 @@ pub const BufferPool = struct {
     /// Get the number of pages currently in the pool
     pub fn size(self: *const Self) usize {
         return self.page_table.count();
+    }
+
+    /// Proactively flush up to `batch` dirty unpinned pages to disk.
+    /// Uses a round-robin cursor so work is spread across calls.
+    pub fn checkpoint(self: *Self, batch: u32) void {
+        if (self.pool_size == 0) return;
+
+        var flushed: u32 = 0;
+        var scanned: u32 = 0;
+        const pool: u32 = @intCast(self.pool_size);
+
+        while (flushed < batch and scanned < pool) : (scanned += 1) {
+            const idx = self.checkpoint_cursor % pool;
+            self.checkpoint_cursor = idx + 1;
+
+            const frame = &self.frames[idx];
+            if (frame.is_dirty and frame.pin_count == 0 and frame.page_id != INVALID_PAGE_ID) {
+                self.disk_manager.writePage(frame.page_id, &frame.data) catch continue;
+                frame.is_dirty = false;
+                flushed += 1;
+            }
+        }
     }
 };
 
@@ -826,4 +851,64 @@ test "buffer pool flushPage unknown page" {
 
     // Flushing a page not in the pool should return PageNotFound
     try std.testing.expectError(BufferPoolError.PageNotFound, bp.flushPage(999));
+}
+
+test "buffer pool checkpoint flushes dirty unpinned pages" {
+    const test_file = "test_bp_checkpoint.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 10);
+    defer bp.deinit();
+
+    // Create 3 pages, unpin as dirty
+    var pids: [3]PageId = undefined;
+    for (&pids) |*pid| {
+        const r = try bp.newPage();
+        pid.* = r.page_id;
+        try bp.unpinPage(r.page_id, true);
+    }
+
+    // All should be dirty
+    for (pids) |pid| {
+        try std.testing.expectEqual(@as(?bool, true), bp.isDirty(pid));
+    }
+
+    // Checkpoint with batch=2 — should flush at most 2
+    bp.checkpoint(2);
+    var clean_count: u32 = 0;
+    for (pids) |pid| {
+        if (bp.isDirty(pid) == false) clean_count += 1;
+    }
+    try std.testing.expect(clean_count >= 2);
+
+    // Another checkpoint pass should flush the remaining
+    bp.checkpoint(2);
+    for (pids) |pid| {
+        try std.testing.expectEqual(@as(?bool, false), bp.isDirty(pid));
+    }
+}
+
+test "buffer pool checkpoint skips pinned pages" {
+    const test_file = "test_bp_checkpoint_pin.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 10);
+    defer bp.deinit();
+
+    // Create page and keep it pinned (dirty)
+    const r = try bp.newPage();
+    // newPage sets is_dirty = true and pin_count = 1
+
+    // Checkpoint should NOT flush the pinned page
+    bp.checkpoint(10);
+    try std.testing.expectEqual(@as(?bool, true), bp.isDirty(r.page_id));
+
+    // Unpin and checkpoint again — now it should flush
+    try bp.unpinPage(r.page_id, true);
+    bp.checkpoint(10);
+    try std.testing.expectEqual(@as(?bool, false), bp.isDirty(r.page_id));
 }
