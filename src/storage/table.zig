@@ -69,6 +69,8 @@ pub const Table = struct {
     undo_log: ?*UndoLog,
     /// Allocation manager for extent-based allocation
     alloc_manager: *AllocManager,
+    /// Hint: last page that had a successful insert (avoids full IAM scan)
+    hint_page_id: PageId = INVALID_PAGE_ID,
 
     const Self = @This();
 
@@ -251,6 +253,15 @@ pub const Table = struct {
 
         const tuple_data = buf[0..size];
 
+        // Fast path: try the hint page first (last page with a successful insert)
+        if (self.hint_page_id != INVALID_PAGE_ID) {
+            if (self.tryInsertIntoPage(self.hint_page_id, tuple_data, txn)) |tid| {
+                return tid;
+            } else |_| {
+                self.hint_page_id = INVALID_PAGE_ID;
+            }
+        }
+
         // Read metadata to get IAM page ID
         const meta = try self.readMeta();
 
@@ -291,6 +302,7 @@ pub const Table = struct {
                     try self.incrementTupleCount();
 
                     const tid = TupleId{ .page_id = page_id, .slot_id = sid };
+                    self.hint_page_id = page_id;
 
                     if (txn != null and self.undo_log != null) {
                         try self.writeInsertUndo(txn.?, tid);
@@ -342,6 +354,38 @@ pub const Table = struct {
         try self.incrementTupleCount();
 
         const tid = TupleId{ .page_id = new_start, .slot_id = slot_id };
+        self.hint_page_id = new_start;
+
+        if (txn != null and self.undo_log != null) {
+            try self.writeInsertUndo(txn.?, tid);
+        }
+
+        return tid;
+    }
+
+    /// Try inserting tuple_data into a specific page.
+    /// Returns TupleId on success, error on failure (page full or I/O error).
+    fn tryInsertIntoPage(self: *Self, page_id: PageId, tuple_data: []const u8, txn: ?*Transaction) TableError!TupleId {
+        var pg = self.buffer_pool.fetchPage(page_id) catch {
+            return TableError.BufferPoolError;
+        };
+
+        const pg_header = pg.getHeader();
+        if (pg_header.free_space_end == 0) {
+            pg = Page.init(pg.data, page_id);
+        }
+
+        const slot_id = pg.insertTuple(tuple_data) orelse {
+            self.alloc_manager.updatePfsFreeSpace(page_id, 0) catch {};
+            self.buffer_pool.unpinPage(page_id, false) catch {};
+            return TableError.PageFull;
+        };
+
+        self.alloc_manager.updatePfsFreeSpace(page_id, pg.getFreeSpace()) catch {};
+        self.buffer_pool.unpinPage(page_id, true) catch {};
+        try self.incrementTupleCount();
+
+        const tid = TupleId{ .page_id = page_id, .slot_id = slot_id };
 
         if (txn != null and self.undo_log != null) {
             try self.writeInsertUndo(txn.?, tid);
