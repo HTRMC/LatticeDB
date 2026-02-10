@@ -336,9 +336,7 @@ pub const Wal = struct {
 
     /// Append a COMMIT record
     pub fn logCommit(self: *Self, txn_id: TxnId, prev_lsn: Lsn) WalError!Lsn {
-        const lsn = try self.appendRecord(txn_id, prev_lsn, .commit, &.{});
-        try self.flush();
-        return lsn;
+        return self.appendRecord(txn_id, prev_lsn, .commit, &.{});
     }
 
     /// Append an ABORT record
@@ -854,6 +852,7 @@ test "wal basic operations" {
     const commit_lsn = try wal.logCommit(txn_id, begin_lsn);
     try std.testing.expectEqual(@as(Lsn, 2), commit_lsn);
 
+    try wal.flush();
     try std.testing.expectEqual(@as(Lsn, 2), wal.getFlushedLsn());
 }
 
@@ -893,6 +892,7 @@ test "wal persistence and recovery" {
         _ = try wal.logBegin(2);
         _ = try wal.logCommit(2, 3);
 
+        try wal.flush();
         try std.testing.expectEqual(@as(Lsn, 4), wal.getFlushedLsn());
     }
 
@@ -975,7 +975,6 @@ test "wal multiple transactions" {
     _ = try wal.logCommit(1, t1_update);
     _ = try wal.logAbort(2, t2_update);
 
-    try std.testing.expectEqual(@as(Lsn, 5), wal.getFlushedLsn());
     try wal.flush();
     try std.testing.expectEqual(@as(Lsn, 6), wal.getFlushedLsn());
 
