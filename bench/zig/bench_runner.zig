@@ -97,6 +97,29 @@ pub fn execSQL(exec: *Executor, sql: []const u8) void {
     exec.freeResult(result);
 }
 
+/// Execute a prepared statement with params, free result immediately. Panics on error.
+pub fn execPreparedSQL(exec: *Executor, stmt: *const Executor.PreparedStatement, params: []const engine.parser.ast.LiteralValue) void {
+    const result = exec.executePrepared(stmt, params) catch |err| {
+        std.debug.print("BENCH PREPARED SQL ERROR: {s}\n", .{@errorName(err)});
+        @panic("benchmark prepared SQL failed");
+    };
+    exec.freeResult(result);
+}
+
+/// Execute a prepared statement with params and return the row count. Panics on error.
+pub fn execPreparedSQLRowCount(exec: *Executor, stmt: *const Executor.PreparedStatement, params: []const engine.parser.ast.LiteralValue) u64 {
+    const result = exec.executePrepared(stmt, params) catch |err| {
+        std.debug.print("BENCH PREPARED SQL ERROR: {s}\n", .{@errorName(err)});
+        @panic("benchmark prepared SQL failed");
+    };
+    defer exec.freeResult(result);
+    return switch (result) {
+        .rows => |r| r.rows.len,
+        .row_count => |c| c,
+        .message => 0,
+    };
+}
+
 /// Execute SQL and return the row count from SELECT. Panics on error.
 pub fn execSQLRowCount(exec: *Executor, sql: []const u8) u64 {
     const result = exec.execute(sql) catch |err| {

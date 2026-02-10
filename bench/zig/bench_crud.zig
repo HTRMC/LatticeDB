@@ -1,5 +1,7 @@
 const std = @import("std");
 const bench_runner = @import("bench_runner.zig");
+const engine = @import("engine");
+const ast = engine.parser.ast;
 
 const BenchContext = bench_runner.BenchContext;
 const BenchmarkResult = bench_runner.BenchmarkResult;
@@ -74,17 +76,26 @@ pub fn run(ctx: *BenchContext, results: *std.ArrayListUnmanaged(BenchmarkResult)
 
 fn bulkInsert(ctx: *BenchContext) void {
     const n = @as(u32, 1000) * ctx.scale_factor;
-    var buf: [256]u8 = undefined;
+
+    var stmt = ctx.exec.prepare("INSERT INTO bench_data VALUES ($1, $2, $3, $4, $5)") catch @panic("prepare failed");
+    defer stmt.deinit();
+
+    var label_buf: [32]u8 = undefined;
     for (0..n) |i| {
         const id: u32 = @intCast(i);
         const val = (id *% 7 +% 13) % 1000;
         const category = id % 10;
         const amount_int = (id *% 3 +% 7) % 500;
-        const sql = std.fmt.bufPrint(&buf,
-            "INSERT INTO bench_data VALUES ({d}, {d}, {d}, 'item_{d}', {d}.0)",
-            .{ id, val, category, id, amount_int },
-        ) catch @panic("buf overflow");
-        execSQL(ctx.exec, sql);
+        const label = std.fmt.bufPrint(&label_buf, "item_{d}", .{id}) catch @panic("buf overflow");
+
+        const params = [_]ast.LiteralValue{
+            .{ .integer = @intCast(id) },
+            .{ .integer = @intCast(val) },
+            .{ .integer = @intCast(category) },
+            .{ .string = label },
+            .{ .float = @floatFromInt(amount_int) },
+        };
+        bench_runner.execPreparedSQL(ctx.exec, &stmt, &params);
     }
 }
 

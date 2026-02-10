@@ -1,5 +1,7 @@
 const std = @import("std");
 const bench_runner = @import("bench_runner.zig");
+const engine = @import("engine");
+const ast = engine.parser.ast;
 
 const BenchContext = bench_runner.BenchContext;
 const BenchmarkResult = bench_runner.BenchmarkResult;
@@ -40,49 +42,60 @@ pub fn run(ctx: *BenchContext, results: *std.ArrayListUnmanaged(BenchmarkResult)
 
 fn txnThroughput(ctx: *BenchContext) void {
     const n = @as(u32, 100) * ctx.scale_factor;
-    var buf: [128]u8 = undefined;
+
+    var stmt = ctx.exec.prepare("INSERT INTO bench_txn VALUES ($1, $2)") catch @panic("prepare failed");
+    defer stmt.deinit();
+
     for (0..n) |i| {
         execSQL(ctx.exec, "BEGIN");
-        const sql = std.fmt.bufPrint(&buf,
-            "INSERT INTO bench_txn VALUES ({d}, {d})",
-            .{ @as(u32, @intCast(i)) + 10000, @as(u32, @intCast(i)) },
-        ) catch @panic("buf overflow");
-        execSQL(ctx.exec, sql);
+        const params = [_]ast.LiteralValue{
+            .{ .integer = @as(i64, @intCast(i)) + 10000 },
+            .{ .integer = @intCast(i) },
+        };
+        bench_runner.execPreparedSQL(ctx.exec, &stmt, &params);
         execSQL(ctx.exec, "COMMIT");
     }
 }
 
 fn rollbackOverhead(ctx: *BenchContext) void {
     const n = @as(u32, 100) * ctx.scale_factor;
-    var buf: [128]u8 = undefined;
+
+    var stmt = ctx.exec.prepare("INSERT INTO bench_txn VALUES ($1, $2)") catch @panic("prepare failed");
+    defer stmt.deinit();
+
     for (0..n) |i| {
         execSQL(ctx.exec, "BEGIN");
-        const sql = std.fmt.bufPrint(&buf,
-            "INSERT INTO bench_txn VALUES ({d}, {d})",
-            .{ @as(u32, @intCast(i)) + 90000, @as(u32, @intCast(i)) },
-        ) catch @panic("buf overflow");
-        execSQL(ctx.exec, sql);
+        const params = [_]ast.LiteralValue{
+            .{ .integer = @as(i64, @intCast(i)) + 90000 },
+            .{ .integer = @intCast(i) },
+        };
+        bench_runner.execPreparedSQL(ctx.exec, &stmt, &params);
         execSQL(ctx.exec, "ROLLBACK");
     }
 }
 
 fn mixedReadWrite(ctx: *BenchContext) void {
     const n = @as(u32, 100) * ctx.scale_factor;
-    var buf: [128]u8 = undefined;
+
+    var insert_stmt = ctx.exec.prepare("INSERT INTO bench_txn VALUES ($1, $2)") catch @panic("prepare failed");
+    defer insert_stmt.deinit();
+
+    var select_stmt = ctx.exec.prepare("SELECT * FROM bench_txn WHERE id = $1") catch @panic("prepare failed");
+    defer select_stmt.deinit();
+
     for (0..n) |i| {
         // Insert
-        const insert_sql = std.fmt.bufPrint(&buf,
-            "INSERT INTO bench_txn VALUES ({d}, {d})",
-            .{ @as(u32, @intCast(i)) + 50000, @as(u32, @intCast(i)) },
-        ) catch @panic("buf overflow");
-        execSQL(ctx.exec, insert_sql);
+        const insert_params = [_]ast.LiteralValue{
+            .{ .integer = @as(i64, @intCast(i)) + 50000 },
+            .{ .integer = @intCast(i) },
+        };
+        bench_runner.execPreparedSQL(ctx.exec, &insert_stmt, &insert_params);
 
         // Read random row
         const read_id = (@as(u32, @intCast(i)) *% 7 +% 3) % (@as(u32, @intCast(i)) + 1) + 50000;
-        const read_sql = std.fmt.bufPrint(&buf,
-            "SELECT * FROM bench_txn WHERE id = {d}",
-            .{read_id},
-        ) catch @panic("buf overflow");
-        _ = bench_runner.execSQLRowCount(ctx.exec, read_sql);
+        const select_params = [_]ast.LiteralValue{
+            .{ .integer = @intCast(read_id) },
+        };
+        _ = bench_runner.execPreparedSQLRowCount(ctx.exec, &select_stmt, &select_params);
     }
 }
