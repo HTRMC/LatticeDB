@@ -10,6 +10,7 @@ const undo_log_mod = @import("../storage/undo_log.zig");
 const btree_mod = @import("../index/btree.zig");
 const planner_mod = @import("../planner/planner.zig");
 const plan_mod = @import("../planner/plan.zig");
+const vec_exec_mod = @import("vec_exec.zig");
 
 const Value = tuple_mod.Value;
 const Column = tuple_mod.Column;
@@ -878,6 +879,40 @@ pub const Executor = struct {
             if (join_list.len > 0) {
                 return self.execSelectJoin(sel);
             }
+        }
+
+        // Try vectorized execution for eligible queries (no params for now)
+        if (self.current_params == null and vec_exec_mod.canUseVectorized(sel)) {
+            const vresult = self.catalog.openTable(sel.table_name) catch {
+                return ExecError.StorageError;
+            } orelse return ExecError.TableNotFound;
+            defer self.catalog.freeSchema(vresult.schema);
+            var vtable = vresult.table;
+            vtable.txn_manager = self.txn_manager;
+            vtable.undo_log = self.undo_log;
+
+            const vtxn = self.current_txn orelse self.beginImplicitTxn();
+            if (vtxn) |t| {
+                if (t.isolation_level == .read_committed) {
+                    if (self.txn_manager) |tm| {
+                        tm.refreshSnapshot(t) catch {};
+                    }
+                }
+            }
+
+            const exec_result = vec_exec_mod.execSelectVectorized(
+                self.allocator,
+                sel,
+                &vtable,
+                vresult.schema,
+                vtxn,
+            ) catch |err| {
+                self.abortImplicitTxn(vtxn);
+                return err;
+            };
+
+            self.commitImplicitTxn(vtxn);
+            return exec_result;
         }
 
         const result = self.catalog.openTable(sel.table_name) catch {

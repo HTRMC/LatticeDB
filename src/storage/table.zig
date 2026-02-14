@@ -47,7 +47,7 @@ const META_RESERVED_SIZE: usize = 64;
 
 /// Table metadata stored in slot 0 of the meta page.
 /// Extent ownership is tracked via IAM page chain.
-const TableMeta = extern struct {
+pub const TableMeta = extern struct {
     iam_page_id: PageId,
     _reserved: u32,
     tuple_count: u64,
@@ -710,7 +710,7 @@ pub const Table = struct {
     // ── Internal helpers ─────────────────────────────────────────────
 
     /// Read table metadata from slot 0
-    fn readMeta(self: *Self) TableError!TableMeta {
+    pub fn readMeta(self: *Self) TableError!TableMeta {
         var pg = self.buffer_pool.fetchPage(self.table_id) catch {
             return TableError.BufferPoolError;
         };
