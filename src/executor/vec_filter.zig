@@ -20,6 +20,47 @@ pub const SimplePredicate = struct {
     literal: Value,
 };
 
+/// Try to detect a BETWEEN expression as two SIMD-eligible predicates: col >= low AND col <= high.
+/// Returns null if the expression is not a BETWEEN on a numeric column with literal bounds.
+pub fn detectBetweenPredicate(expr: *const ast.Expression, schema: *const Schema) ?[2]SimplePredicate {
+    switch (expr.*) {
+        .between_expr => |b| {
+            // value must be a column ref
+            const col_name = switch (b.value.*) {
+                .column_ref => |name| name,
+                else => return null,
+            };
+            const col_idx = findColumnIndex(schema, col_name) orelse return null;
+            const col_type = schema.columns[col_idx].col_type;
+
+            // Only numeric types for SIMD
+            switch (col_type) {
+                .integer, .bigint, .float => {},
+                else => return null,
+            }
+
+            // low and high must be literals
+            const low_lit = switch (b.low.*) {
+                .literal => |l| l,
+                else => return null,
+            };
+            const high_lit = switch (b.high.*) {
+                .literal => |l| l,
+                else => return null,
+            };
+
+            const low_val = literalToValue(low_lit, col_type) orelse return null;
+            const high_val = literalToValue(high_lit, col_type) orelse return null;
+
+            return .{
+                .{ .col_idx = col_idx, .col_type = col_type, .op = .gte, .literal = low_val },
+                .{ .col_idx = col_idx, .col_type = col_type, .op = .lte, .literal = high_val },
+            };
+        },
+        else => return null,
+    }
+}
+
 /// Try to detect a simple SIMD-eligible predicate from a WHERE expression.
 /// Returns null if the expression is too complex for the SIMD path.
 pub fn detectSimplePredicate(expr: *const ast.Expression, schema: *const Schema) ?SimplePredicate {
@@ -158,6 +199,30 @@ fn simdCompare_f64(data: Vec4f64, splat: Vec4f64, op: ast.CompOp) @Vector(SimdWi
         .lte => data <= splat,
         .gte => data >= splat,
     };
+}
+
+/// Apply a SIMD filter that intersects with an existing selection vector.
+/// Used for the second pass of BETWEEN (col >= low already applied, now col <= high).
+pub fn filterSimdWithSel(chunk: *DataChunk, pred: SimplePredicate) SelectionVector {
+    var result = SelectionVector{};
+    const existing_sel = chunk.sel orelse return filterSimd(chunk, pred);
+
+    // Apply pred only to rows that passed the first filter
+    const col = &chunk.columns[pred.col_idx];
+    for (existing_sel.indices[0..existing_sel.len]) |row_idx| {
+        if (col.isNull(row_idx)) continue;
+        const matches = switch (pred.col_type) {
+            .integer => scalarCompare_i32(col.data.integers[row_idx], pred.literal.integer, pred.op),
+            .bigint => scalarCompare_i64(col.data.bigints[row_idx], pred.literal.bigint, pred.op),
+            .float => scalarCompare_f64(col.data.floats[row_idx], pred.literal.float, pred.op),
+            else => false,
+        };
+        if (matches) {
+            result.indices[result.len] = row_idx;
+            result.len += 1;
+        }
+    }
+    return result;
 }
 
 /// Apply a SIMD filter for a simple numeric predicate on a DataChunk.

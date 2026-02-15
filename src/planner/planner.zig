@@ -29,6 +29,11 @@ pub const Planner = struct {
         return .{ .allocator = allocator, .catalog = catalog };
     }
 
+    /// Plan a SELECT using a pre-opened table (avoids redundant catalog lookups).
+    pub fn planSelectWithTable(self: *Self, sel: ast.Select, table_id: page_mod.PageId, s: *const Schema, row_count: u64) PlanError!*PlanNode {
+        return self.planSelectInner(sel, table_id, s, row_count);
+    }
+
     /// Plan a SELECT statement. Caller must free the returned plan tree with freePlan.
     pub fn planSelect(self: *Self, sel: ast.Select) PlanError!*PlanNode {
         // Look up table
@@ -42,6 +47,10 @@ pub const Planner = struct {
         var table = table_result.?.table;
         const row_count = table.tupleCount() catch 0;
 
+        return self.planSelectInner(sel, table_id, schema, row_count);
+    }
+
+    fn planSelectInner(self: *Self, sel: ast.Select, table_id: page_mod.PageId, schema: *const Schema, row_count: u64) PlanError!*PlanNode {
         // Get available indexes
         const indexes = self.catalog.getIndexesForTable(table_id) catch return PlanError.StorageError;
         defer self.catalog.freeIndexList(indexes);

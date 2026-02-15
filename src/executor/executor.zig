@@ -711,9 +711,10 @@ pub const Executor = struct {
         txn: ?*Transaction,
         rows: *std.ArrayList(ResultRow),
     ) bool {
-        // Run planner
+        // Run planner using pre-opened table info to avoid redundant catalog lookups
+        const row_count = table.tupleCount() catch return false;
         var planner = planner_mod.Planner.init(self.allocator, self.catalog);
-        const plan = planner.planSelect(sel) catch return false;
+        const plan = planner.planSelectWithTable(sel, table.table_id, schema, row_count) catch return false;
         defer planner.freePlan(plan);
 
         // Find the base node (unwrap filter/sort/limit wrappers)
@@ -881,40 +882,6 @@ pub const Executor = struct {
             }
         }
 
-        // Try vectorized execution for eligible queries (no params for now)
-        if (self.current_params == null and vec_exec_mod.canUseVectorized(sel)) {
-            const vresult = self.catalog.openTable(sel.table_name) catch {
-                return ExecError.StorageError;
-            } orelse return ExecError.TableNotFound;
-            defer self.catalog.freeSchema(vresult.schema);
-            var vtable = vresult.table;
-            vtable.txn_manager = self.txn_manager;
-            vtable.undo_log = self.undo_log;
-
-            const vtxn = self.current_txn orelse self.beginImplicitTxn();
-            if (vtxn) |t| {
-                if (t.isolation_level == .read_committed) {
-                    if (self.txn_manager) |tm| {
-                        tm.refreshSnapshot(t) catch {};
-                    }
-                }
-            }
-
-            const exec_result = vec_exec_mod.execSelectVectorized(
-                self.allocator,
-                sel,
-                &vtable,
-                vresult.schema,
-                vtxn,
-            ) catch |err| {
-                self.abortImplicitTxn(vtxn);
-                return err;
-            };
-
-            self.commitImplicitTxn(vtxn);
-            return exec_result;
-        }
-
         const result = self.catalog.openTable(sel.table_name) catch {
             return ExecError.StorageError;
         } orelse return ExecError.TableNotFound;
@@ -984,7 +951,28 @@ pub const Executor = struct {
         const used_index = self.tryIndexScan(sel, &table, schema, col_indices, txn, &rows);
 
         if (!used_index) {
-            // Fall back to sequential scan
+            // Planner chose seq_scan — try vectorized execution (reuse already-opened table)
+            if (self.current_params == null and vec_exec_mod.canUseVectorized(sel)) {
+                // Free col_names from scalar setup — vectorized builds its own
+                for (col_names) |cn| self.allocator.free(cn);
+                self.allocator.free(col_names);
+
+                const exec_result = vec_exec_mod.execSelectVectorized(
+                    self.allocator,
+                    sel,
+                    &table,
+                    schema,
+                    txn,
+                ) catch |err| {
+                    self.abortImplicitTxn(txn);
+                    return err;
+                };
+
+                self.commitImplicitTxn(txn);
+                return exec_result;
+            }
+
+            // Fall back to scalar sequential scan
             var iter = table.scanWithTxn(txn) catch {
                 for (col_names) |cn| self.allocator.free(cn);
                 self.allocator.free(col_names);

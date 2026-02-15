@@ -44,16 +44,20 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
     // ── Benchmark executable (no msquic/openssl needed) ──────────────
+    // Always build benchmarks with ReleaseFast for meaningful results
+    // (SIMD vectorization, no safety checks, full compiler optimizations)
+    const bench_optimize = if (optimize != .Debug) optimize else .ReleaseFast;
+
     const engine_mod = b.createModule(.{
         .root_source_file = b.path("src/engine.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = bench_optimize,
     });
 
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/zig/bench_main.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = bench_optimize,
     });
     bench_mod.addImport("engine", engine_mod);
 
