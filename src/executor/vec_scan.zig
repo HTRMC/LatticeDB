@@ -7,6 +7,7 @@ const mvcc_mod = @import("../storage/mvcc.zig");
 const iam_mod = @import("../storage/iam.zig");
 const buffer_pool_mod = @import("../storage/buffer_pool.zig");
 const alloc_map_mod = @import("../storage/alloc_map.zig");
+const ast = @import("../parser/ast.zig");
 
 const DataChunk = vector_mod.DataChunk;
 const ColumnVector = vector_mod.ColumnVector;
@@ -37,6 +38,17 @@ pub const VecScanError = error{
 /// (worst case large tuples), 128 is more than enough.
 const MAX_PINNED_PAGES = 128;
 
+/// A predicate pushed down into the scan. Evaluated on raw tuple bytes
+/// before deserialization — non-matching rows are never written to the chunk.
+pub const ScanPredicate = struct {
+    col_idx: usize,
+    col_type: ColumnType,
+    op: ast.CompOp,
+    literal: Value,
+};
+
+const MAX_SCAN_PREDS = 2;
+
 /// Vectorized sequential scan that produces DataChunks from table pages.
 /// Walks the IAM chain (same as Table.ScanIterator) but fills columnar batches.
 pub const VecSeqScan = struct {
@@ -58,13 +70,14 @@ pub const VecSeqScan = struct {
     // Reusable chunk
     chunk: DataChunk,
 
-    // Deferred string materialization: when enabled, varchar/text columns store
-    // raw pointers into pinned page data instead of arena-duped copies.
-    // After filtering, call materializeSurvivingStrings() to dupe only surviving
-    // rows and unpin pages.
+    // Deferred string materialization
     defer_strings: bool,
     pinned_pages: [MAX_PINNED_PAGES]PageId,
     pinned_count: u8,
+
+    // Scan-filter fusion: predicates evaluated on raw tuple bytes
+    scan_preds: [MAX_SCAN_PREDS]ScanPredicate,
+    scan_pred_count: u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -90,7 +103,23 @@ pub const VecSeqScan = struct {
             .defer_strings = false,
             .pinned_pages = undefined,
             .pinned_count = 0,
+            .scan_preds = undefined,
+            .scan_pred_count = 0,
         };
+    }
+
+    /// Add a predicate to be evaluated during scan (before deserialization).
+    /// Returns true if the predicate was accepted, false if scan fusion isn't possible.
+    pub fn addScanPredicate(self: *VecSeqScan, pred: ScanPredicate) bool {
+        if (self.scan_pred_count >= MAX_SCAN_PREDS) return false;
+        // Only numeric types
+        switch (pred.col_type) {
+            .integer, .bigint, .float => {},
+            else => return false,
+        }
+        self.scan_preds[self.scan_pred_count] = pred;
+        self.scan_pred_count += 1;
+        return true;
     }
 
     pub fn deinit(self: *VecSeqScan) void {
@@ -152,17 +181,20 @@ pub const VecSeqScan = struct {
                 while (slot < pg_header.slot_count and row_idx < VECTOR_SIZE) : (slot += 1) {
                     if (pg.getTuple(slot)) |raw| {
                         // MVCC visibility check
-                        if (self.txn != null and self.txn_manager != null) {
+                        const user_data = if (self.txn != null and self.txn_manager != null) blk: {
                             if (raw.len < TupleHeader.SIZE) continue;
                             const stripped = Tuple.stripHeader(raw) catch continue;
                             const vis = mvcc_mod.isVisible(&stripped.header, &self.txn.?.snapshot, self.txn_manager.?, self.txn.?.txn_id);
                             if (vis == .invisible) continue;
+                            break :blk stripped.user_data;
+                        } else raw;
 
-                            self.deserializeIntoChunk(stripped.user_data, row_idx) catch continue;
-                        } else {
-                            // Legacy mode: no header
-                            self.deserializeIntoChunk(raw, row_idx) catch continue;
+                        // Scan-filter fusion: check predicates on raw bytes before deserializing
+                        if (self.scan_pred_count > 0) {
+                            if (!self.matchesScanPredicates(user_data)) continue;
                         }
+
+                        self.deserializeIntoChunk(user_data, row_idx) catch continue;
                         row_idx += 1;
                     }
                 }
@@ -199,6 +231,59 @@ pub const VecSeqScan = struct {
         return &self.chunk;
     }
 
+    /// Evaluate all scan predicates against raw tuple bytes.
+    /// Returns true if the row matches ALL predicates (AND semantics).
+    fn matchesScanPredicates(self: *const VecSeqScan, data: []const u8) bool {
+        const bitmap_size = self.schema.nullBitmapSize();
+        if (data.len < bitmap_size) return false;
+
+        for (self.scan_preds[0..self.scan_pred_count]) |pred| {
+            // Check null for predicate column
+            const is_null = (data[pred.col_idx / 8] & (@as(u8, 1) << @as(u3, @intCast(pred.col_idx % 8)))) != 0;
+            if (is_null) return false;
+
+            // Compute byte offset to predicate column by walking preceding columns
+            var offset: usize = bitmap_size;
+            for (self.schema.columns[0..pred.col_idx], 0..) |col_def, ci| {
+                const col_null = (data[ci / 8] & (@as(u8, 1) << @as(u3, @intCast(ci % 8)))) != 0;
+                if (!col_null) {
+                    switch (col_def.col_type) {
+                        .boolean => offset += 1,
+                        .integer => offset += 4,
+                        .bigint, .float => offset += 8,
+                        .varchar, .text => {
+                            if (offset + 2 > data.len) return false;
+                            const str_len = std.mem.bytesToValue(u16, data[offset..][0..2]);
+                            offset += 2 + str_len;
+                        },
+                    }
+                }
+            }
+
+            // Read and compare
+            const matches = switch (pred.col_type) {
+                .integer => blk: {
+                    if (offset + 4 > data.len) break :blk false;
+                    const val = std.mem.bytesToValue(i32, data[offset..][0..4]);
+                    break :blk cmpI32(val, pred.literal.integer, pred.op);
+                },
+                .bigint => blk: {
+                    if (offset + 8 > data.len) break :blk false;
+                    const val = std.mem.bytesToValue(i64, data[offset..][0..8]);
+                    break :blk cmpI64(val, pred.literal.bigint, pred.op);
+                },
+                .float => blk: {
+                    if (offset + 8 > data.len) break :blk false;
+                    const val = std.mem.bytesToValue(f64, data[offset..][0..8]);
+                    break :blk cmpF64(val, pred.literal.float, pred.op);
+                },
+                else => true,
+            };
+            if (!matches) return false;
+        }
+        return true;
+    }
+
     /// After filtering, dupe surviving row strings into the arena and unpin pages.
     /// Only needed when defer_strings is enabled.
     pub fn materializeSurvivingStrings(self: *VecSeqScan) void {
@@ -211,7 +296,6 @@ pub const VecSeqScan = struct {
             switch (col_def.col_type) {
                 .varchar, .text => {
                     if (chunk.sel) |sel| {
-                        // Only dupe strings for rows that survived the filter
                         for (sel.indices[0..sel.len]) |row_idx| {
                             if (!chunk.columns[i].isNull(row_idx)) {
                                 const raw = chunk.columns[i].data.bytes_ptrs[row_idx];
@@ -222,7 +306,6 @@ pub const VecSeqScan = struct {
                             }
                         }
                     } else {
-                        // No selection vector — dupe all rows
                         var r: u16 = 0;
                         while (r < chunk.count) : (r += 1) {
                             if (!chunk.columns[i].isNull(r)) {
@@ -255,7 +338,6 @@ pub const VecSeqScan = struct {
         const bitmap_size = self.schema.nullBitmapSize();
 
         if (data.len < bitmap_size) {
-            // Short tuple: fill all columns with null
             for (self.chunk.columns) |*col| {
                 col.setNull(row_idx);
             }
@@ -269,7 +351,6 @@ pub const VecSeqScan = struct {
                 self.chunk.columns[i].setNull(row_idx);
             } else {
                 if (offset >= data.len) {
-                    // Short tuple — column added after this tuple was written
                     self.chunk.columns[i].setNull(row_idx);
                 } else {
                     self.chunk.columns[i].clearNull(row_idx);
@@ -304,10 +385,8 @@ pub const VecSeqScan = struct {
                                 offset += 2;
                                 if (offset + str_len <= data.len) {
                                     if (self.defer_strings) {
-                                        // Store raw pointer into page data (page stays pinned)
                                         self.chunk.columns[i].data.bytes_ptrs[row_idx] = data[offset..][0..str_len];
                                     } else {
-                                        // Dupe string into the chunk's arena (page will be unpinned)
                                         const duped = self.chunk.arena.allocator().dupe(u8, data[offset..][0..str_len]) catch return error.OutOfMemory;
                                         self.chunk.columns[i].data.bytes_ptrs[row_idx] = duped;
                                     }
@@ -326,3 +405,37 @@ pub const VecSeqScan = struct {
         _ = col_count;
     }
 };
+
+// Scalar comparison helpers for scan-filter fusion
+fn cmpI32(a: i32, b: i32, op: ast.CompOp) bool {
+    return switch (op) {
+        .eq => a == b,
+        .neq => a != b,
+        .lt => a < b,
+        .gt => a > b,
+        .lte => a <= b,
+        .gte => a >= b,
+    };
+}
+
+fn cmpI64(a: i64, b: i64, op: ast.CompOp) bool {
+    return switch (op) {
+        .eq => a == b,
+        .neq => a != b,
+        .lt => a < b,
+        .gt => a > b,
+        .lte => a <= b,
+        .gte => a >= b,
+    };
+}
+
+fn cmpF64(a: f64, b: f64, op: ast.CompOp) bool {
+    return switch (op) {
+        .eq => a == b,
+        .neq => a != b,
+        .lt => a < b,
+        .gt => a > b,
+        .lte => a <= b,
+        .gte => a >= b,
+    };
+}

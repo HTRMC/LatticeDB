@@ -122,15 +122,46 @@ pub fn execSelectVectorized(
     };
     defer scan.deinit();
 
-    // Enable deferred string materialization when filter is pure SIMD.
-    // Strings are stored as raw page pointers during scan, then only surviving
-    // rows get arena-duped after filtering — avoids copying strings for filtered-out rows.
-    const has_text_cols = for (schema.columns) |col| {
-        if (col.col_type == .varchar or col.col_type == .text) break true;
-    } else false;
-    const has_simd_filter = simd_pred != null or between_preds != null;
-    if (has_text_cols and has_simd_filter and !needs_general_filter) {
-        scan.defer_strings = true;
+    // Try scan-filter fusion: push predicate into scan so non-matching rows
+    // are never deserialized. Chunk comes back dense-packed with only matching rows.
+    var scan_fused = false;
+    if (!needs_general_filter) {
+        if (simd_pred) |pred| {
+            scan_fused = scan.addScanPredicate(.{
+                .col_idx = pred.col_idx,
+                .col_type = pred.col_type,
+                .op = pred.op,
+                .literal = pred.literal,
+            });
+        }
+        if (between_preds) |preds| {
+            const ok0 = scan.addScanPredicate(.{
+                .col_idx = preds[0].col_idx,
+                .col_type = preds[0].col_type,
+                .op = preds[0].op,
+                .literal = preds[0].literal,
+            });
+            const ok1 = scan.addScanPredicate(.{
+                .col_idx = preds[1].col_idx,
+                .col_type = preds[1].col_type,
+                .op = preds[1].op,
+                .literal = preds[1].literal,
+            });
+            if (ok0 and ok1) scan_fused = true;
+        }
+    }
+
+    // Enable deferred string materialization when filter is NOT fused into scan
+    // and is pure SIMD. With scan fusion, only matching rows are deserialized
+    // so deferred strings aren't needed.
+    if (!scan_fused and !needs_general_filter) {
+        const has_text_cols = for (schema.columns) |col| {
+            if (col.col_type == .varchar or col.col_type == .text) break true;
+        } else false;
+        const has_simd_filter = simd_pred != null or between_preds != null;
+        if (has_text_cols and has_simd_filter) {
+            scan.defer_strings = true;
+        }
     }
 
     const limit: ?usize = if (sel.limit) |l| @intCast(l) else null;
@@ -149,6 +180,7 @@ pub fn execSelectVectorized(
             simd_pred,
             between_preds,
             needs_general_filter,
+            scan_fused,
         );
     }
 
@@ -169,14 +201,16 @@ pub fn execSelectVectorized(
         allocator.free(col_names);
         return ExecError.StorageError;
     }) |chunk| {
-        // Apply SIMD filter(s)
-        if (simd_pred) |pred| {
-            chunk.sel = vec_filter_mod.filterSimd(chunk, pred);
-        }
+        // Apply filters (skip SIMD when fused into scan)
+        if (!scan_fused) {
+            if (simd_pred) |pred| {
+                chunk.sel = vec_filter_mod.filterSimd(chunk, pred);
+            }
 
-        if (between_preds) |preds| {
-            chunk.sel = vec_filter_mod.filterSimd(chunk, preds[0]);
-            chunk.sel = vec_filter_mod.filterSimdWithSel(chunk, preds[1]);
+            if (between_preds) |preds| {
+                chunk.sel = vec_filter_mod.filterSimd(chunk, preds[0]);
+                chunk.sel = vec_filter_mod.filterSimdWithSel(chunk, preds[1]);
+            }
         }
 
         if (needs_general_filter) {
@@ -271,6 +305,7 @@ fn execVectorizedWithOrderBy(
     simd_pred: ?vec_filter_mod.SimplePredicate,
     between_preds: ?[2]vec_filter_mod.SimplePredicate,
     needs_general_filter: bool,
+    scan_fused: bool,
 ) ExecError!ExecResult {
     var collected: std.ArrayList(CollectedRow) = .empty;
     collected.ensureTotalCapacity(allocator, if (limit) |l| @min(l, 256) else 256) catch {};
@@ -284,12 +319,14 @@ fn execVectorizedWithOrderBy(
         allocator.free(col_names);
         return ExecError.StorageError;
     }) |chunk| {
-        if (simd_pred) |pred| {
-            chunk.sel = vec_filter_mod.filterSimd(chunk, pred);
-        }
-        if (between_preds) |preds| {
-            chunk.sel = vec_filter_mod.filterSimd(chunk, preds[0]);
-            chunk.sel = vec_filter_mod.filterSimdWithSel(chunk, preds[1]);
+        if (!scan_fused) {
+            if (simd_pred) |pred| {
+                chunk.sel = vec_filter_mod.filterSimd(chunk, pred);
+            }
+            if (between_preds) |preds| {
+                chunk.sel = vec_filter_mod.filterSimd(chunk, preds[0]);
+                chunk.sel = vec_filter_mod.filterSimdWithSel(chunk, preds[1]);
+            }
         }
         if (needs_general_filter) {
             if (sel.where_clause) |where| {
