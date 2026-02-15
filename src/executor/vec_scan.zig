@@ -393,7 +393,6 @@ pub const VecSeqScan = struct {
 
     /// Deserialize raw tuple bytes directly into the chunk's column vectors at row_idx.
     fn deserializeIntoChunk(self: *VecSeqScan, data: []const u8, row_idx: u16) !void {
-        const col_count = self.schema.columns.len;
         const bitmap_size = self.schema.nullBitmapSize();
 
         if (data.len < bitmap_size) {
@@ -412,30 +411,41 @@ pub const VecSeqScan = struct {
                 if (offset >= data.len) {
                     self.chunk.columns[i].setNull(row_idx);
                 } else {
-                    self.chunk.columns[i].clearNull(row_idx);
                     switch (col_def.col_type) {
                         .boolean => {
                             if (offset < data.len) {
+                                self.chunk.columns[i].clearNull(row_idx);
                                 self.chunk.columns[i].data.booleans[row_idx] = data[offset] != 0;
                                 offset += 1;
+                            } else {
+                                self.chunk.columns[i].setNull(row_idx);
                             }
                         },
                         .integer => {
                             if (offset + 4 <= data.len) {
+                                self.chunk.columns[i].clearNull(row_idx);
                                 self.chunk.columns[i].data.integers[row_idx] = std.mem.bytesToValue(i32, data[offset..][0..4]);
                                 offset += 4;
+                            } else {
+                                self.chunk.columns[i].setNull(row_idx);
                             }
                         },
                         .bigint => {
                             if (offset + 8 <= data.len) {
+                                self.chunk.columns[i].clearNull(row_idx);
                                 self.chunk.columns[i].data.bigints[row_idx] = std.mem.bytesToValue(i64, data[offset..][0..8]);
                                 offset += 8;
+                            } else {
+                                self.chunk.columns[i].setNull(row_idx);
                             }
                         },
                         .float => {
                             if (offset + 8 <= data.len) {
+                                self.chunk.columns[i].clearNull(row_idx);
                                 self.chunk.columns[i].data.floats[row_idx] = std.mem.bytesToValue(f64, data[offset..][0..8]);
                                 offset += 8;
+                            } else {
+                                self.chunk.columns[i].setNull(row_idx);
                             }
                         },
                         .varchar, .text => {
@@ -443,6 +453,7 @@ pub const VecSeqScan = struct {
                                 const str_len = std.mem.bytesToValue(u16, data[offset..][0..2]);
                                 offset += 2;
                                 if (offset + str_len <= data.len) {
+                                    self.chunk.columns[i].clearNull(row_idx);
                                     if (self.defer_strings) {
                                         self.chunk.columns[i].data.bytes_ptrs[row_idx] = data[offset..][0..str_len];
                                     } else {
@@ -461,7 +472,6 @@ pub const VecSeqScan = struct {
                 }
             }
         }
-        _ = col_count;
     }
 };
 
