@@ -34,6 +34,8 @@ pub const VecHashAggregate = struct {
     agg_col_indices: []?usize,
     group_by_indices: []usize,
     groups: std.StringArrayHashMap(GroupState),
+    // Reusable key buffer to avoid per-row allocation
+    key_buf: std.ArrayList(u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, sel: ast.Select, schema: *const Schema) !VecHashAggregate {
         const num_cols = sel.columns.len;
@@ -96,6 +98,7 @@ pub const VecHashAggregate = struct {
     }
 
     pub fn deinit(self: *VecHashAggregate) void {
+        self.key_buf.deinit(self.allocator);
         for (self.groups.values()) |*gs| self.freeGroupState(gs);
         for (self.groups.keys()) |k| self.allocator.free(k);
         self.groups.deinit();
@@ -121,87 +124,39 @@ pub const VecHashAggregate = struct {
 
     fn processRow(self: *VecHashAggregate, chunk: *DataChunk, row_idx: u16, has_group_by: bool) void {
         if (has_group_by) {
-            // Build group key
-            var key_parts: std.ArrayList(u8) = .empty;
+            // Build group key into reusable buffer (no allocation per row)
+            self.key_buf.clearRetainingCapacity();
             for (self.group_by_indices, 0..) |gi, idx| {
-                if (idx > 0) key_parts.append(self.allocator, 0) catch {
-                    key_parts.deinit(self.allocator);
-                    return;
-                };
+                if (idx > 0) self.key_buf.append(self.allocator, 0) catch return;
                 const val = chunk.columns[gi].getValue(row_idx);
-                const fv = formatValue(self.allocator, val) catch {
-                    key_parts.deinit(self.allocator);
-                    return;
-                };
-                defer self.allocator.free(fv);
-                key_parts.appendSlice(self.allocator, fv) catch {
-                    key_parts.deinit(self.allocator);
-                    return;
-                };
+                appendValueToKey(&self.key_buf, self.allocator, val) catch return;
             }
-            const group_key = key_parts.toOwnedSlice(self.allocator) catch {
-                key_parts.deinit(self.allocator);
-                return;
-            };
 
-            if (!self.groups.contains(group_key)) {
-                // Create group values
-                const gv = self.allocator.alloc([]const u8, self.group_by_indices.len) catch {
-                    self.allocator.free(group_key);
-                    return;
-                };
+            // getOrPut: single lookup for both check + insert
+            const gop = self.groups.getOrPut(self.key_buf.items) catch return;
+            if (!gop.found_existing) {
+                // New group — dupe the key and create state
+                gop.key_ptr.* = self.allocator.dupe(u8, self.key_buf.items) catch return;
+                const gv = self.allocator.alloc([]const u8, self.group_by_indices.len) catch return;
                 for (self.group_by_indices, 0..) |gi, idx| {
                     gv[idx] = formatValue(self.allocator, chunk.columns[gi].getValue(row_idx)) catch {
                         for (gv[0..idx]) |v| self.allocator.free(v);
                         self.allocator.free(gv);
-                        self.allocator.free(group_key);
                         return;
                     };
                 }
-                const state = initGroupState(self.allocator, self.num_cols, gv) catch {
+                gop.value_ptr.* = initGroupState(self.allocator, self.num_cols, gv) catch {
                     for (gv) |v| self.allocator.free(v);
                     self.allocator.free(gv);
-                    self.allocator.free(group_key);
-                    return;
-                };
-                self.groups.put(group_key, state) catch {
-                    self.allocator.free(group_key);
-                    return;
-                };
-            } else {
-                self.allocator.free(group_key);
-            }
-
-            // Accumulate - rebuild key for lookup
-            var key_parts2: std.ArrayList(u8) = .empty;
-            for (self.group_by_indices, 0..) |gi, idx| {
-                if (idx > 0) key_parts2.append(self.allocator, 0) catch {
-                    key_parts2.deinit(self.allocator);
-                    return;
-                };
-                const val = chunk.columns[gi].getValue(row_idx);
-                const fv = formatValue(self.allocator, val) catch {
-                    key_parts2.deinit(self.allocator);
-                    return;
-                };
-                defer self.allocator.free(fv);
-                key_parts2.appendSlice(self.allocator, fv) catch {
-                    key_parts2.deinit(self.allocator);
                     return;
                 };
             }
-            const lookup_key = key_parts2.toOwnedSlice(self.allocator) catch {
-                key_parts2.deinit(self.allocator);
-                return;
-            };
-            defer self.allocator.free(lookup_key);
 
-            if (self.groups.getPtr(lookup_key)) |state_ptr| {
-                state_ptr.count += 1;
-                for (0..self.num_cols) |i| {
-                    const ci = self.agg_col_indices[i] orelse continue;
-                    accumulateAgg(self.allocator, state_ptr, i, chunk.columns[ci].getValue(row_idx));
-                }
+            // Accumulate directly via the pointer from getOrPut
+            gop.value_ptr.count += 1;
+            for (0..self.num_cols) |i| {
+                const ci = self.agg_col_indices[i] orelse continue;
+                accumulateAgg(self.allocator, gop.value_ptr, i, chunk.columns[ci].getValue(row_idx));
             }
         } else {
             // Single group
@@ -407,6 +362,30 @@ fn formatAggValue(allocator: std.mem.Allocator, func: ast.AggregateFunc, has_col
             break :blk allocator.dupe(u8, "NULL") catch return ExecError.OutOfMemory;
         },
     };
+}
+
+/// Append a Value's binary representation to a key buffer (no string formatting).
+fn appendValueToKey(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, val: Value) !void {
+    switch (val) {
+        .null_value => try buf.append(allocator, 0),
+        .boolean => |b| try buf.append(allocator, if (b) 2 else 1),
+        .integer => |v| {
+            try buf.append(allocator, 3);
+            try buf.appendSlice(allocator, std.mem.asBytes(&v));
+        },
+        .bigint => |v| {
+            try buf.append(allocator, 4);
+            try buf.appendSlice(allocator, std.mem.asBytes(&v));
+        },
+        .float => |v| {
+            try buf.append(allocator, 5);
+            try buf.appendSlice(allocator, std.mem.asBytes(&v));
+        },
+        .bytes => |s| {
+            try buf.append(allocator, 6);
+            try buf.appendSlice(allocator, s);
+        },
+    }
 }
 
 fn formatValue(allocator: std.mem.Allocator, val: Value) ![]const u8 {

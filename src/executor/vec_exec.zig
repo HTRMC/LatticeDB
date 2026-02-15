@@ -142,7 +142,9 @@ pub fn execSelectVectorized(
     }
 
     // === No ORDER BY: direct materialization from chunk to ResultRow ===
+    // Pre-allocate with estimated capacity to avoid repeated ArrayList reallocation
     var rows: std.ArrayList(ResultRow) = .empty;
+    rows.ensureTotalCapacity(allocator, if (limit) |l| @min(l, 256) else 256) catch {};
     errdefer {
         for (rows.items) |row| {
             for (row.values) |v| allocator.free(v);
@@ -208,6 +210,10 @@ fn materializeChunkDirect(
     col_indices: []const usize,
     rows: *std.ArrayList(ResultRow),
 ) ExecError!void {
+    // Pre-grow to avoid repeated realloc
+    const active: usize = if (chunk.sel) |sel| sel.len else chunk.count;
+    rows.ensureUnusedCapacity(allocator, active) catch return ExecError.OutOfMemory;
+
     if (chunk.sel) |sel| {
         for (sel.indices[0..sel.len]) |row_idx| {
             const formatted = allocator.alloc([]const u8, col_indices.len) catch return ExecError.OutOfMemory;
@@ -219,11 +225,7 @@ fn materializeChunkDirect(
                     return ExecError.OutOfMemory;
                 };
             }
-            rows.append(allocator, .{ .values = formatted }) catch {
-                for (formatted) |f| allocator.free(f);
-                allocator.free(formatted);
-                return ExecError.OutOfMemory;
-            };
+            rows.appendAssumeCapacity(.{ .values = formatted });
         }
     } else {
         var i: u16 = 0;
@@ -237,11 +239,7 @@ fn materializeChunkDirect(
                     return ExecError.OutOfMemory;
                 };
             }
-            rows.append(allocator, .{ .values = formatted }) catch {
-                for (formatted) |f| allocator.free(f);
-                allocator.free(formatted);
-                return ExecError.OutOfMemory;
-            };
+            rows.appendAssumeCapacity(.{ .values = formatted });
         }
     }
 }
@@ -261,6 +259,7 @@ fn execVectorizedWithOrderBy(
     needs_general_filter: bool,
 ) ExecError!ExecResult {
     var collected: std.ArrayList(CollectedRow) = .empty;
+    collected.ensureTotalCapacity(allocator, if (limit) |l| @min(l, 256) else 256) catch {};
     errdefer {
         for (collected.items) |row| freeCollectedRow(allocator, row);
         collected.deinit(allocator);
@@ -418,6 +417,12 @@ fn collectChunkRows(
     col_indices: []const usize,
     collected: *std.ArrayList(CollectedRow),
 ) ExecError!void {
+    const active_count: usize = if (chunk.sel) |sel| sel.len else chunk.count;
+    if (active_count == 0) return;
+
+    // Pre-grow to avoid repeated realloc during append
+    collected.ensureUnusedCapacity(allocator, active_count) catch return ExecError.OutOfMemory;
+
     if (chunk.sel) |sel| {
         for (sel.indices[0..sel.len]) |row_idx| {
             try collectRow(allocator, chunk, col_indices, row_idx, collected);
@@ -452,13 +457,7 @@ fn collectRow(
         else
             val;
     }
-    collected.append(allocator, .{ .values = values }) catch {
-        for (values) |*v| {
-            if (v.* == .bytes) allocator.free(v.bytes);
-        }
-        allocator.free(values);
-        return ExecError.OutOfMemory;
-    };
+    collected.appendAssumeCapacity(.{ .values = values });
 }
 
 fn freeCollectedRow(allocator: std.mem.Allocator, row: CollectedRow) void {

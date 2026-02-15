@@ -592,7 +592,20 @@ fn scalarCompare_f64(a: f64, b: f64, op: ast.CompOp) bool {
 }
 
 fn hasNullInRange(col: *const ColumnVector, start: u16, comptime width: u16) bool {
-    // Check if any row in [start, start+width) has a null
+    // Fast path: check null mask bytes directly instead of bit-by-bit.
+    // If the range is byte-aligned and fits in whole bytes, use a single word check.
+    const start_byte = start / 8;
+    const start_bit = @as(u3, @intCast(start % 8));
+
+    if (start_bit == 0 and width == 8) {
+        // Perfectly aligned 8-row batch: single byte check
+        return col.null_mask[start_byte] != 0;
+    } else if (start_bit == 0 and width == 4) {
+        // Aligned 4-row batch: check low nibble
+        return (col.null_mask[start_byte] & 0x0F) != 0;
+    }
+
+    // General case: bit-by-bit fallback
     var i: u16 = 0;
     while (i < width) : (i += 1) {
         if (col.isNull(start + i)) return true;
