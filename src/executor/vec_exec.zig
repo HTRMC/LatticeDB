@@ -406,19 +406,18 @@ fn execVectorizedWithOrderBy(
     }
 
     if (!order_by_applied) {
-        const items = collected.items;
-        var si: usize = 1;
-        while (si < items.len) : (si += 1) {
-            var j = si;
-            while (j > 0) {
-                if (compareCollectedRows(items[j - 1], items[j], order_clauses, order_indices) == .gt) {
-                    const tmp = items[j];
-                    items[j] = items[j - 1];
-                    items[j - 1] = tmp;
-                    j -= 1;
-                } else break;
+        const SortCtx = struct {
+            clauses: []const ast.OrderByClause,
+            indices: []const usize,
+
+            pub fn lessThan(ctx: @This(), a: CollectedRow, b: CollectedRow) bool {
+                return compareCollectedRows(a, b, ctx.clauses, ctx.indices) == .lt;
             }
-        }
+        };
+        std.sort.pdq(CollectedRow, collected.items, SortCtx{
+            .clauses = order_clauses,
+            .indices = order_indices,
+        }, SortCtx.lessThan);
     }
 
     // LIMIT
