@@ -22,6 +22,8 @@ const PageId = page_mod.PageId;
 const SlotId = page_mod.SlotId;
 const INVALID_PAGE_ID = page_mod.INVALID_PAGE_ID;
 const TupleHeader = mvcc_mod.TupleHeader;
+const TxnId = mvcc_mod.TxnId;
+const INVALID_TXN_ID = mvcc_mod.INVALID_TXN_ID;
 const Transaction = mvcc_mod.Transaction;
 const TransactionManager = mvcc_mod.TransactionManager;
 const BufferPool = buffer_pool_mod.BufferPool;
@@ -79,6 +81,10 @@ pub const VecSeqScan = struct {
     scan_preds: [MAX_SCAN_PREDS]ScanPredicate,
     scan_pred_count: u8,
 
+    // MVCC fast path: cache last-seen xmin to avoid repeated hash lookups
+    cached_xmin: TxnId,
+    cached_xmin_visible: bool,
+
     pub fn init(
         allocator: std.mem.Allocator,
         table: *Table,
@@ -105,6 +111,8 @@ pub const VecSeqScan = struct {
             .pinned_count = 0,
             .scan_preds = undefined,
             .scan_pred_count = 0,
+            .cached_xmin = INVALID_TXN_ID,
+            .cached_xmin_visible = false,
         };
     }
 
@@ -180,13 +188,35 @@ pub const VecSeqScan = struct {
                 var slot = start_slot;
                 while (slot < pg_header.slot_count and row_idx < VECTOR_SIZE) : (slot += 1) {
                     if (pg.getTuple(slot)) |raw| {
-                        // MVCC visibility check
+                        // MVCC visibility check with fast path
                         const user_data = if (self.txn != null and self.txn_manager != null) blk: {
                             if (raw.len < TupleHeader.SIZE) continue;
-                            const stripped = Tuple.stripHeader(raw) catch continue;
-                            const vis = mvcc_mod.isVisible(&stripped.header, &self.txn.?.snapshot, self.txn_manager.?, self.txn.?.txn_id);
-                            if (vis == .invisible) continue;
-                            break :blk stripped.user_data;
+                            const header = std.mem.bytesToValue(TupleHeader, raw[0..TupleHeader.SIZE]);
+                            const data = raw[TupleHeader.SIZE..];
+
+                            // Fast path: live tuple (xmax==0) with cached xmin
+                            if (header.xmax == 0 and header.xmin == self.cached_xmin) {
+                                if (!self.cached_xmin_visible) continue;
+                                break :blk data;
+                            }
+
+                            // Slow path: full visibility check
+                            const vis = mvcc_mod.isVisible(&header, &self.txn.?.snapshot, self.txn_manager.?, self.txn.?.txn_id);
+                            if (vis == .invisible) {
+                                // Cache negative result for this xmin (if live tuple)
+                                if (header.xmax == 0) {
+                                    self.cached_xmin = header.xmin;
+                                    self.cached_xmin_visible = false;
+                                }
+                                continue;
+                            }
+
+                            // Cache positive result for this xmin
+                            if (header.xmax == 0) {
+                                self.cached_xmin = header.xmin;
+                                self.cached_xmin_visible = true;
+                            }
+                            break :blk data;
                         } else raw;
 
                         // Scan-filter fusion: check predicates on raw bytes before deserializing
