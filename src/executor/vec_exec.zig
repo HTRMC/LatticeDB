@@ -122,6 +122,17 @@ pub fn execSelectVectorized(
     };
     defer scan.deinit();
 
+    // Enable deferred string materialization when filter is pure SIMD.
+    // Strings are stored as raw page pointers during scan, then only surviving
+    // rows get arena-duped after filtering — avoids copying strings for filtered-out rows.
+    const has_text_cols = for (schema.columns) |col| {
+        if (col.col_type == .varchar or col.col_type == .text) break true;
+    } else false;
+    const has_simd_filter = simd_pred != null or between_preds != null;
+    if (has_text_cols and has_simd_filter and !needs_general_filter) {
+        scan.defer_strings = true;
+    }
+
     const limit: ?usize = if (sel.limit) |l| @intCast(l) else null;
 
     // === ORDER BY path: deferred materialization with Value-based sorting ===
@@ -173,6 +184,9 @@ pub fn execSelectVectorized(
                 chunk.sel = vec_filter_mod.filterGeneral(chunk, where, schema);
             }
         }
+
+        // Materialize deferred strings for surviving rows only
+        if (scan.defer_strings) scan.materializeSurvivingStrings();
 
         // Directly format matching rows to strings (no intermediate Value collection)
         try materializeChunkDirect(allocator, chunk, col_indices, &rows);
@@ -282,6 +296,9 @@ fn execVectorizedWithOrderBy(
                 chunk.sel = vec_filter_mod.filterGeneral(chunk, where, schema);
             }
         }
+
+        // Materialize deferred strings for surviving rows only
+        if (scan.defer_strings) scan.materializeSurvivingStrings();
 
         try collectChunkRows(allocator, chunk, col_indices, &collected);
     }

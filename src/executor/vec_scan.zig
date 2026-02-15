@@ -33,6 +33,10 @@ pub const VecScanError = error{
     OutOfMemory,
 };
 
+/// Max pages pinned per chunk. With VECTOR_SIZE=2048 and ~16 rows per page
+/// (worst case large tuples), 128 is more than enough.
+const MAX_PINNED_PAGES = 128;
+
 /// Vectorized sequential scan that produces DataChunks from table pages.
 /// Walks the IAM chain (same as Table.ScanIterator) but fills columnar batches.
 pub const VecSeqScan = struct {
@@ -53,6 +57,14 @@ pub const VecSeqScan = struct {
 
     // Reusable chunk
     chunk: DataChunk,
+
+    // Deferred string materialization: when enabled, varchar/text columns store
+    // raw pointers into pinned page data instead of arena-duped copies.
+    // After filtering, call materializeSurvivingStrings() to dupe only surviving
+    // rows and unpin pages.
+    defer_strings: bool,
+    pinned_pages: [MAX_PINNED_PAGES]PageId,
+    pinned_count: u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -75,16 +87,23 @@ pub const VecSeqScan = struct {
             .has_extent = false,
             .done = false,
             .chunk = chunk,
+            .defer_strings = false,
+            .pinned_pages = undefined,
+            .pinned_count = 0,
         };
     }
 
     pub fn deinit(self: *VecSeqScan) void {
+        self.unpinDeferredPages();
         self.chunk.deinit();
     }
 
     /// Returns the next DataChunk of up to VECTOR_SIZE rows, or null when scan is exhausted.
     pub fn next(self: *VecSeqScan) VecScanError!?*DataChunk {
         if (self.done) return null;
+
+        // Unpin pages held from previous chunk (if deferred)
+        self.unpinDeferredPages();
 
         self.chunk.reset();
         var row_idx: u16 = 0;
@@ -148,7 +167,13 @@ pub const VecSeqScan = struct {
                     }
                 }
 
-                self.buffer_pool.unpinPage(page_id, false) catch {};
+                if (self.defer_strings and self.pinned_count < MAX_PINNED_PAGES) {
+                    // Keep page pinned — strings point into page data
+                    self.pinned_pages[self.pinned_count] = page_id;
+                    self.pinned_count += 1;
+                } else {
+                    self.buffer_pool.unpinPage(page_id, false) catch {};
+                }
 
                 if (row_idx >= VECTOR_SIZE) {
                     // Chunk is full — save position for next call
@@ -172,6 +197,56 @@ pub const VecSeqScan = struct {
         self.chunk.count = row_idx;
         if (row_idx == 0) return null;
         return &self.chunk;
+    }
+
+    /// After filtering, dupe surviving row strings into the arena and unpin pages.
+    /// Only needed when defer_strings is enabled.
+    pub fn materializeSurvivingStrings(self: *VecSeqScan) void {
+        if (self.pinned_count == 0) return;
+
+        const chunk = &self.chunk;
+        const arena_alloc = chunk.arena.allocator();
+
+        for (self.schema.columns, 0..) |col_def, i| {
+            switch (col_def.col_type) {
+                .varchar, .text => {
+                    if (chunk.sel) |sel| {
+                        // Only dupe strings for rows that survived the filter
+                        for (sel.indices[0..sel.len]) |row_idx| {
+                            if (!chunk.columns[i].isNull(row_idx)) {
+                                const raw = chunk.columns[i].data.bytes_ptrs[row_idx];
+                                chunk.columns[i].data.bytes_ptrs[row_idx] = arena_alloc.dupe(u8, raw) catch {
+                                    chunk.columns[i].setNull(row_idx);
+                                    continue;
+                                };
+                            }
+                        }
+                    } else {
+                        // No selection vector — dupe all rows
+                        var r: u16 = 0;
+                        while (r < chunk.count) : (r += 1) {
+                            if (!chunk.columns[i].isNull(r)) {
+                                const raw = chunk.columns[i].data.bytes_ptrs[r];
+                                chunk.columns[i].data.bytes_ptrs[r] = arena_alloc.dupe(u8, raw) catch {
+                                    chunk.columns[i].setNull(r);
+                                    continue;
+                                };
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        self.unpinDeferredPages();
+    }
+
+    fn unpinDeferredPages(self: *VecSeqScan) void {
+        for (self.pinned_pages[0..self.pinned_count]) |pid| {
+            self.buffer_pool.unpinPage(pid, false) catch {};
+        }
+        self.pinned_count = 0;
     }
 
     /// Deserialize raw tuple bytes directly into the chunk's column vectors at row_idx.
@@ -228,9 +303,14 @@ pub const VecSeqScan = struct {
                                 const str_len = std.mem.bytesToValue(u16, data[offset..][0..2]);
                                 offset += 2;
                                 if (offset + str_len <= data.len) {
-                                    // Dupe string into the chunk's arena (page will be unpinned)
-                                    const duped = self.chunk.arena.allocator().dupe(u8, data[offset..][0..str_len]) catch return error.OutOfMemory;
-                                    self.chunk.columns[i].data.bytes_ptrs[row_idx] = duped;
+                                    if (self.defer_strings) {
+                                        // Store raw pointer into page data (page stays pinned)
+                                        self.chunk.columns[i].data.bytes_ptrs[row_idx] = data[offset..][0..str_len];
+                                    } else {
+                                        // Dupe string into the chunk's arena (page will be unpinned)
+                                        const duped = self.chunk.arena.allocator().dupe(u8, data[offset..][0..str_len]) catch return error.OutOfMemory;
+                                        self.chunk.columns[i].data.bytes_ptrs[row_idx] = duped;
+                                    }
                                     offset += str_len;
                                 } else {
                                     self.chunk.columns[i].setNull(row_idx);
