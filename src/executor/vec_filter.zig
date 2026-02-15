@@ -126,7 +126,7 @@ fn literalToValue(lit: ast.LiteralValue, target_type: ColumnType) ?Value {
     switch (lit) {
         .integer => |v| {
             return switch (target_type) {
-                .integer => .{ .integer = @as(i32, @intCast(v)) },
+                .integer => .{ .integer = std.math.cast(i32, v) orelse return null },
                 .bigint => .{ .bigint = v },
                 .float => .{ .float = @as(f64, @floatFromInt(v)) },
                 else => null,
@@ -710,6 +710,30 @@ test "detectSimplePredicate rejects string column" {
 
     const pred = detectSimplePredicate(&cmp_expr, &schema);
     try std.testing.expect(pred == null);
+}
+
+test "literalToValue rejects out-of-range integer for i32 column" {
+    // Bug: literalToValue uses @intCast which panics for values > i32 max.
+    // After fix: should return null for out-of-range values.
+    const big = ast.LiteralValue{ .integer = 3_000_000_000 };
+    const result = literalToValue(big, .integer);
+    try std.testing.expect(result == null);
+
+    // Negative out of range
+    const neg = ast.LiteralValue{ .integer = -3_000_000_000 };
+    const neg_result = literalToValue(neg, .integer);
+    try std.testing.expect(neg_result == null);
+
+    // In-range should succeed
+    const ok = ast.LiteralValue{ .integer = 42 };
+    const ok_result = literalToValue(ok, .integer);
+    try std.testing.expect(ok_result != null);
+    try std.testing.expectEqual(@as(i32, 42), ok_result.?.integer);
+
+    // Bigint target should always work
+    const big_result = literalToValue(big, .bigint);
+    try std.testing.expect(big_result != null);
+    try std.testing.expectEqual(@as(i64, 3_000_000_000), big_result.?.bigint);
 }
 
 test "compareValues integer vs bigint out of i32 range" {
