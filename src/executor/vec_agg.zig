@@ -9,6 +9,7 @@ const Value = tuple_mod.Value;
 const Schema = tuple_mod.Schema;
 const ColumnType = tuple_mod.ColumnType;
 
+const vec_exec_mod = @import("vec_exec.zig");
 const ExecError = @import("executor.zig").ExecError;
 const ExecResult = @import("executor.zig").ExecResult;
 const ResultRow = @import("executor.zig").ResultRow;
@@ -390,16 +391,7 @@ fn appendValueToKey(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, val: 
     }
 }
 
-fn formatValue(allocator: std.mem.Allocator, val: Value) ![]const u8 {
-    return switch (val) {
-        .null_value => try allocator.dupe(u8, "NULL"),
-        .boolean => |b| try allocator.dupe(u8, if (b) "true" else "false"),
-        .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
-        .bigint => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
-        .float => |f| try std.fmt.allocPrint(allocator, "{d:.6}", .{f}),
-        .bytes => |s| try allocator.dupe(u8, s),
-    };
-}
+const formatValue = vec_exec_mod.formatValue;
 
 test "appendValueToKey multi-column string keys are unambiguous" {
     // Bug: without length prefix on strings, GROUP BY (str1, str2) can collide:
@@ -427,9 +419,4 @@ test "appendValueToKey multi-column string keys are unambiguous" {
     try std.testing.expect(!std.mem.eql(u8, key_a.items, key_b.items));
 }
 
-fn resolveColumnIndex(schema: *const Schema, name: []const u8) ?usize {
-    for (schema.columns, 0..) |col, i| {
-        if (std.ascii.eqlIgnoreCase(col.name, name)) return i;
-    }
-    return null;
-}
+const resolveColumnIndex = vec_exec_mod.resolveColumnIndex;

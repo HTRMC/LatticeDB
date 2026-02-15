@@ -47,13 +47,23 @@ pub fn canUseVectorized(sel: ast.Select) bool {
 }
 
 fn hasSubquery(expr: *const ast.Expression) bool {
-    switch (expr.*) {
-        .in_subquery, .exists_subquery => return true,
-        .and_expr => |a| return hasSubquery(a.left) or hasSubquery(a.right),
-        .or_expr => |o| return hasSubquery(o.left) or hasSubquery(o.right),
-        .not_expr => |n| return hasSubquery(n.operand),
-        else => return false,
-    }
+    return switch (expr.*) {
+        .in_subquery, .exists_subquery => true,
+        .and_expr => |a| hasSubquery(a.left) or hasSubquery(a.right),
+        .or_expr => |o| hasSubquery(o.left) or hasSubquery(o.right),
+        .not_expr => |n| hasSubquery(n.operand),
+        .comparison => |c| hasSubquery(c.left) or hasSubquery(c.right),
+        .between_expr => |b| hasSubquery(b.value) or hasSubquery(b.low) or hasSubquery(b.high),
+        .like_expr => |l| hasSubquery(l.value) or hasSubquery(l.pattern),
+        .in_list => |il| blk: {
+            if (hasSubquery(il.value)) break :blk true;
+            for (il.items) |item| {
+                if (hasSubquery(item)) break :blk true;
+            }
+            break :blk false;
+        },
+        .column_ref, .qualified_ref, .literal => false,
+    };
 }
 
 /// A row collected with native Value types (deferred materialization).
@@ -594,7 +604,7 @@ fn orderCompareValues(a: Value, b: Value) std.math.Order {
     }
 }
 
-fn formatValue(allocator: std.mem.Allocator, val: Value) ![]const u8 {
+pub fn formatValue(allocator: std.mem.Allocator, val: Value) ![]const u8 {
     return switch (val) {
         .null_value => try allocator.dupe(u8, "NULL"),
         .boolean => |b| try allocator.dupe(u8, if (b) "true" else "false"),
@@ -644,7 +654,7 @@ fn resolveSelectColumns(allocator: std.mem.Allocator, sel_cols: []const ast.Sele
     return indices;
 }
 
-fn resolveColumnIndex(schema: *const Schema, name: []const u8) ?usize {
+pub fn resolveColumnIndex(schema: *const Schema, name: []const u8) ?usize {
     for (schema.columns, 0..) |col, i| {
         if (std.ascii.eqlIgnoreCase(col.name, name)) return i;
     }

@@ -186,6 +186,8 @@ fn simdCompare_i64(data: Vec4i64, splat: Vec4i64, op: ast.CompOp) @Vector(SimdWi
 }
 
 // ── SIMD filter for f64 ─────────────────────────────────────────
+// IEEE 754 semantics: NaN != NaN, NaN comparisons return false.
+// This matches SQL standard NULL-like behavior for NaN.
 
 const SimdWidth_f64 = 4;
 const Vec4f64 = @Vector(SimdWidth_f64, f64);
@@ -581,6 +583,7 @@ fn scalarCompare_i64(a: i64, b: i64, op: ast.CompOp) bool {
     };
 }
 
+/// IEEE 754: NaN comparisons return false (NaN != NaN, NaN < x is false, etc.)
 fn scalarCompare_f64(a: f64, b: f64, op: ast.CompOp) bool {
     return switch (op) {
         .eq => a == b,
