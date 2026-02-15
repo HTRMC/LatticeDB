@@ -35,6 +35,9 @@ pub fn canUseVectorized(sel: ast.Select) bool {
     // No DISTINCT
     if (sel.distinct) return false;
 
+    // No HAVING (not implemented in vectorized path)
+    if (sel.having_clause != null) return false;
+
     // Check WHERE for subqueries
     if (sel.where_clause) |where| {
         if (hasSubquery(where)) return false;
