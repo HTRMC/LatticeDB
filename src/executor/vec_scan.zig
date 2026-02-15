@@ -185,6 +185,7 @@ pub const VecSeqScan = struct {
                 // Skip slot 0 on the meta page
                 const start_slot: SlotId = if (page_id == self.table_id and self.current_slot == 0) 1 else self.current_slot;
 
+                const page_start_row = row_idx;
                 var slot = start_slot;
                 while (slot < pg_header.slot_count and row_idx < VECTOR_SIZE) : (slot += 1) {
                     if (pg.getTuple(slot)) |raw| {
@@ -234,6 +235,11 @@ pub const VecSeqScan = struct {
                     self.pinned_pages[self.pinned_count] = page_id;
                     self.pinned_count += 1;
                 } else {
+                    // Pin limit reached or defer_strings off — if strings were
+                    // deferred, dupe them into the arena before unpinning.
+                    if (self.defer_strings and row_idx > page_start_row) {
+                        self.dupePageStrings(page_start_row, row_idx);
+                    }
                     self.buffer_pool.unpinPage(page_id, false) catch {};
                 }
 
@@ -353,6 +359,29 @@ pub const VecSeqScan = struct {
         }
 
         self.unpinDeferredPages();
+    }
+
+    /// Arena-dupe string columns for a range of rows that were deserialized
+    /// from a page we can't keep pinned (pin limit reached).
+    fn dupePageStrings(self: *VecSeqScan, start_row: u16, end_row: u16) void {
+        const arena_alloc = self.chunk.arena.allocator();
+        for (self.schema.columns, 0..) |col_def, i| {
+            switch (col_def.col_type) {
+                .varchar, .text => {
+                    var r = start_row;
+                    while (r < end_row) : (r += 1) {
+                        if (!self.chunk.columns[i].isNull(r)) {
+                            const raw = self.chunk.columns[i].data.bytes_ptrs[r];
+                            self.chunk.columns[i].data.bytes_ptrs[r] = arena_alloc.dupe(u8, raw) catch {
+                                self.chunk.columns[i].setNull(r);
+                                continue;
+                            };
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
     }
 
     fn unpinDeferredPages(self: *VecSeqScan) void {
