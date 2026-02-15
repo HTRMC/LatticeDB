@@ -43,6 +43,20 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
+    // ── Engine tests (no msquic/openssl needed) ───────────────────────
+    const engine_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/test_engine.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const engine_tests = b.addTest(.{
+        .root_module = engine_test_mod,
+    });
+
+    const engine_test_step = b.step("engine-test", "Run engine tests (no msquic needed)");
+    engine_test_step.dependOn(&b.addRunArtifact(engine_tests).step);
+
     // ── Benchmark executable (no msquic/openssl needed) ──────────────
     // Always build benchmarks with ReleaseFast for meaningful results
     // (SIMD vectorization, no safety checks, full compiler optimizations)

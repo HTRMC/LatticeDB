@@ -482,18 +482,19 @@ fn compareValues(left: Value, op: ast.CompOp, right: Value) bool {
 
     switch (left) {
         .integer => |li| {
-            const ri = switch (right) {
+            const li_wide: i64 = li;
+            const ri: i64 = switch (right) {
                 .integer => |v| v,
-                .bigint => |v| @as(i32, @intCast(v)),
+                .bigint => |v| v,
                 else => return false,
             };
             return switch (op) {
-                .eq => li == ri,
-                .neq => li != ri,
-                .lt => li < ri,
-                .gt => li > ri,
-                .lte => li <= ri,
-                .gte => li >= ri,
+                .eq => li_wide == ri,
+                .neq => li_wide != ri,
+                .lt => li_wide < ri,
+                .gt => li_wide > ri,
+                .lte => li_wide <= ri,
+                .gte => li_wide >= ri,
             };
         },
         .bigint => |li| {
@@ -709,6 +710,29 @@ test "detectSimplePredicate rejects string column" {
 
     const pred = detectSimplePredicate(&cmp_expr, &schema);
     try std.testing.expect(pred == null);
+}
+
+test "compareValues integer vs bigint out of i32 range" {
+    // Bug: comparing .integer(42) < .bigint(3_000_000_000) panics
+    // because @intCast truncates the bigint to i32.
+    // After fix: should widen i32 → i64 and compare correctly.
+    const left = Value{ .integer = 42 };
+    const right = Value{ .bigint = 3_000_000_000 };
+
+    // 42 < 3 billion → true
+    try std.testing.expect(compareValues(left, .lt, right));
+    // 42 == 3 billion → false
+    try std.testing.expect(!compareValues(left, .eq, right));
+    // 42 > 3 billion → false
+    try std.testing.expect(!compareValues(left, .gt, right));
+
+    // Reverse: bigint vs integer
+    try std.testing.expect(compareValues(right, .gt, left));
+
+    // Negative bigint outside i32 range
+    const neg = Value{ .bigint = -3_000_000_000 };
+    try std.testing.expect(compareValues(neg, .lt, left));
+    try std.testing.expect(!compareValues(neg, .gt, left));
 }
 
 test "filterSimd i32 basic" {
