@@ -383,6 +383,8 @@ fn appendValueToKey(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, val: 
         },
         .bytes => |s| {
             try buf.append(allocator, 6);
+            const len: u32 = @intCast(s.len);
+            try buf.appendSlice(allocator, std.mem.asBytes(&len));
             try buf.appendSlice(allocator, s);
         },
     }
@@ -397,6 +399,32 @@ fn formatValue(allocator: std.mem.Allocator, val: Value) ![]const u8 {
         .float => |f| try std.fmt.allocPrint(allocator, "{d:.6}", .{f}),
         .bytes => |s| try allocator.dupe(u8, s),
     };
+}
+
+test "appendValueToKey multi-column string keys are unambiguous" {
+    // Bug: without length prefix on strings, GROUP BY (str1, str2) can collide:
+    //   Row A: str1="a\x00\x06b", str2="c"
+    //   Row B: str1="a",          str2="b\x00\x06c"
+    // Both encode to: [6, 'a', 0, 6, 'b', 0, 6, 'c'] — key collision!
+    // After fix: length-prefixed strings make boundaries unambiguous.
+    const allocator = std.testing.allocator;
+
+    // Simulate GROUP BY (str1, str2) for Row A: ("a\x00\x06b", "c")
+    var key_a: std.ArrayList(u8) = .empty;
+    defer key_a.deinit(allocator);
+    try appendValueToKey(&key_a, allocator, .{ .bytes = "a\x00\x06b" });
+    try key_a.append(allocator, 0); // column separator
+    try appendValueToKey(&key_a, allocator, .{ .bytes = "c" });
+
+    // Simulate GROUP BY (str1, str2) for Row B: ("a", "b\x00\x06c")
+    var key_b: std.ArrayList(u8) = .empty;
+    defer key_b.deinit(allocator);
+    try appendValueToKey(&key_b, allocator, .{ .bytes = "a" });
+    try key_b.append(allocator, 0); // column separator
+    try appendValueToKey(&key_b, allocator, .{ .bytes = "b\x00\x06c" });
+
+    // These MUST differ — different group-by tuples
+    try std.testing.expect(!std.mem.eql(u8, key_a.items, key_b.items));
 }
 
 fn resolveColumnIndex(schema: *const Schema, name: []const u8) ?usize {
