@@ -11,14 +11,15 @@ pub const ColumnType = enum(u8) {
     float = 4, // f64
     varchar = 5, // variable-length, max length stored in schema
     text = 6, // variable-length, no max
+    date = 7, // epoch days as i64
+    timestamp = 8, // epoch seconds as i64
 
     /// Size of a fixed-length type, null for variable-length
     pub fn fixedSize(self: ColumnType) ?usize {
         return switch (self) {
             .boolean => 1,
             .integer => 4,
-            .bigint => 8,
-            .float => 8,
+            .bigint, .float, .date, .timestamp => 8,
             .varchar, .text => null,
         };
     }
@@ -74,6 +75,8 @@ pub const Value = union(enum) {
     bigint: i64,
     float: f64,
     bytes: []const u8, // For varchar and text
+    date: i64, // epoch days
+    timestamp: i64, // epoch seconds
 
     pub fn isNull(self: Value) bool {
         return self == .null_value;
@@ -111,6 +114,11 @@ pub const Value = union(enum) {
                 @memcpy(buf[0..2], std.mem.asBytes(&len));
                 @memcpy(buf[2..][0..v.len], v);
                 return total;
+            },
+            .date, .timestamp => |v| {
+                if (buf.len < 8) return error.BufferTooSmall;
+                @memcpy(buf[0..8], std.mem.asBytes(&v));
+                return 8;
             },
         }
     }
@@ -152,6 +160,20 @@ pub const Value = union(enum) {
                     .size = 2 + len,
                 };
             },
+            .date => {
+                if (buf.len < 8) return error.BufferTooSmall;
+                return .{
+                    .value = .{ .date = std.mem.bytesToValue(i64, buf[0..8]) },
+                    .size = 8,
+                };
+            },
+            .timestamp => {
+                if (buf.len < 8) return error.BufferTooSmall;
+                return .{
+                    .value = .{ .timestamp = std.mem.bytesToValue(i64, buf[0..8]) },
+                    .size = 8,
+                };
+            },
         }
     }
 
@@ -170,6 +192,8 @@ pub const Value = union(enum) {
                 return std.fmt.bufPrint(buf, "{d:.6}", .{v}) catch return error.BufferTooSmall;
             },
             .bytes => |v| return v,
+            .date => return "DATE",
+            .timestamp => return "TIMESTAMP",
         }
     }
 
@@ -207,6 +231,14 @@ pub const Value = union(enum) {
             .bytes => |v| {
                 hasher.update(&[_]u8{4});
                 hasher.update(v);
+            },
+            .date => |v| {
+                hasher.update(&[_]u8{5});
+                hasher.update(std.mem.asBytes(&v));
+            },
+            .timestamp => |v| {
+                hasher.update(&[_]u8{6});
+                hasher.update(std.mem.asBytes(&v));
             },
         }
         return hasher.final();
@@ -251,6 +283,18 @@ pub const Value = union(enum) {
             .boolean => |ab| {
                 return switch (b) {
                     .boolean => |bb| ab == bb,
+                    else => false,
+                };
+            },
+            .date => |ad| {
+                return switch (b) {
+                    .date => |bd| ad == bd,
+                    else => false,
+                };
+            },
+            .timestamp => |at| {
+                return switch (b) {
+                    .timestamp => |bt| at == bt,
                     else => false,
                 };
             },
@@ -346,7 +390,7 @@ pub const Tuple = struct {
                 .null_value => {},
                 .boolean => size += 1,
                 .integer => size += 4,
-                .bigint, .float => size += 8,
+                .bigint, .float, .date, .timestamp => size += 8,
                 .bytes => |v| {
                     _ = i;
                     size += 2 + v.len;

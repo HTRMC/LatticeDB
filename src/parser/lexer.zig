@@ -153,6 +153,8 @@ pub const TokenType = enum {
     kw_boolean,
     kw_varchar,
     kw_text,
+    kw_date,
+    kw_timestamp,
 
     // Identifiers and literals
     identifier,
@@ -299,6 +301,8 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "boolean", .kw_boolean },
     .{ "varchar", .kw_varchar },
     .{ "text", .kw_text },
+    .{ "date", .kw_date },
+    .{ "timestamp", .kw_timestamp },
 });
 
 pub const Lexer = struct {

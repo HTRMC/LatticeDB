@@ -39,7 +39,40 @@ pub fn formatValue(allocator: std.mem.Allocator, val: Value) ![]const u8 {
         .bigint => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
         .float => |f| try std.fmt.allocPrint(allocator, "{d:.6}", .{f}),
         .bytes => |s| try allocator.dupe(u8, s),
+        .date => |d| try formatEpochDays(allocator, d),
+        .timestamp => |t| try formatEpochSecs(allocator, t),
     };
+}
+
+fn formatEpochDays(allocator: std.mem.Allocator, epoch_days: i64) ![]const u8 {
+    const z = epoch_days + 719468;
+    const era = @divFloor(z, 146097);
+    const doe = z - era * 146097;
+    const yoe_raw = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+    const y = yoe_raw + era * 400;
+    const doy = doe - (365 * yoe_raw + @divFloor(yoe_raw, 4) - @divFloor(yoe_raw, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const d = doy - @divFloor(153 * mp + 2, 5) + 1;
+    const m = if (mp < 10) mp + 3 else mp - 9;
+    const yr = if (m <= 2) y + 1 else y;
+    var buf: [11]u8 = undefined;
+    _ = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+        @as(u32, @intCast(yr)), @as(u32, @intCast(m)), @as(u32, @intCast(d)),
+    }) catch return error.OutOfMemory;
+    return allocator.dupe(u8, buf[0..10]);
+}
+
+fn formatEpochSecs(allocator: std.mem.Allocator, epoch_secs: i64) ![]const u8 {
+    const days = @divFloor(epoch_secs, 86400);
+    const rem = @mod(epoch_secs, 86400);
+    const hour = @divFloor(rem, 3600);
+    const min = @divFloor(@mod(rem, 3600), 60);
+    const sec = @mod(rem, 60);
+    const date_str = try formatEpochDays(allocator, days);
+    defer allocator.free(date_str);
+    return std.fmt.allocPrint(allocator, "{s} {d:0>2}:{d:0>2}:{d:0>2}", .{
+        date_str, @as(u32, @intCast(hour)), @as(u32, @intCast(min)), @as(u32, @intCast(sec)),
+    });
 }
 
 /// Get the display name for a projection column.
@@ -214,6 +247,36 @@ pub fn compareValues(left: Value, op: ast.CompOp, right: Value) bool {
                 .eq => lb == rb,
                 .neq => lb != rb,
                 else => false,
+            };
+        },
+        .date => |li| {
+            const ri: i64 = switch (right) {
+                .date => |v| v,
+                .bytes => |s| parseDateToEpochDays(s) orelse return false,
+                else => return false,
+            };
+            return switch (op) {
+                .eq => li == ri,
+                .neq => li != ri,
+                .lt => li < ri,
+                .gt => li > ri,
+                .lte => li <= ri,
+                .gte => li >= ri,
+            };
+        },
+        .timestamp => |li| {
+            const ri: i64 = switch (right) {
+                .timestamp => |v| v,
+                .bytes => |s| parseTimestampToEpochSecs(s) orelse return false,
+                else => return false,
+            };
+            return switch (op) {
+                .eq => li == ri,
+                .neq => li != ri,
+                .lt => li < ri,
+                .gt => li > ri,
+                .lte => li <= ri,
+                .gte => li >= ri,
             };
         },
         .null_value => return false,
@@ -685,6 +748,14 @@ fn evalCast(
             const str = formatValue(allocator, val) catch return ExprResult.borrowed(.{ .null_value = {} });
             return ExprResult.owned_val(.{ .bytes = str });
         },
+        .date => {
+            const i = valToInt(val, allocator) orelse return ExprResult.borrowed(.{ .null_value = {} });
+            return ExprResult.borrowed(.{ .date = i });
+        },
+        .timestamp => {
+            const i = valToInt(val, allocator) orelse return ExprResult.borrowed(.{ .null_value = {} });
+            return ExprResult.borrowed(.{ .timestamp = i });
+        },
     }
 }
 
@@ -699,6 +770,8 @@ fn valToInt(val: Value, allocator: std.mem.Allocator) ?i64 {
         },
         .boolean => |b| if (b) @as(i64, 1) else @as(i64, 0),
         .bytes => |s| std.fmt.parseInt(i64, s, 10) catch null,
+        .date => |d| d,
+        .timestamp => |t| t,
         .null_value => null,
     };
 }
@@ -711,6 +784,8 @@ fn valToFloat(val: Value, allocator: std.mem.Allocator) ?f64 {
         .bigint => |i| @floatFromInt(i),
         .boolean => |b| if (b) @as(f64, 1.0) else @as(f64, 0.0),
         .bytes => |s| std.fmt.parseFloat(f64, s) catch null,
+        .date => |d| @floatFromInt(d),
+        .timestamp => |t| @floatFromInt(t),
         .null_value => null,
     };
 }
@@ -964,6 +1039,8 @@ fn formatValueForConcat(allocator: std.mem.Allocator, val: Value) ![]const u8 {
         .boolean => |b| try allocator.dupe(u8, if (b) "true" else "false"),
         .null_value => try allocator.dupe(u8, "NULL"),
         .bytes => |s| try allocator.dupe(u8, s),
+        .date => |d| try formatEpochDays(allocator, d),
+        .timestamp => |t| try formatEpochSecs(allocator, t),
     };
 }
 
@@ -1292,6 +1369,45 @@ test "arithmetic int-float promotion" {
     } };
     const r = evalExprToValue(std.testing.allocator, &expr, &empty_schema, &.{}, null);
     try std.testing.expectEqual(@as(f64, 7.5), r.value.float);
+}
+
+fn parseDateToEpochDays(s: []const u8) ?i64 {
+    if (s.len != 10 or s[4] != '-' or s[7] != '-') return null;
+    const year = std.fmt.parseInt(i32, s[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(u32, s[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(u32, s[8..10], 10) catch return null;
+    if (month < 1 or month > 12 or day < 1 or day > 31) return null;
+    return civilToEpochDays(year, month, day);
+}
+
+fn parseTimestampToEpochSecs(s: []const u8) ?i64 {
+    if (s.len != 19 or s[4] != '-' or s[7] != '-' or s[10] != ' ' or s[13] != ':' or s[16] != ':') return null;
+    const year = std.fmt.parseInt(i32, s[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(u32, s[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(u32, s[8..10], 10) catch return null;
+    const hour = std.fmt.parseInt(u32, s[11..13], 10) catch return null;
+    const minute = std.fmt.parseInt(u32, s[14..16], 10) catch return null;
+    const second = std.fmt.parseInt(u32, s[17..19], 10) catch return null;
+    if (month < 1 or month > 12 or day < 1 or day > 31) return null;
+    if (hour > 23 or minute > 59 or second > 59) return null;
+    const days = civilToEpochDays(year, month, day) orelse return null;
+    return days * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
+}
+
+fn civilToEpochDays(y_raw: i32, m: u32, d: u32) ?i64 {
+    var y: i64 = y_raw;
+    var m_adj = m;
+    if (m_adj <= 2) {
+        y -= 1;
+        m_adj += 9;
+    } else {
+        m_adj -= 3;
+    }
+    const era: i64 = @divFloor(y, 400);
+    const yoe: i64 = y - era * 400;
+    const doy: i64 = @divFloor(@as(i64, @intCast(153 * m_adj + 2)), 5) + @as(i64, @intCast(d)) - 1;
+    const doe: i64 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
 }
 
 test "unary minus" {

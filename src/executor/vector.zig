@@ -36,7 +36,7 @@ pub const ColumnVector = struct {
         switch (col_type) {
             .boolean => cv.data = .{ .booleans = undefined },
             .integer => cv.data = .{ .integers = undefined },
-            .bigint => cv.data = .{ .bigints = undefined },
+            .bigint, .date, .timestamp => cv.data = .{ .bigints = undefined },
             .float => cv.data = .{ .floats = undefined },
             .varchar, .text => cv.data = .{ .bytes_ptrs = undefined },
         }
@@ -62,6 +62,8 @@ pub const ColumnVector = struct {
             .boolean => .{ .boolean = self.data.booleans[row] },
             .integer => .{ .integer = self.data.integers[row] },
             .bigint => .{ .bigint = self.data.bigints[row] },
+            .date => .{ .date = self.data.bigints[row] },
+            .timestamp => .{ .timestamp = self.data.bigints[row] },
             .float => .{ .float = self.data.floats[row] },
             .varchar, .text => .{ .bytes = self.data.bytes_ptrs[row] },
         };
@@ -78,6 +80,8 @@ pub const ColumnVector = struct {
             .boolean => self.data.booleans[row] = val.boolean,
             .integer => self.data.integers[row] = val.integer,
             .bigint => self.data.bigints[row] = val.bigint,
+            .date => self.data.bigints[row] = val.date,
+            .timestamp => self.data.bigints[row] = val.timestamp,
             .float => self.data.floats[row] = val.float,
             .varchar, .text => self.data.bytes_ptrs[row] = val.bytes,
         }

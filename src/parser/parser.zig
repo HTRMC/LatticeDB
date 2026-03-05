@@ -821,6 +821,8 @@ pub const Parser = struct {
             .kw_boolean => .boolean,
             .kw_varchar => .varchar,
             .kw_text => .text,
+            .kw_date => .date,
+            .kw_timestamp => .timestamp,
             else => return ParseError.UnexpectedToken,
         };
         self.advance();

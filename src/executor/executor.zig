@@ -810,6 +810,8 @@ pub const Executor = struct {
             .boolean => |v| v == b.boolean,
             .bytes => |v| std.mem.eql(u8, v, b.bytes),
             .null_value => true,
+            .date => |v| v == b.date,
+            .timestamp => |v| v == b.timestamp,
         };
     }
 
@@ -1402,6 +1404,8 @@ pub const Executor = struct {
             .bigint => Value{ .bigint = std.fmt.parseInt(i64, str, 10) catch return error.TypeMismatch },
             .float => Value{ .float = std.fmt.parseFloat(f64, str) catch return error.TypeMismatch },
             .varchar, .text => Value{ .bytes = str },
+            .date => Value{ .date = std.fmt.parseInt(i64, str, 10) catch return error.TypeMismatch },
+            .timestamp => Value{ .timestamp = std.fmt.parseInt(i64, str, 10) catch return error.TypeMismatch },
         };
     }
 
@@ -2551,6 +2555,8 @@ pub const Executor = struct {
                 .boolean => |v| std.math.order(@intFromBool(v), @intFromBool(b.boolean)),
                 .bytes => |v| std.mem.order(u8, v, b.bytes),
                 .null_value => .eq,
+                .date => |v| std.math.order(v, b.date),
+                .timestamp => |v| std.math.order(v, b.timestamp),
             };
         }
         // Cross-type int comparison
@@ -3981,6 +3987,14 @@ pub const Executor = struct {
                 return .{ .bytes = str };
             },
             .null_value => return .{ .null_value = {} },
+            .date => {
+                const v = std.fmt.parseInt(i64, str, 10) catch return Value{ .bytes = str };
+                return .{ .date = v };
+            },
+            .timestamp => {
+                const v = std.fmt.parseInt(i64, str, 10) catch return Value{ .bytes = str };
+                return .{ .timestamp = v };
+            },
         }
     }
 
@@ -4017,10 +4031,10 @@ pub const Executor = struct {
                     .gte => li >= ri,
                 };
             },
-            .bigint => |li| {
+            .bigint, .date, .timestamp => |li| {
                 const ri: i64 = switch (right) {
                     .integer => |v| v,
-                    .bigint => |v| v,
+                    .bigint, .date, .timestamp => |v| v,
                     else => return false,
                 };
                 return switch (op) {
@@ -4170,6 +4184,8 @@ pub const Executor = struct {
             .boolean => .boolean,
             .varchar => .varchar,
             .text => .text,
+            .date => .date,
+            .timestamp => .timestamp,
         };
     }
 
@@ -4195,6 +4211,8 @@ pub const Executor = struct {
             },
             .string => |s| switch (col_type) {
                 .varchar, .text => Value{ .bytes = s },
+                .date => Value{ .date = parseDateToEpochDays(s) orelse return error.TypeMismatch },
+                .timestamp => Value{ .timestamp = parseTimestampToEpochSecs(s) orelse return error.TypeMismatch },
                 else => error.TypeMismatch,
             },
             .boolean => |b| switch (col_type) {
@@ -4214,7 +4232,83 @@ pub const Executor = struct {
             .bigint => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
             .float => |f| try std.fmt.allocPrint(allocator, "{d:.6}", .{f}),
             .bytes => |s| try allocator.dupe(u8, s),
+            .date => |d| formatEpochDays(allocator, d),
+            .timestamp => |t| formatEpochSecs(allocator, t),
         };
+    }
+
+    fn parseDateToEpochDays(s: []const u8) ?i64 {
+        // Parse YYYY-MM-DD
+        if (s.len != 10 or s[4] != '-' or s[7] != '-') return null;
+        const year = std.fmt.parseInt(i32, s[0..4], 10) catch return null;
+        const month = std.fmt.parseInt(u32, s[5..7], 10) catch return null;
+        const day = std.fmt.parseInt(u32, s[8..10], 10) catch return null;
+        if (month < 1 or month > 12 or day < 1 or day > 31) return null;
+        return civilToEpochDays(year, month, day);
+    }
+
+    fn parseTimestampToEpochSecs(s: []const u8) ?i64 {
+        // Parse YYYY-MM-DD HH:MM:SS
+        if (s.len != 19 or s[4] != '-' or s[7] != '-' or s[10] != ' ' or s[13] != ':' or s[16] != ':') return null;
+        const year = std.fmt.parseInt(i32, s[0..4], 10) catch return null;
+        const month = std.fmt.parseInt(u32, s[5..7], 10) catch return null;
+        const day = std.fmt.parseInt(u32, s[8..10], 10) catch return null;
+        const hour = std.fmt.parseInt(u32, s[11..13], 10) catch return null;
+        const minute = std.fmt.parseInt(u32, s[14..16], 10) catch return null;
+        const second = std.fmt.parseInt(u32, s[17..19], 10) catch return null;
+        if (month < 1 or month > 12 or day < 1 or day > 31) return null;
+        if (hour > 23 or minute > 59 or second > 59) return null;
+        const days = civilToEpochDays(year, month, day) orelse return null;
+        return days * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
+    }
+
+    fn civilToEpochDays(y_raw: i32, m: u32, d: u32) ?i64 {
+        // Algorithm based on Howard Hinnant's date algorithms
+        var y: i64 = y_raw;
+        var m_adj = m;
+        if (m_adj <= 2) {
+            y -= 1;
+            m_adj += 9;
+        } else {
+            m_adj -= 3;
+        }
+        const era: i64 = @divFloor(y, 400);
+        const yoe: i64 = y - era * 400;
+        const doy: i64 = @divFloor(@as(i64, @intCast(153 * m_adj + 2)), 5) + @as(i64, @intCast(d)) - 1;
+        const doe: i64 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+        return era * 146097 + doe - 719468;
+    }
+
+    fn formatEpochDays(allocator: std.mem.Allocator, epoch_days: i64) ![]const u8 {
+        // Inverse of civilToEpochDays
+        const z = epoch_days + 719468;
+        const era = @divFloor(z, 146097);
+        const doe = z - era * 146097;
+        const yoe_raw = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+        const y = yoe_raw + era * 400;
+        const doy = doe - (365 * yoe_raw + @divFloor(yoe_raw, 4) - @divFloor(yoe_raw, 100));
+        const mp = @divFloor(5 * doy + 2, 153);
+        const d = doy - @divFloor(153 * mp + 2, 5) + 1;
+        const m = if (mp < 10) mp + 3 else mp - 9;
+        const yr = if (m <= 2) y + 1 else y;
+        var buf: [11]u8 = undefined;
+        _ = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+            @as(u32, @intCast(yr)), @as(u32, @intCast(m)), @as(u32, @intCast(d)),
+        }) catch return error.OutOfMemory;
+        return allocator.dupe(u8, buf[0..10]);
+    }
+
+    fn formatEpochSecs(allocator: std.mem.Allocator, epoch_secs: i64) ![]const u8 {
+        const days = @divFloor(epoch_secs, 86400);
+        const rem = @mod(epoch_secs, 86400);
+        const hour = @divFloor(rem, 3600);
+        const min = @divFloor(@mod(rem, 3600), 60);
+        const sec = @mod(rem, 60);
+        const date_str = try formatEpochDays(allocator, days);
+        defer allocator.free(date_str);
+        return std.fmt.allocPrint(allocator, "{s} {d:0>2}:{d:0>2}:{d:0>2}", .{
+            date_str, @as(u32, @intCast(hour)), @as(u32, @intCast(min)), @as(u32, @intCast(sec)),
+        });
     }
 };
 
@@ -9076,4 +9170,49 @@ test "executor window functions ROW_NUMBER, RANK, DENSE_RANK" {
     try std.testing.expectEqualStrings("2", r4.rows.rows[1].values[1]);
     try std.testing.expectEqualStrings("2", r4.rows.rows[2].values[1]);
     try std.testing.expectEqualStrings("3", r4.rows.rows[3].values[1]);
+}
+
+test "executor DATE and TIMESTAMP types" {
+    const test_file = "test_exec_datetime.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+    defer exec.deinit();
+
+    // DATE type
+    const ct = try exec.execute("CREATE TABLE events (id INT, event_date DATE)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO events VALUES (1, '2024-01-15'), (2, '2024-06-30')");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT id, event_date FROM events");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 2), r.rows.rows.len);
+    try std.testing.expectEqualStrings("2024-01-15", r.rows.rows[0].values[1]);
+    try std.testing.expectEqualStrings("2024-06-30", r.rows.rows[1].values[1]);
+
+    // TIMESTAMP type
+    const ct2 = try exec.execute("CREATE TABLE logs (id INT, created_at TIMESTAMP)");
+    exec.freeResult(ct2);
+    const ins2 = try exec.execute("INSERT INTO logs VALUES (1, '2024-01-15 10:30:00')");
+    exec.freeResult(ins2);
+
+    const r2 = try exec.execute("SELECT id, created_at FROM logs");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqual(@as(usize, 1), r2.rows.rows.len);
+    try std.testing.expectEqualStrings("2024-01-15 10:30:00", r2.rows.rows[0].values[1]);
+
+    // DATE comparison in WHERE
+    const r3 = try exec.execute("SELECT id FROM events WHERE event_date > '2024-03-01'");
+    defer exec.freeResult(r3);
+    try std.testing.expectEqual(@as(usize, 1), r3.rows.rows.len);
+    try std.testing.expectEqualStrings("2", r3.rows.rows[0].values[0]);
 }

@@ -290,6 +290,16 @@ pub const Catalog = struct {
                     const s = std.fmt.bufPrint(&buf, "{d}", .{iv}) catch break :blk Value{ .null_value = {} };
                     break :blk Value{ .bytes = s };
                 },
+                .date => |iv| blk: {
+                    var buf: [20]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "{d}", .{iv}) catch break :blk Value{ .null_value = {} };
+                    break :blk Value{ .bytes = s };
+                },
+                .timestamp => |iv| blk: {
+                    var buf: [20]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "{d}", .{iv}) catch break :blk Value{ .null_value = {} };
+                    break :blk Value{ .bytes = s };
+                },
             } else Value{ .null_value = {} };
 
             const col_vals = [_]Value{
@@ -732,6 +742,8 @@ pub const Catalog = struct {
                                 .varchar, .text => Value{ .bytes = self.allocator.dupe(u8, s) catch {
                                     return CatalogError.OutOfMemory;
                                 } },
+                                .date => Value{ .date = std.fmt.parseInt(i64, s, 10) catch break :blk null },
+                                .timestamp => Value{ .timestamp = std.fmt.parseInt(i64, s, 10) catch break :blk null },
                             };
                         },
                         else => break :blk null,

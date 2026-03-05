@@ -9,6 +9,8 @@ pub const DataType = enum {
     boolean,
     varchar,
     text,
+    date,
+    timestamp,
 };
 
 /// Column definition in CREATE TABLE

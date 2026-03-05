@@ -8,6 +8,7 @@ const table_mod = @import("../storage/table.zig");
 const catalog_mod = @import("../storage/catalog.zig");
 const mvcc_mod = @import("../storage/mvcc.zig");
 const ast = @import("../parser/ast.zig");
+const expr_eval = @import("expr_eval.zig");
 
 const DataChunk = vector_mod.DataChunk;
 const SelectionVector = vector_mod.SelectionVector;
@@ -609,16 +610,16 @@ fn orderCompareValues(a: Value, b: Value) std.math.Order {
         .integer => |ai| {
             const bi: i64 = switch (b) {
                 .integer => |v| v,
-                .bigint => |v| return std.math.order(@as(i64, ai), v),
+                .bigint, .date, .timestamp => |v| return std.math.order(@as(i64, ai), v),
                 .float => |v| return std.math.order(@as(f64, @floatFromInt(ai)), v),
                 else => return .lt,
             };
             return std.math.order(@as(i64, ai), bi);
         },
-        .bigint => |ai| {
+        .bigint, .date, .timestamp => |ai| {
             const bi: i64 = switch (b) {
                 .integer => |v| v,
-                .bigint => |v| v,
+                .bigint, .date, .timestamp => |v| v,
                 .float => |v| return std.math.order(@as(f64, @floatFromInt(ai)), v),
                 else => return .lt,
             };
@@ -628,7 +629,7 @@ fn orderCompareValues(a: Value, b: Value) std.math.Order {
             const bf: f64 = switch (b) {
                 .float => |v| v,
                 .integer => |v| @floatFromInt(v),
-                .bigint => |v| @floatFromInt(v),
+                .bigint, .date, .timestamp => |v| @floatFromInt(v),
                 else => return .lt,
             };
             return std.math.order(af, bf);
@@ -654,14 +655,7 @@ fn orderCompareValues(a: Value, b: Value) std.math.Order {
 }
 
 pub fn formatValue(allocator: std.mem.Allocator, val: Value) ![]const u8 {
-    return switch (val) {
-        .null_value => try allocator.dupe(u8, "NULL"),
-        .boolean => |b| try allocator.dupe(u8, if (b) "true" else "false"),
-        .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
-        .bigint => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
-        .float => |f| try std.fmt.allocPrint(allocator, "{d:.6}", .{f}),
-        .bytes => |s| try allocator.dupe(u8, s),
-    };
+    return expr_eval.formatValue(allocator, val);
 }
 
 fn resolveSelectColumns(allocator: std.mem.Allocator, sel_cols: []const ast.SelectColumn, schema: *const Schema) ?[]usize {

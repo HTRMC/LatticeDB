@@ -286,7 +286,7 @@ pub const VecSeqScan = struct {
                     switch (col_def.col_type) {
                         .boolean => offset += 1,
                         .integer => offset += 4,
-                        .bigint, .float => offset += 8,
+                        .bigint, .float, .date, .timestamp => offset += 8,
                         .varchar, .text => {
                             if (offset + 2 > data.len) return false;
                             const str_len = std.mem.bytesToValue(u16, data[offset..][0..2]);
@@ -430,7 +430,7 @@ pub const VecSeqScan = struct {
                                 self.chunk.columns[i].setNull(row_idx);
                             }
                         },
-                        .bigint => {
+                        .bigint, .date, .timestamp => {
                             if (offset + 8 <= data.len) {
                                 self.chunk.columns[i].clearNull(row_idx);
                                 self.chunk.columns[i].data.bigints[row_idx] = std.mem.bytesToValue(i64, data[offset..][0..8]);

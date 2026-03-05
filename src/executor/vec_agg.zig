@@ -418,7 +418,7 @@ fn appendValueToKey(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, val: 
             try buf.append(allocator, 3);
             try buf.appendSlice(allocator, std.mem.asBytes(&v));
         },
-        .bigint => |v| {
+        .bigint, .date, .timestamp => |v| {
             try buf.append(allocator, 4);
             try buf.appendSlice(allocator, std.mem.asBytes(&v));
         },
