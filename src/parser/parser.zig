@@ -422,7 +422,7 @@ pub const Parser = struct {
 
     fn isScalarFunctionToken(self: *Self) bool {
         return switch (self.current.type) {
-            .kw_lower, .kw_upper, .kw_trim, .kw_length, .kw_substring, .kw_concat, .kw_coalesce, .kw_nullif => true,
+            .kw_lower, .kw_upper, .kw_trim, .kw_length, .kw_substring, .kw_concat, .kw_coalesce, .kw_nullif, .kw_abs, .kw_round, .kw_ceil, .kw_floor, .kw_mod => true,
             else => false,
         };
     }
@@ -829,6 +829,11 @@ pub const Parser = struct {
             .kw_concat => return self.parseFunctionCall(.concat),
             .kw_coalesce => return self.parseFunctionCall(.coalesce),
             .kw_nullif => return self.parseFunctionCall(.nullif),
+            .kw_abs => return self.parseFunctionCall(.abs),
+            .kw_round => return self.parseFunctionCall(.round),
+            .kw_ceil => return self.parseFunctionCall(.ceil),
+            .kw_floor => return self.parseFunctionCall(.floor),
+            .kw_mod => return self.parseFunctionCall(.mod),
             .positional_param => {
                 const idx = try self.resolvePositionalParam();
                 expr.* = .{ .literal = .{ .parameter = idx } };
@@ -916,7 +921,9 @@ pub const Parser = struct {
             .substring => if (n < 2 or n > 3) return ParseError.InvalidSyntax,
             .concat => if (n < 2) return ParseError.InvalidSyntax,
             .coalesce => if (n < 1) return ParseError.InvalidSyntax,
-            .nullif => if (n != 2) return ParseError.InvalidSyntax,
+            .nullif, .mod => if (n != 2) return ParseError.InvalidSyntax,
+            .abs, .ceil, .floor => if (n != 1) return ParseError.InvalidSyntax,
+            .round => if (n < 1 or n > 2) return ParseError.InvalidSyntax,
         }
 
         const expr = try alloc.create(ast.Expression);
@@ -959,6 +966,22 @@ pub const Parser = struct {
             .kw_null => {
                 self.advance();
                 return .{ .null_value = {} };
+            },
+            .op_minus => {
+                self.advance();
+                switch (self.current.type) {
+                    .integer_literal => {
+                        const val = std.fmt.parseInt(i64, self.current.text, 10) catch return ParseError.InvalidSyntax;
+                        self.advance();
+                        return .{ .integer = -val };
+                    },
+                    .float_literal => {
+                        const val = std.fmt.parseFloat(f64, self.current.text) catch return ParseError.InvalidSyntax;
+                        self.advance();
+                        return .{ .float = -val };
+                    },
+                    else => return ParseError.UnexpectedToken,
+                }
             },
             .positional_param => return .{ .parameter = try self.resolvePositionalParam() },
             .named_param => return .{ .parameter = try self.resolveNamedParam() },
@@ -1782,4 +1805,30 @@ test "parse NULLIF wrong arg count fails" {
     var p = Parser.init(std.testing.allocator, "SELECT NULLIF(a) FROM t");
     defer p.deinit();
     try std.testing.expectError(ParseError.InvalidSyntax, p.parse());
+}
+
+test "parse ABS function" {
+    var p = Parser.init(std.testing.allocator, "SELECT ABS(x) FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const expr = stmt.select.columns[0].expression;
+    try std.testing.expectEqual(ast.BuiltinFunction.abs, expr.function_call.func);
+}
+
+test "parse ROUND with precision" {
+    var p = Parser.init(std.testing.allocator, "SELECT ROUND(x, 2) FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const expr = stmt.select.columns[0].expression;
+    try std.testing.expectEqual(ast.BuiltinFunction.round, expr.function_call.func);
+    try std.testing.expectEqual(@as(usize, 2), expr.function_call.args.len);
+}
+
+test "parse MOD function" {
+    var p = Parser.init(std.testing.allocator, "SELECT MOD(x, 3) FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const expr = stmt.select.columns[0].expression;
+    try std.testing.expectEqual(ast.BuiltinFunction.mod, expr.function_call.func);
+    try std.testing.expectEqual(@as(usize, 2), expr.function_call.args.len);
 }

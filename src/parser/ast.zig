@@ -141,6 +141,11 @@ pub const BuiltinFunction = enum {
     concat,
     coalesce,
     nullif,
+    abs,
+    round,
+    ceil,
+    floor,
+    mod,
 };
 
 /// CASE WHEN clause

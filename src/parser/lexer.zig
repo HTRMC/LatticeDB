@@ -91,6 +91,13 @@ pub const TokenType = enum {
     kw_coalesce,
     kw_nullif,
 
+    // Numeric functions
+    kw_abs,
+    kw_round,
+    kw_ceil,
+    kw_floor,
+    kw_mod,
+
     // Transaction keywords
     kw_begin,
     kw_commit,
@@ -211,6 +218,11 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "is", .kw_is },
     .{ "coalesce", .kw_coalesce },
     .{ "nullif", .kw_nullif },
+    .{ "abs", .kw_abs },
+    .{ "round", .kw_round },
+    .{ "ceil", .kw_ceil },
+    .{ "floor", .kw_floor },
+    .{ "mod", .kw_mod },
     .{ "int", .kw_int },
     .{ "integer", .kw_integer },
     .{ "bigint", .kw_bigint },

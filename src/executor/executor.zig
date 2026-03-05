@@ -6609,3 +6609,64 @@ test "executor NULLIF" {
     try std.testing.expectEqualStrings("NULL", r.rows.rows[0].values[0]);
     try std.testing.expectEqualStrings("5", r.rows.rows[1].values[0]);
 }
+
+test "executor ABS and MOD" {
+    const test_file = "test_exec_abs_mod.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (x INT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (-7), (10)");
+    exec.freeResult(ins);
+
+    const r1 = try exec.execute("SELECT ABS(x) FROM t");
+    defer exec.freeResult(r1);
+    try std.testing.expectEqualStrings("7", r1.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("10", r1.rows.rows[1].values[0]);
+
+    const r2 = try exec.execute("SELECT MOD(x, 3) FROM t WHERE x > 0");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqualStrings("1", r2.rows.rows[0].values[0]);
+}
+
+test "executor ROUND CEIL FLOOR" {
+    const test_file = "test_exec_round.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (x FLOAT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (3.7)");
+    exec.freeResult(ins);
+
+    const r1 = try exec.execute("SELECT ROUND(x) FROM t");
+    defer exec.freeResult(r1);
+    try std.testing.expectEqualStrings("4.000000", r1.rows.rows[0].values[0]);
+
+    const r2 = try exec.execute("SELECT CEIL(x) FROM t");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqualStrings("4.000000", r2.rows.rows[0].values[0]);
+
+    const r3 = try exec.execute("SELECT FLOOR(x) FROM t");
+    defer exec.freeResult(r3);
+    try std.testing.expectEqualStrings("3.000000", r3.rows.rows[0].values[0]);
+}

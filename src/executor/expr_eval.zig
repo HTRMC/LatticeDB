@@ -58,6 +58,11 @@ pub fn projectionColumnName(proj: ProjectionColumn, schema: *const Schema, func_
                         .concat => "concat",
                         .coalesce => "coalesce",
                         .nullif => "nullif",
+                        .abs => "abs",
+                        .round => "round",
+                        .ceil => "ceil",
+                        .floor => "floor",
+                        .mod => "mod",
                     };
                     return name;
                 },
@@ -343,6 +348,42 @@ fn evalFunctionCall(
             }
             return a;
         },
+        .abs => {
+            const arg = evalExprToValue(allocator, fc.args[0], schema, values, params);
+            defer arg.deinit(allocator);
+            return numAbs(arg.value);
+        },
+        .round => {
+            const arg = evalExprToValue(allocator, fc.args[0], schema, values, params);
+            defer arg.deinit(allocator);
+            const precision: i32 = if (fc.args.len > 1) blk: {
+                const p = evalExprToValue(allocator, fc.args[1], schema, values, params);
+                defer p.deinit(allocator);
+                break :blk switch (p.value) {
+                    .integer => |i| i,
+                    .bigint => |i| @intCast(i),
+                    else => 0,
+                };
+            } else 0;
+            return numRound(arg.value, precision);
+        },
+        .ceil => {
+            const arg = evalExprToValue(allocator, fc.args[0], schema, values, params);
+            defer arg.deinit(allocator);
+            return numCeil(arg.value);
+        },
+        .floor => {
+            const arg = evalExprToValue(allocator, fc.args[0], schema, values, params);
+            defer arg.deinit(allocator);
+            return numFloor(arg.value);
+        },
+        .mod => {
+            const a = evalExprToValue(allocator, fc.args[0], schema, values, params);
+            defer a.deinit(allocator);
+            const b = evalExprToValue(allocator, fc.args[1], schema, values, params);
+            defer b.deinit(allocator);
+            return numMod(a.value, b.value);
+        },
     }
 }
 
@@ -549,6 +590,75 @@ fn toInt(val: Value) ?i64 {
         .bigint => |i| i,
         else => null,
     };
+}
+
+// ── Numeric functions ────────────────────────────────────────────
+
+fn numAbs(val: Value) ExprResult {
+    return switch (val) {
+        .integer => |i| ExprResult.borrowed(.{ .integer = if (i < 0) -%i else i }),
+        .bigint => |i| ExprResult.borrowed(.{ .bigint = if (i < 0) -%i else i }),
+        .float => |f| ExprResult.borrowed(.{ .float = @abs(f) }),
+        .null_value => ExprResult.borrowed(.{ .null_value = {} }),
+        else => ExprResult.borrowed(.{ .null_value = {} }),
+    };
+}
+
+fn numRound(val: Value, precision: i32) ExprResult {
+    switch (val) {
+        .float => |f| {
+            if (precision == 0) {
+                return ExprResult.borrowed(.{ .float = @round(f) });
+            }
+            const p: f64 = std.math.pow(f64, 10.0, @floatFromInt(precision));
+            return ExprResult.borrowed(.{ .float = @round(f * p) / p });
+        },
+        .integer, .bigint => return ExprResult.borrowed(val),
+        .null_value => return ExprResult.borrowed(.{ .null_value = {} }),
+        else => return ExprResult.borrowed(.{ .null_value = {} }),
+    }
+}
+
+fn numCeil(val: Value) ExprResult {
+    return switch (val) {
+        .float => |f| ExprResult.borrowed(.{ .float = @ceil(f) }),
+        .integer, .bigint => ExprResult.borrowed(val),
+        .null_value => ExprResult.borrowed(.{ .null_value = {} }),
+        else => ExprResult.borrowed(.{ .null_value = {} }),
+    };
+}
+
+fn numFloor(val: Value) ExprResult {
+    return switch (val) {
+        .float => |f| ExprResult.borrowed(.{ .float = @floor(f) }),
+        .integer, .bigint => ExprResult.borrowed(val),
+        .null_value => ExprResult.borrowed(.{ .null_value = {} }),
+        else => ExprResult.borrowed(.{ .null_value = {} }),
+    };
+}
+
+fn numMod(a: Value, b: Value) ExprResult {
+    if (a == .null_value or b == .null_value) return ExprResult.borrowed(.{ .null_value = {} });
+
+    // Float mod
+    const af = toFloat(a);
+    const bf = toFloat(b);
+    if (af != null or bf != null) {
+        const lf = af orelse toFloatFromInt(a) orelse return ExprResult.borrowed(.{ .null_value = {} });
+        const rf = bf orelse toFloatFromInt(b) orelse return ExprResult.borrowed(.{ .null_value = {} });
+        if (rf == 0.0) return ExprResult.borrowed(.{ .null_value = {} });
+        return ExprResult.borrowed(.{ .float = @mod(lf, rf) });
+    }
+
+    // Integer mod
+    const li = toInt(a) orelse return ExprResult.borrowed(.{ .null_value = {} });
+    const ri = toInt(b) orelse return ExprResult.borrowed(.{ .null_value = {} });
+    if (ri == 0) return ExprResult.borrowed(.{ .null_value = {} });
+    const result = @rem(li, ri);
+    if (result >= std.math.minInt(i32) and result <= std.math.maxInt(i32)) {
+        return ExprResult.borrowed(.{ .integer = @intCast(result) });
+    }
+    return ExprResult.borrowed(.{ .bigint = result });
 }
 
 // ── String functions ─────────────────────────────────────────────
@@ -767,6 +877,33 @@ test "null propagation in string functions" {
 
     const r2 = strLength(.{ .null_value = {} });
     try std.testing.expectEqual(Value.null_value, std.meta.activeTag(r2.value));
+}
+
+test "numAbs" {
+    try std.testing.expectEqual(@as(i32, 5), numAbs(.{ .integer = -5 }).value.integer);
+    try std.testing.expectEqual(@as(i32, 5), numAbs(.{ .integer = 5 }).value.integer);
+    try std.testing.expectEqual(@as(f64, 3.14), numAbs(.{ .float = -3.14 }).value.float);
+    try std.testing.expect(numAbs(.{ .null_value = {} }).value == .null_value);
+}
+
+test "numRound" {
+    try std.testing.expectEqual(@as(f64, 3.0), numRound(.{ .float = 3.14 }, 0).value.float);
+    try std.testing.expectEqual(@as(f64, 3.1), numRound(.{ .float = 3.14 }, 1).value.float);
+    try std.testing.expectEqual(@as(i32, 5), numRound(.{ .integer = 5 }, 0).value.integer);
+}
+
+test "numCeil and numFloor" {
+    try std.testing.expectEqual(@as(f64, 4.0), numCeil(.{ .float = 3.2 }).value.float);
+    try std.testing.expectEqual(@as(f64, 3.0), numFloor(.{ .float = 3.8 }).value.float);
+    try std.testing.expectEqual(@as(f64, -3.0), numCeil(.{ .float = -3.2 }).value.float);
+    try std.testing.expectEqual(@as(f64, -4.0), numFloor(.{ .float = -3.2 }).value.float);
+}
+
+test "numMod" {
+    try std.testing.expectEqual(@as(i32, 1), numMod(.{ .integer = 7 }, .{ .integer = 3 }).value.integer);
+    try std.testing.expectEqual(@as(i32, 0), numMod(.{ .integer = 6 }, .{ .integer = 3 }).value.integer);
+    try std.testing.expect(numMod(.{ .integer = 5 }, .{ .integer = 0 }).value == .null_value);
+    try std.testing.expect(numMod(.{ .null_value = {} }, .{ .integer = 3 }).value == .null_value);
 }
 
 test "compareValues integers" {
