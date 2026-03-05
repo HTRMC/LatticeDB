@@ -2654,13 +2654,28 @@ pub const Executor = struct {
 
             @memcpy(new_values, entry.values);
 
-            // Apply SET assignments
+            // Track which values were allocated by expression eval
+            var owned_bytes: [64]?[]const u8 = .{null} ** 64;
+
+            // Apply SET assignments — evaluate expressions against current row values
             for (upd.assignments, set_indices) |assign, ci| {
-                const resolved_val = resolveParam(assign.value, self.current_params);
-                new_values[ci] = litToValue(resolved_val, schema.columns[ci].col_type) catch {
-                    self.abortImplicitTxn(txn);
-                    return ExecError.TypeMismatch;
-                };
+                const expr_result = expr_eval.evalExprToValue(self.allocator, assign.value, schema, entry.values, self.current_params);
+                defer expr_result.deinit(self.allocator);
+                if (expr_result.owned) {
+                    switch (expr_result.value) {
+                        .bytes => |b| {
+                            const duped = self.allocator.dupe(u8, b) catch {
+                                self.abortImplicitTxn(txn);
+                                return ExecError.OutOfMemory;
+                            };
+                            new_values[ci] = .{ .bytes = duped };
+                            owned_bytes[ci] = duped;
+                        },
+                        else => new_values[ci] = expr_result.value,
+                    }
+                } else {
+                    new_values[ci] = expr_result.value;
+                }
             }
 
             // Delete old tuple (MVCC: sets xmax)
@@ -2683,6 +2698,14 @@ pub const Executor = struct {
             };
 
             self.maintainIndexesInsert(table.table_id, schema, new_values, new_tid);
+
+            // Free owned expression result bytes
+            for (&owned_bytes) |*ob| {
+                if (ob.*) |b| {
+                    self.allocator.free(b);
+                    ob.* = null;
+                }
+            }
 
             updated += 1;
         }
@@ -7250,4 +7273,47 @@ test "executor INSERT with column list" {
     try std.testing.expectEqualStrings("42", r.rows.rows[0].values[0]);
     try std.testing.expectEqualStrings("hello", r.rows.rows[0].values[1]);
     try std.testing.expectEqualStrings("NULL", r.rows.rows[0].values[2]);
+}
+
+test "executor UPDATE with expression" {
+    const test_file = "test_exec_update_expr.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (x INT, name TEXT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (10, 'alice'), (20, 'bob')");
+    exec.freeResult(ins);
+
+    // UPDATE t SET x = x + 5 WHERE name = 'alice'
+    const upd1 = try exec.execute("UPDATE t SET x = x + 5 WHERE name = 'alice'");
+    defer exec.freeResult(upd1);
+    try std.testing.expectEqual(@as(u64, 1), upd1.row_count);
+
+    const r = try exec.execute("SELECT x FROM t WHERE name = 'alice'");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 1), r.rows.rows.len);
+    try std.testing.expectEqualStrings("15", r.rows.rows[0].values[0]);
+
+    // Verify bob unchanged
+    const rb = try exec.execute("SELECT x FROM t WHERE name = 'bob'");
+    defer exec.freeResult(rb);
+    try std.testing.expectEqualStrings("20", rb.rows.rows[0].values[0]);
+
+    // UPDATE with string concat expression
+    const upd2 = try exec.execute("UPDATE t SET name = name || '_updated'");
+    defer exec.freeResult(upd2);
+
+    const r2 = try exec.execute("SELECT name FROM t WHERE x = 15");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqualStrings("alice_updated", r2.rows.rows[0].values[0]);
 }

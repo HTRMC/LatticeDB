@@ -266,7 +266,7 @@ pub const Update = struct {
 
 pub const SetClause = struct {
     column: []const u8,
-    value: LiteralValue,
+    value: *const Expression,
 };
 
 pub const DropTable = struct {

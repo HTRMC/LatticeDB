@@ -499,7 +499,7 @@ pub const Parser = struct {
     fn parseSetClause(self: *Self) ParseError!ast.SetClause {
         const column = try self.expectIdentifier();
         try self.expect(.op_eq);
-        const value = try self.parseLiteral();
+        const value = try self.parseExpression();
         return .{ .column = column, .value = value };
     }
 
@@ -1280,7 +1280,7 @@ test "parse UPDATE" {
         try std.testing.expectEqualStrings("users", upd.table_name);
         try std.testing.expectEqual(@as(usize, 1), upd.assignments.len);
         try std.testing.expectEqualStrings("name", upd.assignments[0].column);
-        try std.testing.expectEqualStrings("Bob", upd.assignments[0].value.string);
+        try std.testing.expectEqualStrings("Bob", upd.assignments[0].value.literal.string);
         try std.testing.expect(upd.where_clause != null);
     }
     {
@@ -2080,6 +2080,15 @@ test "parse LIMIT without OFFSET" {
     const stmt = try p.parse();
     try std.testing.expectEqual(@as(u64, 5), stmt.select.limit.?);
     try std.testing.expect(stmt.select.offset == null);
+}
+
+test "parse UPDATE with expression" {
+    var p = Parser.init(std.testing.allocator, "UPDATE t SET x = x + 1 WHERE id = 5");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const upd = stmt.update;
+    try std.testing.expectEqualStrings("x", upd.assignments[0].column);
+    try std.testing.expect(upd.assignments[0].value.* == .arithmetic);
 }
 
 test "parse INSERT with column list" {
