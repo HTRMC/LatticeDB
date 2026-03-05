@@ -111,6 +111,13 @@ pub const TokenType = enum {
     kw_foreign,
     kw_references,
 
+    // Window function keywords
+    kw_over,
+    kw_partition,
+    kw_row_number,
+    kw_rank,
+    kw_dense_rank,
+
     // View keyword
     kw_view,
 
@@ -274,6 +281,11 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "constraint", .kw_constraint },
     .{ "foreign", .kw_foreign },
     .{ "references", .kw_references },
+    .{ "over", .kw_over },
+    .{ "partition", .kw_partition },
+    .{ "row_number", .kw_row_number },
+    .{ "rank", .kw_rank },
+    .{ "dense_rank", .kw_dense_rank },
     .{ "view", .kw_view },
     .{ "replace", .kw_replace },
     .{ "position", .kw_position },

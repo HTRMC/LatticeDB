@@ -694,7 +694,7 @@ fn resolveSelectColumns(allocator: std.mem.Allocator, sel_cols: []const ast.Sele
                 allocator.free(indices);
                 return null;
             },
-            .aggregate, .expression => {
+            .aggregate, .expression, .window_function => {
                 allocator.free(indices);
                 return null;
             },

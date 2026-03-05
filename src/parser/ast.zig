@@ -176,6 +176,19 @@ pub const AggregateFunc = enum {
     max,
 };
 
+/// Window function type
+pub const WindowFunc = enum {
+    row_number,
+    rank,
+    dense_rank,
+};
+
+/// Window specification: OVER(PARTITION BY ... ORDER BY ...)
+pub const WindowSpec = struct {
+    partition_by: ?[]const []const u8 = null,
+    order_by: ?[]const OrderByClause = null,
+};
+
 /// What columns to select
 pub const SelectColumn = union(enum) {
     /// SELECT *
@@ -195,6 +208,11 @@ pub const SelectColumn = union(enum) {
     },
     /// SELECT expression (function call, CASE, etc.)
     expression: *const Expression,
+    /// SELECT ROW_NUMBER() OVER(...), RANK() OVER(...), etc.
+    window_function: struct {
+        func: WindowFunc,
+        spec: WindowSpec,
+    },
 };
 
 /// Top-level SQL statement

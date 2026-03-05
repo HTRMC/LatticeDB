@@ -1152,6 +1152,32 @@ pub const Executor = struct {
                     try buf.append(self.allocator, ')');
                 },
                 .expression => |expr| try self.writeExpr(buf, expr),
+                .window_function => |wf| {
+                    const fname: []const u8 = switch (wf.func) {
+                        .row_number => "ROW_NUMBER",
+                        .rank => "RANK",
+                        .dense_rank => "DENSE_RANK",
+                    };
+                    try buf.appendSlice(self.allocator, fname);
+                    try buf.appendSlice(self.allocator, "() OVER(");
+                    if (wf.spec.partition_by) |pb| {
+                        try buf.appendSlice(self.allocator, "PARTITION BY ");
+                        for (pb, 0..) |p, pi| {
+                            if (pi > 0) try buf.appendSlice(self.allocator, ", ");
+                            try buf.appendSlice(self.allocator, p);
+                        }
+                    }
+                    if (wf.spec.order_by) |ob| {
+                        if (wf.spec.partition_by != null) try buf.append(self.allocator, ' ');
+                        try buf.appendSlice(self.allocator, "ORDER BY ");
+                        for (ob, 0..) |o, oi| {
+                            if (oi > 0) try buf.appendSlice(self.allocator, ", ");
+                            try buf.appendSlice(self.allocator, o.column);
+                            if (!o.ascending) try buf.appendSlice(self.allocator, " DESC");
+                        }
+                    }
+                    try buf.append(self.allocator, ')');
+                },
             }
             if (sel.aliases) |aliases| {
                 if (aliases[ci]) |alias| {
@@ -1773,6 +1799,18 @@ pub const Executor = struct {
             return self.execSelectAggregate(sel, &table, schema);
         }
 
+        // Check for window functions
+        var has_window = false;
+        for (sel.columns) |col| {
+            if (col == .window_function) {
+                has_window = true;
+                break;
+            }
+        }
+        if (has_window) {
+            return self.execSelectWindow(sel, &table, schema);
+        }
+
         // Determine which columns to output
         const col_proj = try self.resolveSelectColumns(sel.columns, schema);
         defer self.allocator.free(col_proj);
@@ -2241,6 +2279,294 @@ pub const Executor = struct {
         };
     }
 
+    fn execSelectWindow(
+        self: *Self,
+        sel: ast.Select,
+        table: *Table,
+        schema: *const Schema,
+    ) ExecError!ExecResult {
+        const txn = self.current_txn orelse self.beginImplicitTxn();
+
+        // READ COMMITTED: refresh snapshot
+        if (txn) |t| {
+            if (t.isolation_level == .read_committed) {
+                if (self.txn_manager) |tm| {
+                    tm.refreshSnapshot(t) catch {};
+                }
+            }
+        }
+
+        // Collect all rows
+        var all_rows: std.ArrayList([]Value) = .empty;
+        defer {
+            for (all_rows.items) |vals| self.allocator.free(vals);
+            all_rows.deinit(self.allocator);
+        }
+
+        var iter = table.scanWithTxn(txn) catch return ExecError.StorageError;
+        while (iter.next() catch return ExecError.StorageError) |row| {
+            // Apply WHERE filter
+            const matches = if (sel.where_clause) |where|
+                self.evalWhere(where, schema, row.values)
+            else
+                true;
+            if (matches) {
+                all_rows.append(self.allocator, row.values) catch return ExecError.OutOfMemory;
+            } else {
+                iter.freeValues(row.values);
+            }
+        }
+
+        self.commitImplicitTxn(txn);
+
+        const num_rows = all_rows.items.len;
+        const num_cols = sel.columns.len;
+
+        // Build column headers
+        const col_names = self.allocator.alloc([]const u8, num_cols) catch return ExecError.OutOfMemory;
+        for (sel.columns, 0..) |col, ci| {
+            const alias_name = if (sel.aliases) |aliases| (if (ci < aliases.len) aliases[ci] else null) else null;
+            col_names[ci] = if (alias_name) |a|
+                self.allocator.dupe(u8, a) catch return ExecError.OutOfMemory
+            else switch (col) {
+                .named => |name| self.allocator.dupe(u8, name) catch return ExecError.OutOfMemory,
+                .qualified => |q| self.allocator.dupe(u8, q.column) catch return ExecError.OutOfMemory,
+                .window_function => |wf| switch (wf.func) {
+                    .row_number => self.allocator.dupe(u8, "row_number") catch return ExecError.OutOfMemory,
+                    .rank => self.allocator.dupe(u8, "rank") catch return ExecError.OutOfMemory,
+                    .dense_rank => self.allocator.dupe(u8, "dense_rank") catch return ExecError.OutOfMemory,
+                },
+                else => self.allocator.dupe(u8, "?") catch return ExecError.OutOfMemory,
+            };
+        }
+
+        // For each window function column, compute the window values
+        // First, resolve non-window column indices
+        const col_indices = self.allocator.alloc(?usize, num_cols) catch return ExecError.OutOfMemory;
+        defer self.allocator.free(col_indices);
+        for (sel.columns, 0..) |col, ci| {
+            switch (col) {
+                .named => |name| {
+                    col_indices[ci] = resolveColumnIndex(schema, name) orelse return ExecError.ColumnNotFound;
+                },
+                .qualified => |q| {
+                    col_indices[ci] = resolveColumnIndex(schema, q.column) orelse return ExecError.ColumnNotFound;
+                },
+                .window_function => {
+                    col_indices[ci] = null; // computed separately
+                },
+                else => {
+                    col_indices[ci] = null;
+                },
+            }
+        }
+
+        // Compute window function values for each row
+        // window_vals[col_idx][row_idx] = computed value
+        const window_vals = self.allocator.alloc(?[]u64, num_cols) catch return ExecError.OutOfMemory;
+        defer {
+            for (window_vals) |wv| if (wv) |v| self.allocator.free(v);
+            self.allocator.free(window_vals);
+        }
+
+        for (sel.columns, 0..) |col, ci| {
+            if (col != .window_function) {
+                window_vals[ci] = null;
+                continue;
+            }
+            const wf = col.window_function;
+
+            // Build row indices and sort by partition + order
+            const indices = self.allocator.alloc(usize, num_rows) catch return ExecError.OutOfMemory;
+            defer self.allocator.free(indices);
+            for (0..num_rows) |i| indices[i] = i;
+
+            // Sort indices by partition_by columns then order_by columns
+            const SortCtx = struct {
+                rows: []const []Value,
+                partition_cols: ?[]const usize,
+                order_cols: ?[]const usize,
+                order_asc: ?[]const bool,
+            };
+
+            var part_indices: ?[]usize = null;
+            defer if (part_indices) |pi| self.allocator.free(pi);
+            if (wf.spec.partition_by) |pb| {
+                const pi = self.allocator.alloc(usize, pb.len) catch return ExecError.OutOfMemory;
+                for (pb, 0..) |pname, i| {
+                    pi[i] = resolveColumnIndex(schema, pname) orelse return ExecError.ColumnNotFound;
+                }
+                part_indices = pi;
+            }
+
+            var ord_indices: ?[]usize = null;
+            var ord_asc: ?[]bool = null;
+            defer if (ord_indices) |oi| self.allocator.free(oi);
+            defer if (ord_asc) |oa| self.allocator.free(oa);
+            if (wf.spec.order_by) |ob| {
+                const oi = self.allocator.alloc(usize, ob.len) catch return ExecError.OutOfMemory;
+                const oa = self.allocator.alloc(bool, ob.len) catch return ExecError.OutOfMemory;
+                for (ob, 0..) |o, i| {
+                    oi[i] = resolveColumnIndex(schema, o.column) orelse return ExecError.ColumnNotFound;
+                    oa[i] = o.ascending;
+                }
+                ord_indices = oi;
+                ord_asc = oa;
+            }
+
+            const ctx: SortCtx = .{
+                .rows = all_rows.items,
+                .partition_cols = part_indices,
+                .order_cols = ord_indices,
+                .order_asc = ord_asc,
+            };
+
+            std.mem.sortUnstable(usize, indices, ctx, struct {
+                fn lessThan(c: SortCtx, a: usize, b: usize) bool {
+                    const ra = c.rows[a];
+                    const rb = c.rows[b];
+                    // Sort by partition columns first
+                    if (c.partition_cols) |pcols| {
+                        for (pcols) |pc| {
+                            const cmp = orderValues(ra[pc], rb[pc]);
+                            if (cmp != .eq) return cmp == .lt;
+                        }
+                    }
+                    // Then by order columns
+                    if (c.order_cols) |ocols| {
+                        for (ocols, 0..) |oc, oi| {
+                            const cmp = orderValues(ra[oc], rb[oc]);
+                            if (cmp != .eq) {
+                                const asc = if (c.order_asc) |oa| oa[oi] else true;
+                                return if (asc) cmp == .lt else cmp == .gt;
+                            }
+                        }
+                    }
+                    return false;
+                }
+            }.lessThan);
+
+            // Assign window function values
+            const vals = self.allocator.alloc(u64, num_rows) catch return ExecError.OutOfMemory;
+
+            var rank_val: u64 = 0;
+            var dense_val: u64 = 0;
+            var i: usize = 0;
+            while (i < num_rows) {
+                const row_idx = indices[i];
+                const is_new_partition = if (i == 0) true else blk: {
+                    if (part_indices) |pcols| {
+                        const prev = all_rows.items[indices[i - 1]];
+                        const curr = all_rows.items[row_idx];
+                        for (pcols) |pc| {
+                            if (orderValues(prev[pc], curr[pc]) != .eq) break :blk true;
+                        }
+                    }
+                    break :blk false;
+                };
+
+                if (is_new_partition) {
+                    rank_val = 1;
+                    dense_val = 1;
+                } else {
+                    rank_val += 1;
+                    // Check if order values changed from previous row
+                    const prev = all_rows.items[indices[i - 1]];
+                    const curr = all_rows.items[row_idx];
+                    var order_changed = false;
+                    if (ord_indices) |ocols| {
+                        for (ocols) |oc| {
+                            if (orderValues(prev[oc], curr[oc]) != .eq) {
+                                order_changed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (order_changed) dense_val += 1;
+                }
+
+                switch (wf.func) {
+                    .row_number => vals[row_idx] = rank_val,
+                    .rank => {
+                        // Rank: same for ties, skip after
+                        if (i > 0 and !is_new_partition) {
+                            const prev = all_rows.items[indices[i - 1]];
+                            const curr = all_rows.items[row_idx];
+                            var same = true;
+                            if (ord_indices) |ocols| {
+                                for (ocols) |oc| {
+                                    if (orderValues(prev[oc], curr[oc]) != .eq) {
+                                        same = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (same) {
+                                vals[row_idx] = vals[indices[i - 1]];
+                            } else {
+                                vals[row_idx] = rank_val;
+                            }
+                        } else {
+                            vals[row_idx] = rank_val;
+                        }
+                    },
+                    .dense_rank => vals[row_idx] = dense_val,
+                }
+                i += 1;
+            }
+
+            window_vals[ci] = vals;
+        }
+
+        // Build result rows in original order
+        const result_rows = self.allocator.alloc(ResultRow, num_rows) catch return ExecError.OutOfMemory;
+        for (0..num_rows) |ri| {
+            const vals = self.allocator.alloc([]const u8, num_cols) catch return ExecError.OutOfMemory;
+            for (0..num_cols) |ci| {
+                if (window_vals[ci]) |wv| {
+                    vals[ci] = std.fmt.allocPrint(self.allocator, "{d}", .{wv[ri]}) catch return ExecError.OutOfMemory;
+                } else if (col_indices[ci]) |idx| {
+                    vals[ci] = expr_eval.formatValue(self.allocator, all_rows.items[ri][idx]) catch return ExecError.OutOfMemory;
+                } else {
+                    vals[ci] = self.allocator.dupe(u8, "NULL") catch return ExecError.OutOfMemory;
+                }
+            }
+            result_rows[ri] = .{ .values = vals };
+        }
+
+        return .{ .rows = .{ .columns = col_names, .rows = result_rows } };
+    }
+
+    fn orderValues(a: Value, b: Value) std.math.Order {
+        const tag_a = std.meta.activeTag(a);
+        const tag_b = std.meta.activeTag(b);
+        if (a == .null_value and b == .null_value) return .eq;
+        if (a == .null_value) return .lt;
+        if (b == .null_value) return .gt;
+        if (tag_a == tag_b) {
+            return switch (a) {
+                .integer => |v| std.math.order(v, b.integer),
+                .bigint => |v| std.math.order(v, b.bigint),
+                .float => |v| std.math.order(v, b.float),
+                .boolean => |v| std.math.order(@intFromBool(v), @intFromBool(b.boolean)),
+                .bytes => |v| std.mem.order(u8, v, b.bytes),
+                .null_value => .eq,
+            };
+        }
+        // Cross-type int comparison
+        const int_a = switch (a) {
+            .integer => |v| @as(i64, v),
+            .bigint => |v| v,
+            else => return .lt,
+        };
+        const int_b = switch (b) {
+            .integer => |v| @as(i64, v),
+            .bigint => |v| v,
+            else => return .gt,
+        };
+        return std.math.order(int_a, int_b);
+    }
+
     fn execSelectAggregate(
         self: *Self,
         sel: ast.Select,
@@ -2268,7 +2594,7 @@ pub const Executor = struct {
                 .qualified => |q| {
                     agg_col_indices[i] = resolveColumnIndex(schema, q.column) orelse return ExecError.ColumnNotFound;
                 },
-                .all_columns, .expression => return ExecError.ColumnNotFound,
+                .all_columns, .expression, .window_function => return ExecError.ColumnNotFound,
             }
         }
 
@@ -2468,7 +2794,7 @@ pub const Executor = struct {
                 .named => |name| self.allocator.dupe(u8, name) catch return ExecError.OutOfMemory,
                 .qualified => |q| self.allocator.dupe(u8, q.column) catch return ExecError.OutOfMemory,
                 .all_columns => unreachable,
-                .expression => return ExecError.ColumnNotFound, // expression columns not supported in aggregates
+                .expression, .window_function => return ExecError.ColumnNotFound,
             };
         }
 
@@ -2510,7 +2836,7 @@ pub const Executor = struct {
                         break :blk self.allocator.dupe(u8, "NULL") catch return ExecError.OutOfMemory;
                     },
                     .all_columns => unreachable,
-                    .expression => return ExecError.ColumnNotFound,
+                    .expression, .window_function => return ExecError.ColumnNotFound,
                 };
             }
 
@@ -8686,4 +9012,68 @@ test "executor FOREIGN KEY constraint" {
     const del = try exec.execute("DELETE FROM departments WHERE id = 2");
     defer exec.freeResult(del);
     try std.testing.expectEqual(@as(u64, 1), del.row_count);
+}
+
+test "executor window functions ROW_NUMBER, RANK, DENSE_RANK" {
+    const test_file = "test_exec_window.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+    defer exec.deinit();
+
+    const ct = try exec.execute("CREATE TABLE scores (name TEXT, dept TEXT, score INT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO scores VALUES ('Alice', 'Eng', 90), ('Bob', 'Eng', 85), ('Carol', 'Sales', 90), ('Dave', 'Sales', 80)");
+    exec.freeResult(ins);
+
+    // ROW_NUMBER() OVER(ORDER BY score DESC)
+    const r1 = try exec.execute("SELECT name, ROW_NUMBER() OVER(ORDER BY score DESC) FROM scores");
+    defer exec.freeResult(r1);
+    try std.testing.expectEqual(@as(usize, 4), r1.rows.rows.len);
+    try std.testing.expectEqualStrings("row_number", r1.rows.columns[1]);
+    // Alice(90)=1, Bob(85)=3, Carol(90)=2, Dave(80)=4 (original order, numbered by sort)
+    try std.testing.expectEqualStrings("1", r1.rows.rows[0].values[1]); // Alice
+    try std.testing.expectEqualStrings("3", r1.rows.rows[1].values[1]); // Bob
+
+    // ROW_NUMBER() OVER(PARTITION BY dept ORDER BY score DESC)
+    const r2 = try exec.execute("SELECT name, dept, ROW_NUMBER() OVER(PARTITION BY dept ORDER BY score DESC) FROM scores");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqual(@as(usize, 4), r2.rows.rows.len);
+    // Within each partition, numbering restarts at 1
+    // Eng: Alice(90)=1, Bob(85)=2; Sales: Carol(90)=1, Dave(80)=2
+    for (r2.rows.rows) |row| {
+        const rn = try std.fmt.parseInt(u64, row.values[2], 10);
+        try std.testing.expect(rn == 1 or rn == 2);
+    }
+
+    // RANK() with ties
+    const ct2 = try exec.execute("CREATE TABLE ranks (id INT, val INT)");
+    exec.freeResult(ct2);
+    const ins2 = try exec.execute("INSERT INTO ranks VALUES (1, 10), (2, 20), (3, 20), (4, 30)");
+    exec.freeResult(ins2);
+
+    const r3 = try exec.execute("SELECT id, RANK() OVER(ORDER BY val) FROM ranks");
+    defer exec.freeResult(r3);
+    // val=10 → rank 1, val=20 → rank 2, val=20 → rank 2, val=30 → rank 4
+    try std.testing.expectEqualStrings("1", r3.rows.rows[0].values[1]);
+    try std.testing.expectEqualStrings("2", r3.rows.rows[1].values[1]);
+    try std.testing.expectEqualStrings("2", r3.rows.rows[2].values[1]);
+    try std.testing.expectEqualStrings("4", r3.rows.rows[3].values[1]);
+
+    // DENSE_RANK()
+    const r4 = try exec.execute("SELECT id, DENSE_RANK() OVER(ORDER BY val) FROM ranks");
+    defer exec.freeResult(r4);
+    // val=10 → 1, val=20 → 2, val=20 → 2, val=30 → 3
+    try std.testing.expectEqualStrings("1", r4.rows.rows[0].values[1]);
+    try std.testing.expectEqualStrings("2", r4.rows.rows[1].values[1]);
+    try std.testing.expectEqualStrings("2", r4.rows.rows[2].values[1]);
+    try std.testing.expectEqualStrings("3", r4.rows.rows[3].values[1]);
 }

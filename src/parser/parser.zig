@@ -424,7 +424,66 @@ pub const Parser = struct {
         };
     }
 
+    fn parseWindowSpec(self: *Self) ParseError!ast.WindowSpec {
+        const alloc = self.arena();
+        try self.expect(.kw_over);
+        try self.expect(.left_paren);
+
+        var partition_by: ?[]const []const u8 = null;
+        var order_by: ?[]const ast.OrderByClause = null;
+
+        if (self.current.type == .kw_partition) {
+            self.advance(); // consume PARTITION
+            try self.expect(.kw_by);
+            var parts: std.ArrayList([]const u8) = .empty;
+            parts.append(alloc, try self.expectIdentifier()) catch return ParseError.OutOfMemory;
+            while (self.current.type == .comma) {
+                self.advance();
+                parts.append(alloc, try self.expectIdentifier()) catch return ParseError.OutOfMemory;
+            }
+            partition_by = parts.toOwnedSlice(alloc) catch return ParseError.OutOfMemory;
+        }
+
+        if (self.current.type == .kw_order) {
+            self.advance(); // consume ORDER
+            try self.expect(.kw_by);
+            var orders: std.ArrayList(ast.OrderByClause) = .empty;
+            while (true) {
+                const col = try self.expectIdentifier();
+                var ascending = true;
+                if (self.current.type == .kw_desc) {
+                    ascending = false;
+                    self.advance();
+                } else if (self.current.type == .kw_asc) {
+                    self.advance();
+                }
+                orders.append(alloc, .{ .column = col, .ascending = ascending }) catch return ParseError.OutOfMemory;
+                if (self.current.type != .comma) break;
+                self.advance();
+            }
+            order_by = orders.toOwnedSlice(alloc) catch return ParseError.OutOfMemory;
+        }
+
+        try self.expect(.right_paren);
+        return .{ .partition_by = partition_by, .order_by = order_by };
+    }
+
     fn parseSelectColumn(self: *Self) ParseError!ast.SelectColumn {
+        // Check for window functions: ROW_NUMBER(), RANK(), DENSE_RANK()
+        const win_func: ?ast.WindowFunc = switch (self.current.type) {
+            .kw_row_number => .row_number,
+            .kw_rank => .rank,
+            .kw_dense_rank => .dense_rank,
+            else => null,
+        };
+        if (win_func) |func| {
+            self.advance(); // consume function name
+            try self.expect(.left_paren);
+            try self.expect(.right_paren);
+            const spec = try self.parseWindowSpec();
+            return .{ .window_function = .{ .func = func, .spec = spec } };
+        }
+
         // Check for aggregate functions: COUNT, SUM, AVG, MIN, MAX
         const agg_func: ?ast.AggregateFunc = switch (self.current.type) {
             .kw_count => .count,
