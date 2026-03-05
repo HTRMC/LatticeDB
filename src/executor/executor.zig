@@ -6347,3 +6347,134 @@ test "executor CASE no else returns NULL" {
     defer exec.freeResult(r);
     try std.testing.expectEqualStrings("NULL", r.rows.rows[0].values[0]);
 }
+
+test "executor arithmetic in SELECT" {
+    const test_file = "test_exec_arith_select.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE products (price INT, quantity INT)");
+    exec.freeResult(ct);
+    const ins1 = try exec.execute("INSERT INTO products VALUES (10, 3)");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO products VALUES (25, 2)");
+    exec.freeResult(ins2);
+
+    const r = try exec.execute("SELECT price * quantity FROM products");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 2), r.rows.rows.len);
+    try std.testing.expectEqualStrings("30", r.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("50", r.rows.rows[1].values[0]);
+}
+
+test "executor arithmetic in WHERE" {
+    const test_file = "test_exec_arith_where.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE items (a INT, b INT)");
+    exec.freeResult(ct);
+    const ins1 = try exec.execute("INSERT INTO items VALUES (3, 7)");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO items VALUES (10, 1)");
+    exec.freeResult(ins2);
+
+    const r = try exec.execute("SELECT * FROM items WHERE a + b > 5");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 2), r.rows.rows.len);
+}
+
+test "executor arithmetic with alias" {
+    const test_file = "test_exec_arith_alias.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (x INT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (5)");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT x * 2 AS doubled FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqualStrings("doubled", r.rows.columns[0]);
+    try std.testing.expectEqualStrings("10", r.rows.rows[0].values[0]);
+}
+
+test "executor arithmetic division and subtraction" {
+    const test_file = "test_exec_arith_div.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (x INT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (20)");
+    exec.freeResult(ins);
+
+    const r1 = try exec.execute("SELECT x / 4 FROM t");
+    defer exec.freeResult(r1);
+    try std.testing.expectEqualStrings("5", r1.rows.rows[0].values[0]);
+
+    const r2 = try exec.execute("SELECT x - 8 FROM t");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqualStrings("12", r2.rows.rows[0].values[0]);
+}
+
+test "executor arithmetic float promotion" {
+    const test_file = "test_exec_arith_float.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (x FLOAT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (3.5)");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT x * 2 FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqualStrings("7.000000", r.rows.rows[0].values[0]);
+}
