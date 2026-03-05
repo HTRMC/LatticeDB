@@ -2628,30 +2628,6 @@ pub const Executor = struct {
         }
     }
 
-    fn resolveExprValue(expr: *const ast.Expression, schema: *const Schema, values: []const Value, params: ?[]const ast.LiteralValue) Value {
-        switch (expr.*) {
-            .column_ref => |name| {
-                // Find column index
-                for (schema.columns, 0..) |col, i| {
-                    if (std.ascii.eqlIgnoreCase(col.name, name)) {
-                        return values[i];
-                    }
-                }
-                return .{ .null_value = {} };
-            },
-            .qualified_ref => |qr| {
-                // Resolve by column name (table prefix ignored — uses combined schema)
-                for (schema.columns, 0..) |col, i| {
-                    if (std.ascii.eqlIgnoreCase(col.name, qr.column)) {
-                        return values[i];
-                    }
-                }
-                return .{ .null_value = {} };
-            },
-            .literal => |lit| return litToStorageValue(lit, params),
-            else => return .{ .null_value = {} },
-        }
-    }
 
     fn litToStorageValue(lit: ast.LiteralValue, params: ?[]const ast.LiteralValue) Value {
         const resolved = resolveParam(lit, params);
