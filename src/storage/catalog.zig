@@ -366,6 +366,36 @@ pub const Catalog = struct {
         };
     }
 
+    /// Rename a column in an existing table (metadata-only).
+    pub fn renameColumn(self: *Self, table_name: []const u8, old_name: []const u8, new_name: []const u8) CatalogError!void {
+        const tid = try self.findTableId(table_name) orelse return CatalogError.TableNotFound;
+
+        // Scan gp_columns for the matching column and rewrite its row
+        var iter = self.columns_table.scan() catch return CatalogError.StorageError;
+        var found = false;
+        while (iter.next() catch { return CatalogError.StorageError; }) |row| {
+            defer iter.freeValues(row.values);
+            const col_tid: PageId = @bitCast(row.values[0].integer);
+            if (col_tid == tid and std.mem.eql(u8, row.values[2].bytes, old_name)) {
+                // Delete old row and insert with new name
+                _ = self.columns_table.deleteTuple(null, row.tid) catch return CatalogError.StorageError;
+                const col_vals = [_]Value{
+                    row.values[0],
+                    row.values[1],
+                    .{ .bytes = new_name },
+                    row.values[3],
+                    row.values[4],
+                    row.values[5],
+                    if (row.values.len > 6) row.values[6] else .{ .null_value = {} },
+                };
+                _ = self.columns_table.insertTuple(null, &col_vals) catch return CatalogError.StorageError;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return CatalogError.StorageError;
+    }
+
     /// Drop a user table by name. Removes entries from gp_tables, gp_columns, and gp_indexes.
     /// System tables (gp_tables, gp_columns, gp_indexes) cannot be dropped.
     pub fn dropTable(self: *Self, name: []const u8) CatalogError!void {

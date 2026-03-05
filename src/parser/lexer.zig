@@ -101,6 +101,10 @@ pub const TokenType = enum {
     kw_floor,
     kw_mod,
 
+    // ALTER TABLE keywords
+    kw_rename,
+    kw_to,
+
     // Additional string functions
     kw_replace,
     kw_position,
@@ -255,6 +259,8 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "ceil", .kw_ceil },
     .{ "floor", .kw_floor },
     .{ "mod", .kw_mod },
+    .{ "rename", .kw_rename },
+    .{ "to", .kw_to },
     .{ "replace", .kw_replace },
     .{ "position", .kw_position },
     .{ "reverse", .kw_reverse },

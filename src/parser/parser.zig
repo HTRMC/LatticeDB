@@ -569,16 +569,26 @@ pub const Parser = struct {
         try self.expect(.kw_alter);
         try self.expect(.kw_table);
         const table_name = try self.expectIdentifier();
-        try self.expect(.kw_add);
-        // Optional COLUMN keyword
-        if (self.current.type == .kw_column) {
+
+        if (self.current.type == .kw_add) {
             self.advance();
+            if (self.current.type == .kw_column) self.advance();
+            const col_def = try self.parseColumnDef();
+            return .{ .table_name = table_name, .action = .{ .add_column = col_def } };
+        } else if (self.current.type == .kw_drop) {
+            self.advance();
+            if (self.current.type == .kw_column) self.advance();
+            const col_name = try self.expectIdentifier();
+            return .{ .table_name = table_name, .action = .{ .drop_column = col_name } };
+        } else if (self.current.type == .kw_rename) {
+            self.advance();
+            if (self.current.type == .kw_column) self.advance();
+            const old_name = try self.expectIdentifier();
+            try self.expect(.kw_to);
+            const new_name = try self.expectIdentifier();
+            return .{ .table_name = table_name, .action = .{ .rename_column = .{ .old_name = old_name, .new_name = new_name } } };
         }
-        const col_def = try self.parseColumnDef();
-        return .{
-            .table_name = table_name,
-            .action = .{ .add_column = col_def },
-        };
+        return ParseError.UnexpectedToken;
     }
 
     // ============================================================

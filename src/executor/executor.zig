@@ -546,28 +546,37 @@ pub const Executor = struct {
     fn execAlterTable(self: *Self, at: ast.AlterTable) ExecError!ExecResult {
         switch (at.action) {
             .add_column => |col_def| {
-                // Enforce that added column must be nullable
-                // (existing rows will have NULL for it)
                 const col = Column{
                     .name = col_def.name,
                     .col_type = mapDataType(col_def.data_type),
                     .max_length = col_def.max_length,
-                    .nullable = true, // Always nullable for ADD COLUMN
+                    .nullable = true,
                 };
-
                 self.catalog.addColumn(at.table_name, col) catch |err| {
                     return switch (err) {
                         catalog_mod.CatalogError.TableNotFound => ExecError.TableNotFound,
                         else => ExecError.StorageError,
                     };
                 };
-
-                const msg = std.fmt.allocPrint(self.allocator, "ALTER TABLE", .{}) catch {
-                    return ExecError.OutOfMemory;
+            },
+            .rename_column => |rc| {
+                self.catalog.renameColumn(at.table_name, rc.old_name, rc.new_name) catch |err| {
+                    return switch (err) {
+                        catalog_mod.CatalogError.TableNotFound => ExecError.TableNotFound,
+                        else => ExecError.StorageError,
+                    };
                 };
-                return .{ .message = msg };
+            },
+            .drop_column => |col_name| {
+                _ = col_name;
+                // DROP COLUMN requires tuple rewriting — not yet supported
+                return ExecError.StorageError;
             },
         }
+        const msg = std.fmt.allocPrint(self.allocator, "ALTER TABLE", .{}) catch {
+            return ExecError.OutOfMemory;
+        };
+        return .{ .message = msg };
     }
 
     // ============================================================
@@ -7833,4 +7842,33 @@ test "executor EXCEPT and INTERSECT" {
     const r2 = try exec.execute("SELECT id FROM t1 INTERSECT SELECT id FROM t2");
     defer exec.freeResult(r2);
     try std.testing.expectEqual(@as(usize, 2), r2.rows.rows.len);
+}
+
+test "executor ALTER TABLE RENAME COLUMN" {
+    const test_file = "test_exec_rename_col.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (1, 'alice')");
+    exec.freeResult(ins);
+
+    const alt = try exec.execute("ALTER TABLE t RENAME COLUMN name TO username");
+    exec.freeResult(alt);
+
+    // Query using the new column name
+    const r = try exec.execute("SELECT username FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqualStrings("username", r.rows.columns[0]);
+    try std.testing.expectEqualStrings("alice", r.rows.rows[0].values[0]);
 }

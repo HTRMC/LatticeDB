@@ -286,6 +286,8 @@ pub const DropTable = struct {
 
 pub const AlterAction = union(enum) {
     add_column: ColumnDef,
+    drop_column: []const u8,
+    rename_column: struct { old_name: []const u8, new_name: []const u8 },
 };
 
 pub const AlterTable = struct {
