@@ -7694,3 +7694,58 @@ test "executor COUNT(DISTINCT) with GROUP BY" {
     try std.testing.expectEqualStrings("b", r.rows.rows[1].values[0]);
     try std.testing.expectEqualStrings("1", r.rows.rows[1].values[1]);
 }
+
+test "executor string functions REPLACE, POSITION, LEFT, RIGHT, REVERSE, LPAD, RPAD" {
+    const test_file = "test_exec_strfuncs.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (name TEXT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES ('hello world')");
+    exec.freeResult(ins);
+
+    // REPLACE
+    const r1 = try exec.execute("SELECT REPLACE(name, 'world', 'zig') FROM t");
+    defer exec.freeResult(r1);
+    try std.testing.expectEqualStrings("hello zig", r1.rows.rows[0].values[0]);
+
+    // POSITION
+    const r2 = try exec.execute("SELECT POSITION('world', name) FROM t");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqualStrings("7", r2.rows.rows[0].values[0]);
+
+    // LEFT
+    const r3 = try exec.execute("SELECT LEFT(name, 5) FROM t");
+    defer exec.freeResult(r3);
+    try std.testing.expectEqualStrings("hello", r3.rows.rows[0].values[0]);
+
+    // RIGHT
+    const r4 = try exec.execute("SELECT RIGHT(name, 5) FROM t");
+    defer exec.freeResult(r4);
+    try std.testing.expectEqualStrings("world", r4.rows.rows[0].values[0]);
+
+    // REVERSE
+    const r5 = try exec.execute("SELECT REVERSE(name) FROM t");
+    defer exec.freeResult(r5);
+    try std.testing.expectEqualStrings("dlrow olleh", r5.rows.rows[0].values[0]);
+
+    // LPAD
+    const r6 = try exec.execute("SELECT LPAD(name, 15, '*') FROM t");
+    defer exec.freeResult(r6);
+    try std.testing.expectEqualStrings("****hello world", r6.rows.rows[0].values[0]);
+
+    // RPAD
+    const r7 = try exec.execute("SELECT RPAD(name, 15, '-') FROM t");
+    defer exec.freeResult(r7);
+    try std.testing.expectEqualStrings("hello world----", r7.rows.rows[0].values[0]);
+}

@@ -101,6 +101,13 @@ pub const TokenType = enum {
     kw_floor,
     kw_mod,
 
+    // Additional string functions
+    kw_replace,
+    kw_position,
+    kw_reverse,
+    kw_lpad,
+    kw_rpad,
+
     // Set operations
     kw_union,
     kw_all,
@@ -244,6 +251,11 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "ceil", .kw_ceil },
     .{ "floor", .kw_floor },
     .{ "mod", .kw_mod },
+    .{ "replace", .kw_replace },
+    .{ "position", .kw_position },
+    .{ "reverse", .kw_reverse },
+    .{ "lpad", .kw_lpad },
+    .{ "rpad", .kw_rpad },
     .{ "int", .kw_int },
     .{ "integer", .kw_integer },
     .{ "bigint", .kw_bigint },

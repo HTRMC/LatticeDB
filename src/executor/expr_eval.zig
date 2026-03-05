@@ -63,6 +63,13 @@ pub fn projectionColumnName(proj: ProjectionColumn, schema: *const Schema, func_
                         .ceil => "ceil",
                         .floor => "floor",
                         .mod => "mod",
+                        .replace => "replace",
+                        .position => "position",
+                        .left => "left",
+                        .right => "right",
+                        .reverse => "reverse",
+                        .lpad => "lpad",
+                        .rpad => "rpad",
                     };
                     return name;
                 },
@@ -385,6 +392,63 @@ fn evalFunctionCall(
             const b = evalExprToValue(allocator, fc.args[1], schema, values, params);
             defer b.deinit(allocator);
             return numMod(a.value, b.value);
+        },
+        .replace => {
+            const str_arg = evalExprToValue(allocator, fc.args[0], schema, values, params);
+            defer str_arg.deinit(allocator);
+            const from_arg = evalExprToValue(allocator, fc.args[1], schema, values, params);
+            defer from_arg.deinit(allocator);
+            const to_arg = evalExprToValue(allocator, fc.args[2], schema, values, params);
+            defer to_arg.deinit(allocator);
+            return strReplace(allocator, str_arg.value, from_arg.value, to_arg.value);
+        },
+        .position => {
+            const substr_arg = evalExprToValue(allocator, fc.args[0], schema, values, params);
+            defer substr_arg.deinit(allocator);
+            const str_arg = evalExprToValue(allocator, fc.args[1], schema, values, params);
+            defer str_arg.deinit(allocator);
+            return strPosition(substr_arg.value, str_arg.value);
+        },
+        .left => {
+            const str_arg = evalExprToValue(allocator, fc.args[0], schema, values, params);
+            defer str_arg.deinit(allocator);
+            const n_arg = evalExprToValue(allocator, fc.args[1], schema, values, params);
+            defer n_arg.deinit(allocator);
+            return strLeft(allocator, str_arg.value, n_arg.value);
+        },
+        .right => {
+            const str_arg = evalExprToValue(allocator, fc.args[0], schema, values, params);
+            defer str_arg.deinit(allocator);
+            const n_arg = evalExprToValue(allocator, fc.args[1], schema, values, params);
+            defer n_arg.deinit(allocator);
+            return strRight(allocator, str_arg.value, n_arg.value);
+        },
+        .reverse => {
+            const arg = evalExprToValue(allocator, fc.args[0], schema, values, params);
+            defer arg.deinit(allocator);
+            return strReverse(allocator, arg.value);
+        },
+        .lpad => {
+            const str_arg = evalExprToValue(allocator, fc.args[0], schema, values, params);
+            defer str_arg.deinit(allocator);
+            const len_arg = evalExprToValue(allocator, fc.args[1], schema, values, params);
+            defer len_arg.deinit(allocator);
+            const pad_arg = if (fc.args.len > 2) blk: {
+                break :blk evalExprToValue(allocator, fc.args[2], schema, values, params);
+            } else ExprResult.borrowed(.{ .bytes = " " });
+            defer pad_arg.deinit(allocator);
+            return strLpad(allocator, str_arg.value, len_arg.value, pad_arg.value);
+        },
+        .rpad => {
+            const str_arg = evalExprToValue(allocator, fc.args[0], schema, values, params);
+            defer str_arg.deinit(allocator);
+            const len_arg = evalExprToValue(allocator, fc.args[1], schema, values, params);
+            defer len_arg.deinit(allocator);
+            const pad_arg = if (fc.args.len > 2) blk: {
+                break :blk evalExprToValue(allocator, fc.args[2], schema, values, params);
+            } else ExprResult.borrowed(.{ .bytes = " " });
+            defer pad_arg.deinit(allocator);
+            return strRpad(allocator, str_arg.value, len_arg.value, pad_arg.value);
         },
     }
 }
@@ -901,6 +965,166 @@ fn formatValueForConcat(allocator: std.mem.Allocator, val: Value) ![]const u8 {
         .null_value => try allocator.dupe(u8, "NULL"),
         .bytes => |s| try allocator.dupe(u8, s),
     };
+}
+
+fn strReplace(allocator: std.mem.Allocator, val: Value, from_val: Value, to_val: Value) ExprResult {
+    const s = switch (val) {
+        .bytes => |b| b,
+        .null_value => return ExprResult.borrowed(.{ .null_value = {} }),
+        else => return ExprResult.borrowed(.{ .null_value = {} }),
+    };
+    const from = switch (from_val) {
+        .bytes => |b| b,
+        else => return ExprResult.borrowed(.{ .null_value = {} }),
+    };
+    const to = switch (to_val) {
+        .bytes => |b| b,
+        else => return ExprResult.borrowed(.{ .null_value = {} }),
+    };
+    if (from.len == 0) {
+        const buf = allocator.dupe(u8, s) catch return ExprResult.borrowed(.{ .null_value = {} });
+        return ExprResult.owned_val(.{ .bytes = buf });
+    }
+    // Count occurrences and build result
+    var result: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (i + from.len <= s.len and std.mem.eql(u8, s[i..][0..from.len], from)) {
+            result.appendSlice(allocator, to) catch return ExprResult.borrowed(.{ .null_value = {} });
+            i += from.len;
+        } else {
+            result.append(allocator, s[i]) catch return ExprResult.borrowed(.{ .null_value = {} });
+            i += 1;
+        }
+    }
+    const buf = result.toOwnedSlice(allocator) catch return ExprResult.borrowed(.{ .null_value = {} });
+    return ExprResult.owned_val(.{ .bytes = buf });
+}
+
+fn strPosition(substr_val: Value, str_val: Value) ExprResult {
+    const s = switch (str_val) {
+        .bytes => |b| b,
+        .null_value => return ExprResult.borrowed(.{ .null_value = {} }),
+        else => return ExprResult.borrowed(.{ .null_value = {} }),
+    };
+    const sub = switch (substr_val) {
+        .bytes => |b| b,
+        else => return ExprResult.borrowed(.{ .null_value = {} }),
+    };
+    if (sub.len == 0) return ExprResult.borrowed(.{ .integer = 1 });
+    if (std.mem.indexOf(u8, s, sub)) |pos| {
+        return ExprResult.borrowed(.{ .integer = @as(i32, @intCast(pos)) + 1 }); // 1-based
+    }
+    return ExprResult.borrowed(.{ .integer = 0 });
+}
+
+fn strLeft(allocator: std.mem.Allocator, val: Value, n_val: Value) ExprResult {
+    const s = switch (val) {
+        .bytes => |b| b,
+        .null_value => return ExprResult.borrowed(.{ .null_value = {} }),
+        else => return ExprResult.borrowed(.{ .null_value = {} }),
+    };
+    const n: usize = switch (n_val) {
+        .integer => |i| if (i < 0) 0 else @intCast(i),
+        .bigint => |i| if (i < 0) 0 else @intCast(i),
+        else => return ExprResult.borrowed(.{ .null_value = {} }),
+    };
+    const take = @min(n, s.len);
+    const buf = allocator.dupe(u8, s[0..take]) catch return ExprResult.borrowed(.{ .null_value = {} });
+    return ExprResult.owned_val(.{ .bytes = buf });
+}
+
+fn strRight(allocator: std.mem.Allocator, val: Value, n_val: Value) ExprResult {
+    const s = switch (val) {
+        .bytes => |b| b,
+        .null_value => return ExprResult.borrowed(.{ .null_value = {} }),
+        else => return ExprResult.borrowed(.{ .null_value = {} }),
+    };
+    const n: usize = switch (n_val) {
+        .integer => |i| if (i < 0) 0 else @intCast(i),
+        .bigint => |i| if (i < 0) 0 else @intCast(i),
+        else => return ExprResult.borrowed(.{ .null_value = {} }),
+    };
+    const take = @min(n, s.len);
+    const buf = allocator.dupe(u8, s[s.len - take ..]) catch return ExprResult.borrowed(.{ .null_value = {} });
+    return ExprResult.owned_val(.{ .bytes = buf });
+}
+
+fn strReverse(allocator: std.mem.Allocator, val: Value) ExprResult {
+    const s = switch (val) {
+        .bytes => |b| b,
+        .null_value => return ExprResult.borrowed(.{ .null_value = {} }),
+        else => return ExprResult.borrowed(.{ .null_value = {} }),
+    };
+    const buf = allocator.alloc(u8, s.len) catch return ExprResult.borrowed(.{ .null_value = {} });
+    for (s, 0..) |c, i| {
+        buf[s.len - 1 - i] = c;
+    }
+    return ExprResult.owned_val(.{ .bytes = buf });
+}
+
+fn strLpad(allocator: std.mem.Allocator, val: Value, len_val: Value, pad_val: Value) ExprResult {
+    const s = switch (val) {
+        .bytes => |b| b,
+        .null_value => return ExprResult.borrowed(.{ .null_value = {} }),
+        else => return ExprResult.borrowed(.{ .null_value = {} }),
+    };
+    const target_len: usize = switch (len_val) {
+        .integer => |i| if (i < 0) 0 else @intCast(i),
+        .bigint => |i| if (i < 0) 0 else @intCast(i),
+        else => return ExprResult.borrowed(.{ .null_value = {} }),
+    };
+    const pad = switch (pad_val) {
+        .bytes => |b| b,
+        else => return ExprResult.borrowed(.{ .null_value = {} }),
+    };
+    if (s.len >= target_len) {
+        const buf = allocator.dupe(u8, s[0..target_len]) catch return ExprResult.borrowed(.{ .null_value = {} });
+        return ExprResult.owned_val(.{ .bytes = buf });
+    }
+    if (pad.len == 0) {
+        const buf = allocator.dupe(u8, s) catch return ExprResult.borrowed(.{ .null_value = {} });
+        return ExprResult.owned_val(.{ .bytes = buf });
+    }
+    const buf = allocator.alloc(u8, target_len) catch return ExprResult.borrowed(.{ .null_value = {} });
+    const pad_needed = target_len - s.len;
+    for (0..pad_needed) |i| {
+        buf[i] = pad[i % pad.len];
+    }
+    @memcpy(buf[pad_needed..], s);
+    return ExprResult.owned_val(.{ .bytes = buf });
+}
+
+fn strRpad(allocator: std.mem.Allocator, val: Value, len_val: Value, pad_val: Value) ExprResult {
+    const s = switch (val) {
+        .bytes => |b| b,
+        .null_value => return ExprResult.borrowed(.{ .null_value = {} }),
+        else => return ExprResult.borrowed(.{ .null_value = {} }),
+    };
+    const target_len: usize = switch (len_val) {
+        .integer => |i| if (i < 0) 0 else @intCast(i),
+        .bigint => |i| if (i < 0) 0 else @intCast(i),
+        else => return ExprResult.borrowed(.{ .null_value = {} }),
+    };
+    const pad = switch (pad_val) {
+        .bytes => |b| b,
+        else => return ExprResult.borrowed(.{ .null_value = {} }),
+    };
+    if (s.len >= target_len) {
+        const buf = allocator.dupe(u8, s[0..target_len]) catch return ExprResult.borrowed(.{ .null_value = {} });
+        return ExprResult.owned_val(.{ .bytes = buf });
+    }
+    if (pad.len == 0) {
+        const buf = allocator.dupe(u8, s) catch return ExprResult.borrowed(.{ .null_value = {} });
+        return ExprResult.owned_val(.{ .bytes = buf });
+    }
+    const buf = allocator.alloc(u8, target_len) catch return ExprResult.borrowed(.{ .null_value = {} });
+    @memcpy(buf[0..s.len], s);
+    const pad_needed = target_len - s.len;
+    for (0..pad_needed) |i| {
+        buf[s.len + i] = pad[i % pad.len];
+    }
+    return ExprResult.owned_val(.{ .bytes = buf });
 }
 
 // ── Tests ────────────────────────────────────────────────────────

@@ -152,6 +152,13 @@ pub const BuiltinFunction = enum {
     ceil,
     floor,
     mod,
+    replace,
+    position,
+    left,
+    right,
+    reverse,
+    lpad,
+    rpad,
 };
 
 /// CASE WHEN clause

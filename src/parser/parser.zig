@@ -497,7 +497,7 @@ pub const Parser = struct {
 
     fn isScalarFunctionToken(self: *Self) bool {
         return switch (self.current.type) {
-            .kw_lower, .kw_upper, .kw_trim, .kw_length, .kw_substring, .kw_concat, .kw_coalesce, .kw_nullif, .kw_abs, .kw_round, .kw_ceil, .kw_floor, .kw_mod, .kw_cast => true,
+            .kw_lower, .kw_upper, .kw_trim, .kw_length, .kw_substring, .kw_concat, .kw_coalesce, .kw_nullif, .kw_abs, .kw_round, .kw_ceil, .kw_floor, .kw_mod, .kw_cast, .kw_replace, .kw_position, .kw_reverse, .kw_lpad, .kw_rpad, .kw_left, .kw_right => true,
             else => false,
         };
     }
@@ -952,6 +952,13 @@ pub const Parser = struct {
             .kw_ceil => return self.parseFunctionCall(.ceil),
             .kw_floor => return self.parseFunctionCall(.floor),
             .kw_mod => return self.parseFunctionCall(.mod),
+            .kw_replace => return self.parseFunctionCall(.replace),
+            .kw_position => return self.parseFunctionCall(.position),
+            .kw_reverse => return self.parseFunctionCall(.reverse),
+            .kw_lpad => return self.parseFunctionCall(.lpad),
+            .kw_rpad => return self.parseFunctionCall(.rpad),
+            .kw_left => return self.parseFunctionCall(.left),
+            .kw_right => return self.parseFunctionCall(.right),
             .positional_param => {
                 const idx = try self.resolvePositionalParam();
                 expr.* = .{ .literal = .{ .parameter = idx } };
@@ -1035,13 +1042,15 @@ pub const Parser = struct {
         // Validate argument count
         const n = args.items.len;
         switch (func) {
-            .lower, .upper, .trim, .length => if (n != 1) return ParseError.InvalidSyntax,
+            .lower, .upper, .trim, .length, .reverse => if (n != 1) return ParseError.InvalidSyntax,
             .substring => if (n < 2 or n > 3) return ParseError.InvalidSyntax,
             .concat => if (n < 2) return ParseError.InvalidSyntax,
             .coalesce => if (n < 1) return ParseError.InvalidSyntax,
-            .nullif, .mod => if (n != 2) return ParseError.InvalidSyntax,
+            .nullif, .mod, .left, .right, .position => if (n != 2) return ParseError.InvalidSyntax,
             .abs, .ceil, .floor => if (n != 1) return ParseError.InvalidSyntax,
             .round => if (n < 1 or n > 2) return ParseError.InvalidSyntax,
+            .replace => if (n != 3) return ParseError.InvalidSyntax,
+            .lpad, .rpad => if (n < 2 or n > 3) return ParseError.InvalidSyntax,
         }
 
         const expr = try alloc.create(ast.Expression);
