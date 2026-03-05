@@ -447,8 +447,8 @@ fn evalExprOnChunk(expr: *const ast.Expression, chunk: *DataChunk, schema: *cons
             const result = val == .null_value;
             return if (isn.negated) !result else result;
         },
-        // CASE, function_call, arithmetic, unary_minus: delegate to resolveExprValueFromChunk for evaluation
-        .case_expr, .function_call, .arithmetic, .unary_minus => return true,
+        // CASE, function_call, arithmetic, unary_minus, cast: delegate to resolveExprValueFromChunk for evaluation
+        .case_expr, .function_call, .arithmetic, .unary_minus, .cast_expr => return true,
     }
 }
 
@@ -472,7 +472,7 @@ fn resolveExprValueFromChunk(expr: *const ast.Expression, chunk: *DataChunk, sch
             const result = val == .null_value;
             return .{ .boolean = if (isn.negated) !result else result };
         },
-        .function_call, .case_expr, .arithmetic, .unary_minus => {
+        .function_call, .case_expr, .arithmetic, .unary_minus, .cast_expr => {
             // Build row values from chunk for expr_eval
             var row_values: [128]Value = undefined;
             const ncols = @min(schema.columns.len, 128);

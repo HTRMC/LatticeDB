@@ -76,8 +76,9 @@ pub const TokenType = enum {
     kw_else,
     kw_end,
 
-    // IS keyword
+    // IS / CAST keywords
     kw_is,
+    kw_cast,
 
     // String functions
     kw_lower,
@@ -216,6 +217,7 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "substring", .kw_substring },
     .{ "concat", .kw_concat },
     .{ "is", .kw_is },
+    .{ "cast", .kw_cast },
     .{ "coalesce", .kw_coalesce },
     .{ "nullif", .kw_nullif },
     .{ "abs", .kw_abs },

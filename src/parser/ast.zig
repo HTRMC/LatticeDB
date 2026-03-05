@@ -121,6 +121,11 @@ pub const Expression = union(enum) {
         operand: *const Expression,
         negated: bool, // true = IS NOT NULL
     },
+    /// CAST(expr AS type)
+    cast_expr: struct {
+        operand: *const Expression,
+        target_type: DataType,
+    },
 };
 
 /// Arithmetic operators

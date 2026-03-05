@@ -67,6 +67,7 @@ pub fn projectionColumnName(proj: ProjectionColumn, schema: *const Schema, func_
                     return name;
                 },
                 .case_expr => return "case",
+                .cast_expr => return "cast",
                 .arithmetic => return "?expr?",
                 .unary_minus => return "?expr?",
                 else => return "?expr?",
@@ -283,6 +284,7 @@ pub fn evalExprToValue(
             const result = operand.value == .null_value;
             return ExprResult.borrowed(.{ .boolean = if (isn.negated) !result else result });
         },
+        .cast_expr => |ce| return evalCast(allocator, ce, schema, values, params),
         else => return ExprResult.borrowed(.{ .null_value = {} }),
     }
 }
@@ -485,7 +487,7 @@ fn evalExprToBool(
             const result = operand.value == .null_value;
             return if (isn.negated) !result else result;
         },
-        .case_expr, .function_call, .arithmetic, .unary_minus => {
+        .case_expr, .function_call, .arithmetic, .unary_minus, .cast_expr => {
             const result = evalExprToValue(allocator, expr, schema, values, params);
             defer result.deinit(allocator);
             return switch (result.value) {
@@ -566,6 +568,86 @@ fn evalUnaryMinus(
         .float => |f| ExprResult.borrowed(.{ .float = -f }),
         .null_value => ExprResult.borrowed(.{ .null_value = {} }),
         else => ExprResult.borrowed(.{ .null_value = {} }),
+    };
+}
+
+fn evalCast(
+    allocator: std.mem.Allocator,
+    ce: anytype,
+    schema: *const Schema,
+    values: []const Value,
+    params: ?[]const ast.LiteralValue,
+) ExprResult {
+    const res = evalExprToValue(allocator, ce.operand, schema, values, params);
+    defer res.deinit(allocator);
+    const val = res.value;
+
+    if (val == .null_value) return ExprResult.borrowed(.{ .null_value = {} });
+
+    switch (ce.target_type) {
+        .int, .integer => {
+            const i = valToInt(val, allocator) orelse return ExprResult.borrowed(.{ .null_value = {} });
+            if (i >= std.math.minInt(i32) and i <= std.math.maxInt(i32)) {
+                return ExprResult.borrowed(.{ .integer = @intCast(i) });
+            }
+            return ExprResult.borrowed(.{ .bigint = i });
+        },
+        .bigint => {
+            const i = valToInt(val, allocator) orelse return ExprResult.borrowed(.{ .null_value = {} });
+            return ExprResult.borrowed(.{ .bigint = i });
+        },
+        .float => {
+            const f = valToFloat(val, allocator) orelse return ExprResult.borrowed(.{ .null_value = {} });
+            return ExprResult.borrowed(.{ .float = f });
+        },
+        .boolean => {
+            return switch (val) {
+                .boolean => ExprResult.borrowed(val),
+                .integer => |i| ExprResult.borrowed(.{ .boolean = i != 0 }),
+                .bigint => |i| ExprResult.borrowed(.{ .boolean = i != 0 }),
+                .bytes => |s| {
+                    if (std.ascii.eqlIgnoreCase(s, "true") or std.mem.eql(u8, s, "1")) {
+                        return ExprResult.borrowed(.{ .boolean = true });
+                    }
+                    if (std.ascii.eqlIgnoreCase(s, "false") or std.mem.eql(u8, s, "0")) {
+                        return ExprResult.borrowed(.{ .boolean = false });
+                    }
+                    return ExprResult.borrowed(.{ .null_value = {} });
+                },
+                else => ExprResult.borrowed(.{ .null_value = {} }),
+            };
+        },
+        .varchar, .text => {
+            const str = formatValue(allocator, val) catch return ExprResult.borrowed(.{ .null_value = {} });
+            return ExprResult.owned_val(.{ .bytes = str });
+        },
+    }
+}
+
+fn valToInt(val: Value, allocator: std.mem.Allocator) ?i64 {
+    _ = allocator;
+    return switch (val) {
+        .integer => |i| i,
+        .bigint => |i| i,
+        .float => |f| blk: {
+            const truncated = @as(i64, @intFromFloat(@trunc(f)));
+            break :blk truncated;
+        },
+        .boolean => |b| if (b) @as(i64, 1) else @as(i64, 0),
+        .bytes => |s| std.fmt.parseInt(i64, s, 10) catch null,
+        .null_value => null,
+    };
+}
+
+fn valToFloat(val: Value, allocator: std.mem.Allocator) ?f64 {
+    _ = allocator;
+    return switch (val) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        .bigint => |i| @floatFromInt(i),
+        .boolean => |b| if (b) @as(f64, 1.0) else @as(f64, 0.0),
+        .bytes => |s| std.fmt.parseFloat(f64, s) catch null,
+        .null_value => null,
     };
 }
 

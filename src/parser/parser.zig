@@ -422,7 +422,7 @@ pub const Parser = struct {
 
     fn isScalarFunctionToken(self: *Self) bool {
         return switch (self.current.type) {
-            .kw_lower, .kw_upper, .kw_trim, .kw_length, .kw_substring, .kw_concat, .kw_coalesce, .kw_nullif, .kw_abs, .kw_round, .kw_ceil, .kw_floor, .kw_mod => true,
+            .kw_lower, .kw_upper, .kw_trim, .kw_length, .kw_substring, .kw_concat, .kw_coalesce, .kw_nullif, .kw_abs, .kw_round, .kw_ceil, .kw_floor, .kw_mod, .kw_cast => true,
             else => false,
         };
     }
@@ -821,6 +821,7 @@ pub const Parser = struct {
                 expr.* = .{ .exists_subquery = .{ .subquery = sub_ptr } };
             },
             .kw_case => return self.parseCaseExpr(),
+            .kw_cast => return self.parseCastExpr(),
             .kw_lower => return self.parseFunctionCall(.lower),
             .kw_upper => return self.parseFunctionCall(.upper),
             .kw_trim => return self.parseFunctionCall(.trim),
@@ -931,6 +932,27 @@ pub const Parser = struct {
             .func = func,
             .args = args.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
         } };
+        return expr;
+    }
+
+    /// Parse CAST(expr AS type)
+    fn parseCastExpr(self: *Self) ParseError!*const ast.Expression {
+        const alloc = self.arena();
+        self.advance(); // consume CAST
+        try self.expect(.left_paren);
+        const operand = try self.parseExpression();
+        try self.expect(.kw_as);
+        const target_type = try self.parseDataType();
+        // Skip optional VARCHAR(n) length
+        if (target_type == .varchar and self.current.type == .left_paren) {
+            self.advance();
+            _ = self.current; // skip length
+            if (self.current.type == .integer_literal) self.advance();
+            try self.expect(.right_paren);
+        }
+        try self.expect(.right_paren);
+        const expr = try alloc.create(ast.Expression);
+        expr.* = .{ .cast_expr = .{ .operand = operand, .target_type = target_type } };
         return expr;
     }
 
@@ -1831,4 +1853,40 @@ test "parse MOD function" {
     const expr = stmt.select.columns[0].expression;
     try std.testing.expectEqual(ast.BuiltinFunction.mod, expr.function_call.func);
     try std.testing.expectEqual(@as(usize, 2), expr.function_call.args.len);
+}
+
+test "parse CAST to INT" {
+    var p = Parser.init(std.testing.allocator, "SELECT CAST(x AS INT) FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const expr = stmt.select.columns[0].expression;
+    try std.testing.expect(expr.* == .cast_expr);
+    try std.testing.expectEqual(ast.DataType.int, expr.cast_expr.target_type);
+}
+
+test "parse CAST to FLOAT" {
+    var p = Parser.init(std.testing.allocator, "SELECT CAST(x AS FLOAT) FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const expr = stmt.select.columns[0].expression;
+    try std.testing.expect(expr.* == .cast_expr);
+    try std.testing.expectEqual(ast.DataType.float, expr.cast_expr.target_type);
+}
+
+test "parse CAST to TEXT" {
+    var p = Parser.init(std.testing.allocator, "SELECT CAST(x AS TEXT) FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const expr = stmt.select.columns[0].expression;
+    try std.testing.expect(expr.* == .cast_expr);
+    try std.testing.expectEqual(ast.DataType.text, expr.cast_expr.target_type);
+}
+
+test "parse CAST in WHERE" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t WHERE CAST(x AS INT) > 5");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const where = stmt.select.where_clause.?;
+    try std.testing.expect(where.* == .comparison);
+    try std.testing.expect(where.comparison.left.* == .cast_expr);
 }

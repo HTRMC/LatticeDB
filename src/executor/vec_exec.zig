@@ -86,6 +86,7 @@ fn hasSubquery(expr: *const ast.Expression) bool {
         .arithmetic => |ar| hasSubquery(ar.left) or hasSubquery(ar.right),
         .unary_minus => |um| hasSubquery(um.operand),
         .is_null => |isn| hasSubquery(isn.operand),
+        .cast_expr => |ce| hasSubquery(ce.operand),
         .column_ref, .qualified_ref, .literal => false,
     };
 }

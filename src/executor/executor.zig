@@ -2600,7 +2600,7 @@ pub const Executor = struct {
                 const result = operand.value == .null_value;
                 return if (isn.negated) !result else result;
             },
-            .case_expr, .function_call, .arithmetic, .unary_minus => {
+            .case_expr, .function_call, .arithmetic, .unary_minus, .cast_expr => {
                 const result = expr_eval.evalExprToValue(self.allocator, expr, schema, values, params);
                 defer result.deinit(self.allocator);
                 return switch (result.value) {
@@ -6669,4 +6669,100 @@ test "executor ROUND CEIL FLOOR" {
     const r3 = try exec.execute("SELECT FLOOR(x) FROM t");
     defer exec.freeResult(r3);
     try std.testing.expectEqualStrings("3.000000", r3.rows.rows[0].values[0]);
+}
+
+test "executor CAST int to float" {
+    const test_file = "test_exec_cast_itof.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (x INT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (42)");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT CAST(x AS FLOAT) FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqualStrings("42.000000", r.rows.rows[0].values[0]);
+}
+
+test "executor CAST float to int" {
+    const test_file = "test_exec_cast_ftoi.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (x FLOAT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (3.7)");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT CAST(x AS INT) FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqualStrings("3", r.rows.rows[0].values[0]);
+}
+
+test "executor CAST int to text" {
+    const test_file = "test_exec_cast_itot.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (x INT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (99)");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT CAST(x AS TEXT) FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqualStrings("99", r.rows.rows[0].values[0]);
+}
+
+test "executor CAST text to int" {
+    const test_file = "test_exec_cast_ttoi.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (s TEXT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES ('123')");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT CAST(s AS INT) FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqualStrings("123", r.rows.rows[0].values[0]);
 }
