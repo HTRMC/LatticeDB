@@ -216,9 +216,15 @@ pub const Statement = union(enum) {
     rollback_txn: void,
 };
 
+pub const CheckConstraint = struct {
+    name: ?[]const u8, // optional constraint name
+    expr: *const Expression,
+};
+
 pub const CreateTable = struct {
     table_name: []const u8,
     columns: []const ColumnDef,
+    checks: []const CheckConstraint = &.{},
 };
 
 pub const Insert = struct {

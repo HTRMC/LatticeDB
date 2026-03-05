@@ -472,7 +472,7 @@ fn evalCaseExpr(
 }
 
 /// Evaluate an expression as a boolean (for CASE WHEN conditions).
-fn evalExprToBool(
+pub fn evalExprToBool(
     allocator: std.mem.Allocator,
     expr: *const ast.Expression,
     schema: *const Schema,

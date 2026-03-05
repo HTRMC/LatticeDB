@@ -538,10 +538,27 @@ pub const Parser = struct {
 
         const alloc = self.arena();
         var cols: std.ArrayList(ast.ColumnDef) = .empty;
-        cols.append(alloc, try self.parseColumnDef()) catch return ParseError.OutOfMemory;
-        while (self.current.type == .comma) {
+        var checks: std.ArrayList(ast.CheckConstraint) = .empty;
+
+        // Parse column defs and table-level constraints
+        while (true) {
+            if (self.current.type == .kw_check or self.current.type == .kw_constraint) {
+                // Table-level CHECK constraint
+                var name: ?[]const u8 = null;
+                if (self.current.type == .kw_constraint) {
+                    self.advance();
+                    name = try self.expectIdentifier();
+                }
+                try self.expect(.kw_check);
+                try self.expect(.left_paren);
+                const expr = try self.parseExpression();
+                try self.expect(.right_paren);
+                checks.append(alloc, .{ .name = name, .expr = expr }) catch return ParseError.OutOfMemory;
+            } else {
+                cols.append(alloc, try self.parseColumnDef()) catch return ParseError.OutOfMemory;
+            }
+            if (self.current.type != .comma) break;
             self.advance();
-            cols.append(alloc, try self.parseColumnDef()) catch return ParseError.OutOfMemory;
         }
 
         try self.expect(.right_paren);
@@ -549,6 +566,7 @@ pub const Parser = struct {
         return .{
             .table_name = table_name,
             .columns = cols.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
+            .checks = checks.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
         };
     }
 

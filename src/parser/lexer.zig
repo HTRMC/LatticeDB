@@ -105,6 +105,10 @@ pub const TokenType = enum {
     kw_rename,
     kw_to,
 
+    // Constraint keywords
+    kw_check,
+    kw_constraint,
+
     // Additional string functions
     kw_replace,
     kw_position,
@@ -261,6 +265,8 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "mod", .kw_mod },
     .{ "rename", .kw_rename },
     .{ "to", .kw_to },
+    .{ "check", .kw_check },
+    .{ "constraint", .kw_constraint },
     .{ "replace", .kw_replace },
     .{ "position", .kw_position },
     .{ "reverse", .kw_reverse },

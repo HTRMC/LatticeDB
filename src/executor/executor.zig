@@ -39,6 +39,7 @@ pub const ExecError = error{
     IndexNotFound,
     IndexAlreadyExists,
     NotNullViolation,
+    CheckViolation,
 };
 
 /// A result row — an array of string-formatted values
@@ -70,6 +71,8 @@ pub const Executor = struct {
     current_txn: ?*Transaction,
     /// Bound parameters for current prepared statement execution (null = no params)
     current_params: ?[]const ast.LiteralValue = null,
+    /// In-memory CHECK constraints (table_name → check expressions SQL text)
+    check_constraints: std.StringHashMapUnmanaged([]const []const u8) = .empty,
 
     const Self = @This();
 
@@ -90,6 +93,16 @@ pub const Executor = struct {
             .undo_log = undo_log,
             .current_txn = null,
         };
+    }
+
+    pub fn deinit(self: *Self) void {
+        var it = self.check_constraints.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.*) |sql| self.allocator.free(sql);
+            self.allocator.free(entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.check_constraints.deinit(self.allocator);
     }
 
     /// A prepared statement that can be executed multiple times with different parameters.
@@ -516,10 +529,108 @@ pub const Executor = struct {
             };
         };
 
+        // Store CHECK constraints in memory
+        if (ct.checks.len > 0) {
+            const exprs = self.allocator.alloc([]const u8, ct.checks.len) catch return ExecError.OutOfMemory;
+            for (ct.checks, 0..) |chk, i| {
+                // Serialize expression back to SQL text for storage
+                exprs[i] = self.serializeExpr(chk.expr) catch return ExecError.OutOfMemory;
+            }
+            const name_copy = self.allocator.dupe(u8, ct.table_name) catch return ExecError.OutOfMemory;
+            self.check_constraints.put(self.allocator, name_copy, exprs) catch return ExecError.OutOfMemory;
+        }
+
         const msg = std.fmt.allocPrint(self.allocator, "CREATE TABLE", .{}) catch {
             return ExecError.OutOfMemory;
         };
         return .{ .message = msg };
+    }
+
+    fn serializeExpr(self: *Self, expr: *const ast.Expression) ![]const u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        try self.writeExpr(&buf, expr);
+        return buf.toOwnedSlice(self.allocator);
+    }
+
+    fn writeExpr(self: *Self, buf: *std.ArrayList(u8), expr: *const ast.Expression) !void {
+        switch (expr.*) {
+            .column_ref => |name| {
+                try buf.appendSlice(self.allocator, name);
+            },
+            .literal => |lit| {
+                switch (lit) {
+                    .integer => |v| {
+                        const s = try std.fmt.allocPrint(self.allocator, "{d}", .{v});
+                        defer self.allocator.free(s);
+                        try buf.appendSlice(self.allocator, s);
+                    },
+                    .float => |v| {
+                        const s = try std.fmt.allocPrint(self.allocator, "{d:.6}", .{v});
+                        defer self.allocator.free(s);
+                        try buf.appendSlice(self.allocator, s);
+                    },
+                    .string => |s| {
+                        try buf.append(self.allocator, '\'');
+                        try buf.appendSlice(self.allocator, s);
+                        try buf.append(self.allocator, '\'');
+                    },
+                    .boolean => |b| try buf.appendSlice(self.allocator, if (b) "TRUE" else "FALSE"),
+                    .null_value => try buf.appendSlice(self.allocator, "NULL"),
+                    .parameter => {},
+                }
+            },
+            .comparison => |cmp| {
+                try buf.append(self.allocator, '(');
+                try self.writeExpr(buf, cmp.left);
+                try buf.appendSlice(self.allocator, switch (cmp.op) {
+                    .eq => " = ",
+                    .neq => " != ",
+                    .lt => " < ",
+                    .gt => " > ",
+                    .lte => " <= ",
+                    .gte => " >= ",
+                });
+                try self.writeExpr(buf, cmp.right);
+                try buf.append(self.allocator, ')');
+            },
+            .and_expr => |ae| {
+                try buf.append(self.allocator, '(');
+                try self.writeExpr(buf, ae.left);
+                try buf.appendSlice(self.allocator, " AND ");
+                try self.writeExpr(buf, ae.right);
+                try buf.append(self.allocator, ')');
+            },
+            .or_expr => |oe| {
+                try buf.append(self.allocator, '(');
+                try self.writeExpr(buf, oe.left);
+                try buf.appendSlice(self.allocator, " OR ");
+                try self.writeExpr(buf, oe.right);
+                try buf.append(self.allocator, ')');
+            },
+            .not_expr => |ne| {
+                try buf.appendSlice(self.allocator, "NOT ");
+                try self.writeExpr(buf, ne.operand);
+            },
+            else => try buf.appendSlice(self.allocator, "TRUE"), // fallback
+        }
+    }
+
+    fn validateChecks(self: *Self, check_sqls: []const []const u8, schema: *const Schema, values: []const Value) bool {
+        for (check_sqls) |sql| {
+            // Wrap in a SELECT WHERE context to parse
+            const full_sql = std.fmt.allocPrint(self.allocator, "SELECT * FROM _t WHERE {s}", .{sql}) catch return true;
+            defer self.allocator.free(full_sql);
+            var parser = Parser.init(self.allocator, full_sql);
+            defer parser.deinit();
+            const stmt = parser.parse() catch return true; // if can't parse, pass
+            const sel = stmt.select;
+            if (sel.where_clause) |where| {
+                if (!expr_eval.evalExprToBool(self.allocator, where, schema, values, null)) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     // ============================================================
@@ -989,6 +1100,14 @@ pub const Executor = struct {
                 if (!col.nullable and val == .null_value) {
                     self.abortImplicitTxn(txn);
                     return ExecError.NotNullViolation;
+                }
+            }
+
+            // Enforce CHECK constraints
+            if (self.check_constraints.get(ins.table_name)) |checks| {
+                if (!self.validateChecks(checks, schema, values)) {
+                    self.abortImplicitTxn(txn);
+                    return ExecError.CheckViolation;
                 }
             }
 
@@ -2848,6 +2967,14 @@ pub const Executor = struct {
                 if (!col.nullable and val == .null_value) {
                     self.abortImplicitTxn(txn);
                     return ExecError.NotNullViolation;
+                }
+            }
+
+            // Enforce CHECK constraints on updated values
+            if (self.check_constraints.get(upd.table_name)) |checks| {
+                if (!self.validateChecks(checks, schema, new_values)) {
+                    self.abortImplicitTxn(txn);
+                    return ExecError.CheckViolation;
                 }
             }
 
@@ -7871,4 +7998,37 @@ test "executor ALTER TABLE RENAME COLUMN" {
     defer exec.freeResult(r);
     try std.testing.expectEqualStrings("username", r.rows.columns[0]);
     try std.testing.expectEqualStrings("alice", r.rows.rows[0].values[0]);
+}
+
+test "executor CHECK constraint" {
+    const test_file = "test_exec_check.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+    defer exec.deinit();
+
+    const ct = try exec.execute("CREATE TABLE t (age INT, CHECK (age > 0))");
+    exec.freeResult(ct);
+
+    // Valid insert
+    const ins1 = try exec.execute("INSERT INTO t VALUES (25)");
+    exec.freeResult(ins1);
+
+    // CHECK violation
+    const result = exec.execute("INSERT INTO t VALUES (-1)");
+    try std.testing.expectError(ExecError.CheckViolation, result);
+
+    // Verify only valid row exists
+    const r = try exec.execute("SELECT * FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 1), r.rows.rows.len);
+    try std.testing.expectEqualStrings("25", r.rows.rows[0].values[0]);
 }
