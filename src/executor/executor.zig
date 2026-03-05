@@ -2494,9 +2494,11 @@ pub const Executor = struct {
     fn evalExprWithParams(self: *Self, expr: *const ast.Expression, schema: *const Schema, values: []const Value, params: ?[]const ast.LiteralValue) bool {
         switch (expr.*) {
             .comparison => |cmp| {
-                const left_val = resolveExprValue(cmp.left, schema, values, params);
-                const right_val = resolveExprValue(cmp.right, schema, values, params);
-                return compareValues(left_val, cmp.op, right_val);
+                const left_res = expr_eval.evalExprToValue(self.allocator, cmp.left, schema, values, params);
+                defer left_res.deinit(self.allocator);
+                const right_res = expr_eval.evalExprToValue(self.allocator, cmp.right, schema, values, params);
+                defer right_res.deinit(self.allocator);
+                return expr_eval.compareValues(left_res.value, cmp.op, right_res.value);
             },
             .and_expr => |a| {
                 return self.evalExprWithParams(a.left, schema, values, params) and self.evalExprWithParams(a.right, schema, values, params);
@@ -2508,41 +2510,48 @@ pub const Executor = struct {
                 return !self.evalExprWithParams(n.operand, schema, values, params);
             },
             .between_expr => |b| {
-                const val = resolveExprValue(b.value, schema, values, params);
-                const low = resolveExprValue(b.low, schema, values, params);
-                const high = resolveExprValue(b.high, schema, values, params);
-                return compareValues(val, .gte, low) and compareValues(val, .lte, high);
+                const val = expr_eval.evalExprToValue(self.allocator, b.value, schema, values, params);
+                defer val.deinit(self.allocator);
+                const low = expr_eval.evalExprToValue(self.allocator, b.low, schema, values, params);
+                defer low.deinit(self.allocator);
+                const high = expr_eval.evalExprToValue(self.allocator, b.high, schema, values, params);
+                defer high.deinit(self.allocator);
+                return expr_eval.compareValues(val.value, .gte, low.value) and expr_eval.compareValues(val.value, .lte, high.value);
             },
             .like_expr => |l| {
-                const val = resolveExprValue(l.value, schema, values, params);
-                const pat = resolveExprValue(l.pattern, schema, values, params);
-                const text = switch (val) {
+                const val = expr_eval.evalExprToValue(self.allocator, l.value, schema, values, params);
+                defer val.deinit(self.allocator);
+                const pat = expr_eval.evalExprToValue(self.allocator, l.pattern, schema, values, params);
+                defer pat.deinit(self.allocator);
+                const text = switch (val.value) {
                     .bytes => |s| s,
                     else => return false,
                 };
-                const pattern = switch (pat) {
+                const pattern = switch (pat.value) {
                     .bytes => |s| s,
                     else => return false,
                 };
                 return expr_eval.matchLike(text, pattern);
             },
             .in_list => |il| {
-                const val = resolveExprValue(il.value, schema, values, params);
+                const val = expr_eval.evalExprToValue(self.allocator, il.value, schema, values, params);
+                defer val.deinit(self.allocator);
                 for (il.items) |item| {
-                    const item_val = resolveExprValue(item, schema, values, params);
-                    if (compareValues(val, .eq, item_val)) return true;
+                    const item_val = expr_eval.evalExprToValue(self.allocator, item, schema, values, params);
+                    defer item_val.deinit(self.allocator);
+                    if (expr_eval.compareValues(val.value, .eq, item_val.value)) return true;
                 }
                 return false;
             },
             .in_subquery => |isq| {
-                const val = resolveExprValue(isq.value, schema, values, params);
+                const val_res = expr_eval.evalExprToValue(self.allocator, isq.value, schema, values, params);
+                defer val_res.deinit(self.allocator);
                 const sub_result = self.execSelect(isq.subquery.*) catch return false;
                 defer self.freeResult(.{ .rows = sub_result.rows });
                 for (sub_result.rows.rows) |row| {
                     if (row.values.len > 0) {
-                        // Compare val with first column of each row
-                        const sub_val = self.parseSubqueryValue(row.values[0], val);
-                        if (compareValues(val, .eq, sub_val)) return true;
+                        const sub_val = self.parseSubqueryValue(row.values[0], val_res.value);
+                        if (expr_eval.compareValues(val_res.value, .eq, sub_val)) return true;
                     }
                 }
                 return false;
@@ -6087,4 +6096,278 @@ test "executor SELECT FROM nonexistent table" {
     var exec = Executor.init(std.testing.allocator, &catalog);
 
     try std.testing.expectError(ExecError.TableNotFound, exec.execute("SELECT * FROM ghost"));
+}
+
+test "executor LOWER function" {
+    const test_file = "test_exec_lower.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (name TEXT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES ('Hello World')");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT LOWER(name) FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 1), r.rows.rows.len);
+    try std.testing.expectEqualStrings("hello world", r.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("lower", r.rows.columns[0]);
+}
+
+test "executor UPPER function" {
+    const test_file = "test_exec_upper.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (name TEXT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES ('Hello')");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT UPPER(name) FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqualStrings("HELLO", r.rows.rows[0].values[0]);
+}
+
+test "executor LENGTH function" {
+    const test_file = "test_exec_length.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (name TEXT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES ('hello')");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT LENGTH(name) FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqualStrings("5", r.rows.rows[0].values[0]);
+}
+
+test "executor TRIM function" {
+    const test_file = "test_exec_trim.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (name TEXT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES ('  hello  ')");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT TRIM(name) FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqualStrings("hello", r.rows.rows[0].values[0]);
+}
+
+test "executor SUBSTRING function" {
+    const test_file = "test_exec_substr.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (name TEXT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES ('hello world')");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT SUBSTRING(name, 1, 5) FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqualStrings("hello", r.rows.rows[0].values[0]);
+}
+
+test "executor CONCAT function" {
+    const test_file = "test_exec_concat.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (first TEXT, last TEXT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES ('hello', ' world')");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT CONCAT(first, last) FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqualStrings("hello world", r.rows.rows[0].values[0]);
+}
+
+test "executor CASE expression" {
+    const test_file = "test_exec_case.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (x INT)");
+    exec.freeResult(ct);
+    const ins1 = try exec.execute("INSERT INTO t VALUES (10)");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO t VALUES (3)");
+    exec.freeResult(ins2);
+
+    const r = try exec.execute("SELECT CASE WHEN x > 5 THEN 'big' ELSE 'small' END FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 2), r.rows.rows.len);
+    try std.testing.expectEqualStrings("big", r.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("small", r.rows.rows[1].values[0]);
+}
+
+test "executor nested functions" {
+    const test_file = "test_exec_nested.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (name TEXT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES ('Hello World')");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT UPPER(SUBSTRING(name, 1, 5)) FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqualStrings("HELLO", r.rows.rows[0].values[0]);
+}
+
+test "executor function in WHERE" {
+    const test_file = "test_exec_fn_where.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (name TEXT)");
+    exec.freeResult(ct);
+    const ins1 = try exec.execute("INSERT INTO t VALUES ('Alice')");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO t VALUES ('Bob')");
+    exec.freeResult(ins2);
+
+    const r = try exec.execute("SELECT name FROM t WHERE UPPER(name) = 'ALICE'");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 1), r.rows.rows.len);
+    try std.testing.expectEqualStrings("Alice", r.rows.rows[0].values[0]);
+}
+
+test "executor function with alias" {
+    const test_file = "test_exec_fn_alias.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (name TEXT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES ('hello')");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT UPPER(name) AS uname FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqualStrings("uname", r.rows.columns[0]);
+    try std.testing.expectEqualStrings("HELLO", r.rows.rows[0].values[0]);
+}
+
+test "executor CASE no else returns NULL" {
+    const test_file = "test_exec_case_null.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (x INT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (1)");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT CASE WHEN x > 100 THEN 'big' END FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqualStrings("NULL", r.rows.rows[0].values[0]);
 }

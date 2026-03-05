@@ -38,6 +38,11 @@ pub fn canUseVectorized(sel: ast.Select) bool {
     // No HAVING (not implemented in vectorized path)
     if (sel.having_clause != null) return false;
 
+    // No expression columns (not yet supported in vectorized path)
+    for (sel.columns) |col| {
+        if (col == .expression) return false;
+    }
+
     // Check WHERE for subqueries
     if (sel.where_clause) |where| {
         if (hasSubquery(where)) return false;

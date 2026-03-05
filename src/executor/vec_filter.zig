@@ -462,6 +462,19 @@ fn resolveExprValueFromChunk(expr: *const ast.Expression, chunk: *DataChunk, sch
             return .{ .null_value = {} };
         },
         .literal => |lit| return litToStorageValue(lit),
+        .function_call, .case_expr => {
+            // Build row values from chunk for expr_eval
+            var row_values: [128]Value = undefined;
+            const ncols = @min(schema.columns.len, 128);
+            for (0..ncols) |ci| {
+                row_values[ci] = chunk.columns[ci].getValue(row);
+            }
+            // eval_result may own memory — but we're in a per-row filter context
+            // and the result is immediately compared, so we accept the leak for now.
+            // TODO: use chunk arena for owned results
+            const result = expr_eval.evalExprToValue(chunk.arena.allocator(), expr, schema, row_values[0..ncols], null);
+            return result.value;
+        },
         else => return .{ .null_value = {} },
     }
 }
