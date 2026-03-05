@@ -131,6 +131,7 @@ pub const Executor = struct {
             .drop_index => |di| self.execDropIndex(di),
             .alter_table => |at| self.execAlterTable(at),
             .explain => |ex| self.execExplain(ex),
+            .union_query => |uq| self.execUnion(uq),
             .begin_txn => self.execBegin(),
             .commit_txn => self.execCommit(),
             .rollback_txn => self.execRollback(),
@@ -157,6 +158,7 @@ pub const Executor = struct {
             .drop_index => |di| self.execDropIndex(di),
             .alter_table => |at| self.execAlterTable(at),
             .explain => |ex| self.execExplain(ex),
+            .union_query => |uq| self.execUnion(uq),
             .begin_txn => self.execBegin(),
             .commit_txn => self.execCommit(),
             .rollback_txn => self.execRollback(),
@@ -879,6 +881,77 @@ pub const Executor = struct {
         self.current_params = params;
         defer self.current_params = null;
         return self.execSelect(sel);
+    }
+
+    fn execUnion(self: *Self, uq: ast.UnionQuery) ExecError!ExecResult {
+        // Execute both sides
+        const left_result = try self.execSelect(uq.left);
+        const right_result = try self.execSelect(uq.right);
+
+        const left = left_result.rows;
+        const right = right_result.rows;
+
+        // Column count must match
+        if (left.columns.len != right.columns.len) {
+            self.freeResult(left_result);
+            self.freeResult(right_result);
+            return ExecError.ColumnCountMismatch;
+        }
+
+        // Use left's column names
+        // Free right's column names
+        for (right.columns) |col| {
+            self.allocator.free(col);
+        }
+        self.allocator.free(right.columns);
+
+        if (uq.all) {
+            // UNION ALL: just concatenate
+            const combined = self.allocator.alloc(ResultRow, left.rows.len + right.rows.len) catch return ExecError.OutOfMemory;
+            @memcpy(combined[0..left.rows.len], left.rows);
+            @memcpy(combined[left.rows.len..], right.rows);
+            self.allocator.free(left.rows);
+            self.allocator.free(right.rows);
+            return ExecResult{ .rows = .{ .columns = left.columns, .rows = combined } };
+        }
+
+        // UNION: deduplicate
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer {
+            var kit = seen.keyIterator();
+            while (kit.next()) |k| self.allocator.free(k.*);
+            seen.deinit(self.allocator);
+        }
+        var unique_rows: std.ArrayList(ResultRow) = .empty;
+
+        // Build key for each row and keep unique ones
+        const all_rows = [_][]ResultRow{ left.rows, right.rows };
+        for (&all_rows) |rows| {
+            for (rows) |row| {
+                var key_parts: std.ArrayList(u8) = .empty;
+                for (row.values, 0..) |val, i| {
+                    if (i > 0) key_parts.append(self.allocator, 0) catch return ExecError.OutOfMemory;
+                    key_parts.appendSlice(self.allocator, val) catch return ExecError.OutOfMemory;
+                }
+                const key = key_parts.toOwnedSlice(self.allocator) catch return ExecError.OutOfMemory;
+                if (seen.contains(key)) {
+                    self.allocator.free(key);
+                    for (row.values) |val| {
+                        self.allocator.free(val);
+                    }
+                    self.allocator.free(row.values);
+                } else {
+                    seen.put(self.allocator, key, {}) catch return ExecError.OutOfMemory;
+                    unique_rows.append(self.allocator, row) catch return ExecError.OutOfMemory;
+                }
+            }
+        }
+
+        self.allocator.free(left.rows);
+        self.allocator.free(right.rows);
+
+        const result_rows = unique_rows.toOwnedSlice(self.allocator) catch return ExecError.OutOfMemory;
+        return ExecResult{ .rows = .{ .columns = left.columns, .rows = result_rows } };
     }
 
     fn execSelect(self: *Self, sel: ast.Select) ExecError!ExecResult {
@@ -6882,4 +6955,72 @@ test "executor || concat operator" {
     defer exec.freeResult(r3);
     try std.testing.expectEqualStrings("hello  world", r3.rows.rows[0].values[0]);
     try std.testing.expectEqualStrings("foo bar", r3.rows.rows[1].values[0]);
+}
+
+test "executor UNION removes duplicates" {
+    const test_file = "test_exec_union.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct1 = try exec.execute("CREATE TABLE t1 (x INT)");
+    exec.freeResult(ct1);
+    const ct2 = try exec.execute("CREATE TABLE t2 (y INT)");
+    exec.freeResult(ct2);
+    const ins1 = try exec.execute("INSERT INTO t1 VALUES (1), (2), (3)");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO t2 VALUES (2), (3), (4)");
+    exec.freeResult(ins2);
+
+    // UNION should deduplicate: {1, 2, 3, 4}
+    const r = try exec.execute("SELECT x FROM t1 UNION SELECT y FROM t2");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 4), r.rows.rows.len);
+    try std.testing.expectEqualStrings("1", r.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("2", r.rows.rows[1].values[0]);
+    try std.testing.expectEqualStrings("3", r.rows.rows[2].values[0]);
+    try std.testing.expectEqualStrings("4", r.rows.rows[3].values[0]);
+}
+
+test "executor UNION ALL keeps duplicates" {
+    const test_file = "test_exec_union_all.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct1 = try exec.execute("CREATE TABLE t1 (x INT)");
+    exec.freeResult(ct1);
+    const ct2 = try exec.execute("CREATE TABLE t2 (y INT)");
+    exec.freeResult(ct2);
+    const ins1 = try exec.execute("INSERT INTO t1 VALUES (1), (2), (3)");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO t2 VALUES (2), (3), (4)");
+    exec.freeResult(ins2);
+
+    // UNION ALL keeps all rows: {1, 2, 3, 2, 3, 4}
+    const r = try exec.execute("SELECT x FROM t1 UNION ALL SELECT y FROM t2");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 6), r.rows.rows.len);
+    try std.testing.expectEqualStrings("1", r.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("2", r.rows.rows[1].values[0]);
+    try std.testing.expectEqualStrings("3", r.rows.rows[2].values[0]);
+    try std.testing.expectEqualStrings("2", r.rows.rows[3].values[0]);
+    try std.testing.expectEqualStrings("3", r.rows.rows[4].values[0]);
+    try std.testing.expectEqualStrings("4", r.rows.rows[5].values[0]);
 }

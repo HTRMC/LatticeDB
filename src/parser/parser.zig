@@ -52,7 +52,18 @@ pub const Parser = struct {
     /// Parse a single SQL statement
     pub fn parse(self: *Self) ParseError!ast.Statement {
         const stmt = switch (self.current.type) {
-            .kw_select => ast.Statement{ .select = try self.parseSelect() },
+            .kw_select => blk: {
+                const sel = try self.parseSelect();
+                // Check for UNION [ALL]
+                if (self.current.type == .kw_union) {
+                    self.advance();
+                    const all = self.current.type == .kw_all;
+                    if (all) self.advance();
+                    const right = try self.parseSelect();
+                    break :blk ast.Statement{ .union_query = .{ .left = sel, .right = right, .all = all } };
+                }
+                break :blk ast.Statement{ .select = sel };
+            },
             .kw_insert => ast.Statement{ .insert = try self.parseInsert() },
             .kw_update => ast.Statement{ .update = try self.parseUpdate() },
             .kw_delete => ast.Statement{ .delete = try self.parseDelete() },
@@ -1990,4 +2001,22 @@ test "parse || concat chained" {
     try std.testing.expectEqual(ast.BuiltinFunction.concat, expr.function_call.func);
     // left arg is also concat
     try std.testing.expect(expr.function_call.args[0].* == .function_call);
+}
+
+test "parse UNION" {
+    var p = Parser.init(std.testing.allocator, "SELECT a FROM t1 UNION SELECT b FROM t2");
+    defer p.deinit();
+    const stmt = try p.parse();
+    try std.testing.expect(stmt == .union_query);
+    try std.testing.expect(!stmt.union_query.all);
+    try std.testing.expectEqualStrings("t1", stmt.union_query.left.table_name);
+    try std.testing.expectEqualStrings("t2", stmt.union_query.right.table_name);
+}
+
+test "parse UNION ALL" {
+    var p = Parser.init(std.testing.allocator, "SELECT a FROM t1 UNION ALL SELECT b FROM t2");
+    defer p.deinit();
+    const stmt = try p.parse();
+    try std.testing.expect(stmt == .union_query);
+    try std.testing.expect(stmt.union_query.all);
 }

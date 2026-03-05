@@ -200,6 +200,7 @@ pub const Statement = union(enum) {
     drop_index: DropIndex,
     alter_table: AlterTable,
     explain: Explain,
+    union_query: UnionQuery,
     begin_txn: void,
     commit_txn: void,
     rollback_txn: void,
@@ -282,6 +283,12 @@ pub const CreateIndex = struct {
 
 pub const DropIndex = struct {
     index_name: []const u8,
+};
+
+pub const UnionQuery = struct {
+    left: Select,
+    right: Select,
+    all: bool, // true = UNION ALL (keep duplicates)
 };
 
 pub const Explain = struct {

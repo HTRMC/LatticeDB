@@ -99,6 +99,10 @@ pub const TokenType = enum {
     kw_floor,
     kw_mod,
 
+    // Set operations
+    kw_union,
+    kw_all,
+
     // Transaction keywords
     kw_begin,
     kw_commit,
@@ -200,6 +204,8 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "exists", .kw_exists },
     .{ "in", .kw_in },
     .{ "like", .kw_like },
+    .{ "union", .kw_union },
+    .{ "all", .kw_all },
     .{ "begin", .kw_begin },
     .{ "commit", .kw_commit },
     .{ "rollback", .kw_rollback },
