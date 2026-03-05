@@ -106,6 +106,7 @@ pub const Catalog = struct {
             .{ .name = "col_type", .col_type = .integer, .max_length = 0, .nullable = false },
             .{ .name = "max_length", .col_type = .integer, .max_length = 0, .nullable = false },
             .{ .name = "nullable", .col_type = .integer, .max_length = 0, .nullable = false },
+            .{ .name = "default_val", .col_type = .text, .max_length = 0, .nullable = true },
         },
     };
 
@@ -227,6 +228,7 @@ pub const Catalog = struct {
                 .col_type = col.col_type,
                 .max_length = col.max_length,
                 .nullable = col.nullable,
+                .default_value = col.default_value,
             };
         }
 
@@ -269,6 +271,27 @@ pub const Catalog = struct {
 
         // Insert columns into gp_columns
         for (columns, 0..) |col, i| {
+            const default_str: Value = if (col.default_value) |dv| switch (dv) {
+                .integer => |iv| blk: {
+                    var buf: [20]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "{d}", .{iv}) catch break :blk Value{ .null_value = {} };
+                    break :blk Value{ .bytes = s };
+                },
+                .float => |fv| blk: {
+                    var buf: [32]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "{d:.6}", .{fv}) catch break :blk Value{ .null_value = {} };
+                    break :blk Value{ .bytes = s };
+                },
+                .boolean => |bv| Value{ .bytes = if (bv) "true" else "false" },
+                .bytes => |bv| Value{ .bytes = bv },
+                .null_value => Value{ .null_value = {} },
+                .bigint => |iv| blk: {
+                    var buf: [20]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "{d}", .{iv}) catch break :blk Value{ .null_value = {} };
+                    break :blk Value{ .bytes = s };
+                },
+            } else Value{ .null_value = {} };
+
             const col_vals = [_]Value{
                 .{ .integer = @bitCast(table_id) },
                 .{ .integer = @intCast(i) },
@@ -276,6 +299,7 @@ pub const Catalog = struct {
                 .{ .integer = @intCast(@intFromEnum(col.col_type)) },
                 .{ .integer = @intCast(col.max_length) },
                 .{ .integer = if (col.nullable) @as(i32, 1) else @as(i32, 0) },
+                default_str,
             };
             _ = self.columns_table.insertTuple(null, &col_vals) catch {
                 return CatalogError.StorageError;
@@ -335,6 +359,7 @@ pub const Catalog = struct {
             .{ .integer = @intCast(@intFromEnum(col.col_type)) },
             .{ .integer = @intCast(col.max_length) },
             .{ .integer = if (col.nullable) @as(i32, 1) else @as(i32, 0) },
+            .{ .null_value = {} },
         };
         _ = self.columns_table.insertTuple(null, &col_vals) catch {
             return CatalogError.StorageError;
@@ -634,6 +659,12 @@ pub const Catalog = struct {
         errdefer {
             for (columns) |col| {
                 if (col.name.len > 0) self.allocator.free(col.name);
+                if (col.default_value) |dv| {
+                    switch (dv) {
+                        .bytes => |b| self.allocator.free(b),
+                        else => {},
+                    }
+                }
             }
             self.allocator.free(columns);
         }
@@ -655,11 +686,34 @@ pub const Catalog = struct {
                     return CatalogError.OutOfMemory;
                 };
 
+                const col_type: ColumnType = @enumFromInt(@as(u8, @intCast(row.values[3].integer)));
+
+                // Deserialize default value from the default_val TEXT column (index 6)
+                const default_value: ?Value = if (row.values.len > 6) blk: {
+                    switch (row.values[6]) {
+                        .null_value => break :blk null,
+                        .bytes => |s| {
+                            if (s.len == 0) break :blk null;
+                            break :blk switch (col_type) {
+                                .boolean => Value{ .boolean = std.mem.eql(u8, s, "true") },
+                                .integer => Value{ .integer = std.fmt.parseInt(i32, s, 10) catch break :blk null },
+                                .bigint => Value{ .bigint = std.fmt.parseInt(i64, s, 10) catch break :blk null },
+                                .float => Value{ .float = std.fmt.parseFloat(f64, s) catch break :blk null },
+                                .varchar, .text => Value{ .bytes = self.allocator.dupe(u8, s) catch {
+                                    return CatalogError.OutOfMemory;
+                                } },
+                            };
+                        },
+                        else => break :blk null,
+                    }
+                } else null;
+
                 columns[ordinal] = .{
                     .name = name_copy,
-                    .col_type = @enumFromInt(@as(u8, @intCast(row.values[3].integer))),
+                    .col_type = col_type,
                     .max_length = @intCast(row.values[4].integer),
                     .nullable = row.values[5].integer != 0,
+                    .default_value = default_value,
                 };
             }
         }
@@ -676,6 +730,12 @@ pub const Catalog = struct {
         for (schema.columns) |col| {
             if (col.name.len > 0) {
                 self.allocator.free(col.name);
+            }
+            if (col.default_value) |dv| {
+                switch (dv) {
+                    .bytes => |b| self.allocator.free(b),
+                    else => {},
+                }
             }
         }
         self.allocator.free(schema.columns);
