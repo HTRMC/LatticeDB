@@ -158,18 +158,30 @@ pub const Parser = struct {
         var joins: ?[]const ast.JoinClause = null;
         {
             var join_list: std.ArrayList(ast.JoinClause) = .empty;
-            while (self.current.type == .kw_join or self.current.type == .kw_inner or self.current.type == .kw_left) {
+            while (self.current.type == .kw_join or self.current.type == .kw_inner or
+                self.current.type == .kw_left or self.current.type == .kw_right or
+                self.current.type == .kw_cross)
+            {
                 var join_type: ast.JoinType = .inner;
                 if (self.current.type == .kw_left) {
                     join_type = .left;
+                    self.advance();
+                } else if (self.current.type == .kw_right) {
+                    join_type = .right;
+                    self.advance();
+                } else if (self.current.type == .kw_cross) {
+                    join_type = .cross;
                     self.advance();
                 } else if (self.current.type == .kw_inner) {
                     self.advance();
                 }
                 try self.expect(.kw_join);
                 const join_table = try self.expectIdentifier();
-                try self.expect(.kw_on);
-                const on_cond = try self.parseExpression();
+                var on_cond: ?*const ast.Expression = null;
+                if (join_type != .cross) {
+                    try self.expect(.kw_on);
+                    on_cond = try self.parseExpression();
+                }
                 join_list.append(alloc, .{
                     .join_type = join_type,
                     .table_name = join_table,
@@ -1379,7 +1391,7 @@ test "parse SELECT with JOIN" {
         try std.testing.expectEqual(ast.JoinType.inner, join_list[0].join_type);
         try std.testing.expectEqualStrings("orders", join_list[0].table_name);
         // ON condition should be a comparison of qualified refs
-        const on_cond = join_list[0].on_condition;
+        const on_cond = join_list[0].on_condition.?;
         try std.testing.expectEqualStrings("users", on_cond.comparison.left.qualified_ref.table);
         try std.testing.expectEqualStrings("id", on_cond.comparison.left.qualified_ref.column);
     }
@@ -2080,6 +2092,23 @@ test "parse LIMIT without OFFSET" {
     const stmt = try p.parse();
     try std.testing.expectEqual(@as(u64, 5), stmt.select.limit.?);
     try std.testing.expect(stmt.select.offset == null);
+}
+
+test "parse RIGHT JOIN" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t1 RIGHT JOIN t2 ON t1.id = t2.id");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const join_list = stmt.select.joins.?;
+    try std.testing.expectEqual(ast.JoinType.right, join_list[0].join_type);
+}
+
+test "parse CROSS JOIN" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t1 CROSS JOIN t2");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const join_list = stmt.select.joins.?;
+    try std.testing.expectEqual(ast.JoinType.cross, join_list[0].join_type);
+    try std.testing.expect(join_list[0].on_condition == null);
 }
 
 test "parse UPDATE with expression" {

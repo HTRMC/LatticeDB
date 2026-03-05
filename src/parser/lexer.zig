@@ -45,6 +45,8 @@ pub const TokenType = enum {
     kw_join,
     kw_inner,
     kw_left,
+    kw_right,
+    kw_cross,
     kw_on,
 
     // Aliases and modifiers
@@ -197,6 +199,8 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "join", .kw_join },
     .{ "inner", .kw_inner },
     .{ "left", .kw_left },
+    .{ "right", .kw_right },
+    .{ "cross", .kw_cross },
     .{ "on", .kw_on },
     .{ "add", .kw_add },
     .{ "alter", .kw_alter },

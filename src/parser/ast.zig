@@ -231,12 +231,14 @@ pub const OrderByClause = struct {
 pub const JoinType = enum {
     inner,
     left,
+    right,
+    cross,
 };
 
 pub const JoinClause = struct {
     join_type: JoinType,
     table_name: []const u8,
-    on_condition: *const Expression,
+    on_condition: ?*const Expression, // null for CROSS JOIN
 };
 
 pub const Select = struct {

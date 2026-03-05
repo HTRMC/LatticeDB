@@ -2015,14 +2015,17 @@ pub const Executor = struct {
 
         // Try index nested-loop join: if right table has an index on the join column,
         // use btree point lookup instead of materializing all right rows.
-        const index_join = self.tryIndexNestedLoopJoin(
-            join.on_condition,
-            sel.table_name,
-            join.table_name,
-            left_schema,
-            right_schema,
-            right_table.table_id,
-        );
+        const index_join = if (join.on_condition) |on_cond|
+            self.tryIndexNestedLoopJoin(
+                on_cond,
+                sel.table_name,
+                join.table_name,
+                left_schema,
+                right_schema,
+                right_table.table_id,
+            )
+        else
+            null;
 
         if (index_join) |ij| {
             // Index nested-loop join: scan left, lookup right via index
@@ -2075,7 +2078,7 @@ pub const Executor = struct {
                         @memcpy(combined_values[left_schema.columns.len..], right_vals);
 
                         // Verify ON condition (handles residual checks beyond the index key)
-                        const on_match = self.evalJoinCondition(join.on_condition, sel.table_name, join.table_name, left_schema, right_schema, left_row.values, right_vals);
+                        const on_match = if (join.on_condition) |on_cond| self.evalJoinCondition(on_cond, sel.table_name, join.table_name, left_schema, right_schema, left_row.values, right_vals) else true;
 
                         if (on_match) {
                             if (sel.where_clause) |where| {
@@ -2111,7 +2114,7 @@ pub const Executor = struct {
 
                 self.allocator.free(combined_values);
             }
-        } else if (self.tryExtractEquiJoinKeys(join.on_condition, sel.table_name, join.table_name, left_schema, right_schema)) |eq_keys| {
+        } else if (if (join.on_condition) |on_cond| self.tryExtractEquiJoinKeys(on_cond, sel.table_name, join.table_name, left_schema, right_schema) else null) |eq_keys| {
             // Hash join: O(n+m) for equi-joins without an index
             try self.execHashJoin(
                 eq_keys,
@@ -2160,6 +2163,14 @@ pub const Executor = struct {
                 }
             }
 
+            // Track matched right rows for RIGHT JOIN
+            const right_matched: ?[]bool = if (join.join_type == .right) blk: {
+                const rm = self.allocator.alloc(bool, right_rows.items.len) catch break :blk null;
+                @memset(rm, false);
+                break :blk rm;
+            } else null;
+            defer if (right_matched) |rm| self.allocator.free(rm);
+
             // Nested loop: for each left row, scan all right rows
             var liter = left_table.scanWithTxn(txn) catch {
                 for (col_names) |cn| self.allocator.free(cn);
@@ -2185,10 +2196,10 @@ pub const Executor = struct {
                 @memcpy(combined_values[0..left_schema.columns.len], left_row.values);
 
                 var matched = false;
-                for (right_rows.items) |right_vals| {
+                for (right_rows.items, 0..) |right_vals, ri| {
                     @memcpy(combined_values[left_schema.columns.len..], right_vals);
 
-                    const on_match = self.evalJoinCondition(join.on_condition, sel.table_name, join.table_name, left_schema, right_schema, left_row.values, right_vals);
+                    const on_match = if (join.on_condition) |on_cond| self.evalJoinCondition(on_cond, sel.table_name, join.table_name, left_schema, right_schema, left_row.values, right_vals) else true;
                     if (!on_match) continue;
 
                     if (sel.where_clause) |where| {
@@ -2196,6 +2207,7 @@ pub const Executor = struct {
                     }
 
                     matched = true;
+                    if (right_matched) |rm| rm[ri] = true;
                     try self.formatAndAppendJoinRow(col_proj, combined_schema, combined_values, &rows);
                 }
 
@@ -2216,6 +2228,30 @@ pub const Executor = struct {
                 }
 
                 self.allocator.free(combined_values);
+            }
+
+            // RIGHT JOIN: emit unmatched right rows with NULLs on the left side
+            if (join.join_type == .right) {
+                if (right_matched) |rm| {
+                    for (right_rows.items, 0..) |right_vals, ri| {
+                        if (rm[ri]) continue;
+                        const combined_values2 = self.allocator.alloc(Value, combined_count) catch return ExecError.OutOfMemory;
+                        for (combined_values2[0..left_schema.columns.len]) |*v| {
+                            v.* = .{ .null_value = {} };
+                        }
+                        @memcpy(combined_values2[left_schema.columns.len..], right_vals);
+
+                        const emit = if (sel.where_clause) |where|
+                            self.evalWhere(where, combined_schema, combined_values2)
+                        else
+                            true;
+
+                        if (emit) {
+                            try self.formatAndAppendJoinRow(col_proj, combined_schema, combined_values2, &rows);
+                        }
+                        self.allocator.free(combined_values2);
+                    }
+                }
             }
         }
 
@@ -2255,6 +2291,8 @@ pub const Executor = struct {
         // INNER JOIN: build the smaller table.
         const build_right = if (join.join_type == .left)
             true
+        else if (join.join_type == .right)
+            false // RIGHT JOIN: build left, probe right
         else blk: {
             const left_count = left_table.tupleCount() catch 0;
             const right_count = right_table.tupleCount() catch 0;
@@ -2336,7 +2374,7 @@ pub const Executor = struct {
                             const left_vals = combined_values[0..left_schema.columns.len];
                             const right_vals = combined_values[left_schema.columns.len..];
                             const on_match = self.evalJoinCondition(
-                                join.on_condition,
+                                join.on_condition.?,
                                 sel.table_name,
                                 join.table_name,
                                 left_schema,
@@ -2372,6 +2410,29 @@ pub const Executor = struct {
                     for (combined_values[left_schema.columns.len..]) |*v| {
                         v.* = .{ .null_value = {} };
                     }
+
+                    const emit = if (sel.where_clause) |where|
+                        self.evalWhere(where, combined_schema, combined_values)
+                    else
+                        true;
+
+                    if (emit) {
+                        self.formatAndAppendJoinRow(col_proj, combined_schema, combined_values, rows) catch {
+                            self.allocator.free(combined_values);
+                            return ExecError.OutOfMemory;
+                        };
+                    }
+
+                    self.allocator.free(combined_values);
+                }
+
+                // RIGHT JOIN: emit row with NULLs for left side if no match
+                if (join.join_type == .right and !matched and !build_right) {
+                    const combined_values = self.allocator.alloc(Value, combined_count) catch return ExecError.OutOfMemory;
+                    for (combined_values[0..left_schema.columns.len]) |*v| {
+                        v.* = .{ .null_value = {} };
+                    }
+                    @memcpy(combined_values[left_schema.columns.len..], probe_row.values);
 
                     const emit = if (sel.where_clause) |where|
                         self.evalWhere(where, combined_schema, combined_values)
@@ -7316,4 +7377,68 @@ test "executor UPDATE with expression" {
     const r2 = try exec.execute("SELECT name FROM t WHERE x = 15");
     defer exec.freeResult(r2);
     try std.testing.expectEqualStrings("alice_updated", r2.rows.rows[0].values[0]);
+}
+
+test "executor RIGHT JOIN" {
+    const test_file = "test_exec_right_join.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct1 = try exec.execute("CREATE TABLE t1 (id INT, val TEXT)");
+    exec.freeResult(ct1);
+    const ct2 = try exec.execute("CREATE TABLE t2 (id INT, name TEXT)");
+    exec.freeResult(ct2);
+    const ins1 = try exec.execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b')");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO t2 VALUES (2, 'x'), (3, 'y')");
+    exec.freeResult(ins2);
+
+    // RIGHT JOIN: all right rows, NULLs for unmatched left
+    const r = try exec.execute("SELECT t1.val, t2.name FROM t1 RIGHT JOIN t2 ON t1.id = t2.id");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 2), r.rows.rows.len);
+    // id=2 matches: val='b', name='x'
+    try std.testing.expectEqualStrings("b", r.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("x", r.rows.rows[0].values[1]);
+    // id=3 no match: val=NULL, name='y'
+    try std.testing.expectEqualStrings("NULL", r.rows.rows[1].values[0]);
+    try std.testing.expectEqualStrings("y", r.rows.rows[1].values[1]);
+}
+
+test "executor CROSS JOIN" {
+    const test_file = "test_exec_cross_join.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct1 = try exec.execute("CREATE TABLE t1 (a INT)");
+    exec.freeResult(ct1);
+    const ct2 = try exec.execute("CREATE TABLE t2 (b INT)");
+    exec.freeResult(ct2);
+    const ins1 = try exec.execute("INSERT INTO t1 VALUES (1), (2)");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO t2 VALUES (10), (20)");
+    exec.freeResult(ins2);
+
+    // CROSS JOIN: 2x2 = 4 rows
+    const r = try exec.execute("SELECT * FROM t1 CROSS JOIN t2");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 4), r.rows.rows.len);
 }
