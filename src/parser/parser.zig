@@ -254,8 +254,23 @@ pub const Parser = struct {
         try self.expect(.kw_into);
         const table_name = try self.expectIdentifier();
         try self.expect(.kw_values);
-        try self.expect(.left_paren);
 
+        const alloc = self.arena();
+        var rows: std.ArrayList([]const ast.LiteralValue) = .empty;
+        rows.append(alloc, try self.parseValueRow()) catch return ParseError.OutOfMemory;
+        while (self.current.type == .comma) {
+            self.advance();
+            rows.append(alloc, try self.parseValueRow()) catch return ParseError.OutOfMemory;
+        }
+
+        return .{
+            .table_name = table_name,
+            .rows = rows.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
+        };
+    }
+
+    fn parseValueRow(self: *Self) ParseError![]const ast.LiteralValue {
+        try self.expect(.left_paren);
         const alloc = self.arena();
         var vals: std.ArrayList(ast.LiteralValue) = .empty;
         vals.append(alloc, try self.parseLiteral()) catch return ParseError.OutOfMemory;
@@ -263,13 +278,8 @@ pub const Parser = struct {
             self.advance();
             vals.append(alloc, try self.parseLiteral()) catch return ParseError.OutOfMemory;
         }
-
         try self.expect(.right_paren);
-
-        return .{
-            .table_name = table_name,
-            .values = vals.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
-        };
+        return vals.toOwnedSlice(alloc) catch return ParseError.OutOfMemory;
     }
 
     // ============================================================
@@ -1029,10 +1039,11 @@ test "parse INSERT" {
     const ins = stmt.insert;
 
     try std.testing.expectEqualStrings("users", ins.table_name);
-    try std.testing.expectEqual(@as(usize, 3), ins.values.len);
-    try std.testing.expectEqual(@as(i64, 1), ins.values[0].integer);
-    try std.testing.expectEqualStrings("alice", ins.values[1].string);
-    try std.testing.expectEqualStrings("alice@example.com", ins.values[2].string);
+    try std.testing.expectEqual(@as(usize, 1), ins.rows.len);
+    try std.testing.expectEqual(@as(usize, 3), ins.rows[0].len);
+    try std.testing.expectEqual(@as(i64, 1), ins.rows[0][0].integer);
+    try std.testing.expectEqualStrings("alice", ins.rows[0][1].string);
+    try std.testing.expectEqualStrings("alice@example.com", ins.rows[0][2].string);
 }
 
 test "parse SELECT with WHERE" {
@@ -1458,10 +1469,11 @@ test "parse INSERT with positional params" {
     defer p.deinit();
     const stmt = try p.parse();
     const ins = stmt.insert;
-    try std.testing.expectEqual(@as(usize, 3), ins.values.len);
-    try std.testing.expectEqual(@as(u32, 0), ins.values[0].parameter);
-    try std.testing.expectEqual(@as(u32, 1), ins.values[1].parameter);
-    try std.testing.expectEqual(@as(u32, 2), ins.values[2].parameter);
+    try std.testing.expectEqual(@as(usize, 1), ins.rows.len);
+    try std.testing.expectEqual(@as(usize, 3), ins.rows[0].len);
+    try std.testing.expectEqual(@as(u32, 0), ins.rows[0][0].parameter);
+    try std.testing.expectEqual(@as(u32, 1), ins.rows[0][1].parameter);
+    try std.testing.expectEqual(@as(u32, 2), ins.rows[0][2].parameter);
     try std.testing.expectEqual(@as(u32, 3), p.param_count);
 }
 
@@ -1695,4 +1707,18 @@ test "parse arithmetic with alias" {
     try std.testing.expect(sel.columns[0] == .expression);
     const alias = sel.aliases.?[0].?;
     try std.testing.expectEqualStrings("total", alias);
+}
+
+test "parse multi-row INSERT" {
+    var p = Parser.init(std.testing.allocator, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const ins = stmt.insert;
+    try std.testing.expectEqual(@as(usize, 3), ins.rows.len);
+    try std.testing.expectEqual(@as(i64, 1), ins.rows[0][0].integer);
+    try std.testing.expectEqualStrings("a", ins.rows[0][1].string);
+    try std.testing.expectEqual(@as(i64, 2), ins.rows[1][0].integer);
+    try std.testing.expectEqualStrings("b", ins.rows[1][1].string);
+    try std.testing.expectEqual(@as(i64, 3), ins.rows[2][0].integer);
+    try std.testing.expectEqualStrings("c", ins.rows[2][1].string);
 }

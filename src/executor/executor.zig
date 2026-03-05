@@ -833,37 +833,43 @@ pub const Executor = struct {
 
         const schema = result.schema;
 
-        // Check column count matches
-        if (ins.values.len != schema.columns.len) {
-            return ExecError.ColumnCountMismatch;
-        }
-
         // Convert AST literal values to storage Values
-        const values = self.allocator.alloc(Value, ins.values.len) catch {
+        const values = self.allocator.alloc(Value, schema.columns.len) catch {
             return ExecError.OutOfMemory;
         };
         defer self.allocator.free(values);
 
-        for (ins.values, schema.columns, 0..) |lit, col, i| {
-            const resolved = resolveParam(lit, self.current_params);
-            values[i] = litToValue(resolved, col.col_type) catch {
-                return ExecError.TypeMismatch;
-            };
-        }
-
         // Use explicit txn or auto-commit
         const txn = self.current_txn orelse self.beginImplicitTxn();
 
-        const tid = table.insertTuple(txn, values) catch {
-            self.abortImplicitTxn(txn);
-            return ExecError.StorageError;
-        };
+        var row_count: usize = 0;
+        for (ins.rows) |row_vals| {
+            // Check column count matches
+            if (row_vals.len != schema.columns.len) {
+                self.abortImplicitTxn(txn);
+                return ExecError.ColumnCountMismatch;
+            }
 
-        // Maintain indexes
-        self.maintainIndexesInsert(table.table_id, schema, values, tid);
+            for (row_vals, schema.columns, 0..) |lit, col, i| {
+                const resolved = resolveParam(lit, self.current_params);
+                values[i] = litToValue(resolved, col.col_type) catch {
+                    self.abortImplicitTxn(txn);
+                    return ExecError.TypeMismatch;
+                };
+            }
+
+            const tid = table.insertTuple(txn, values) catch {
+                self.abortImplicitTxn(txn);
+                return ExecError.StorageError;
+            };
+
+            // Maintain indexes
+            self.maintainIndexesInsert(table.table_id, schema, values, tid);
+            row_count += 1;
+        }
 
         self.commitImplicitTxn(txn);
-        return .{ .row_count = 1 };
+        return .{ .row_count = row_count };
     }
 
     // ============================================================
@@ -6477,4 +6483,36 @@ test "executor arithmetic float promotion" {
     const r = try exec.execute("SELECT x * 2 FROM t");
     defer exec.freeResult(r);
     try std.testing.expectEqualStrings("7.000000", r.rows.rows[0].values[0]);
+}
+
+test "executor multi-row INSERT" {
+    const test_file = "test_exec_multi_insert.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+
+    const ins = try exec.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')");
+    try std.testing.expectEqual(@as(usize, 3), ins.row_count);
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT * FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 3), r.rows.rows.len);
+    try std.testing.expectEqualStrings("1", r.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("alice", r.rows.rows[0].values[1]);
+    try std.testing.expectEqualStrings("2", r.rows.rows[1].values[0]);
+    try std.testing.expectEqualStrings("bob", r.rows.rows[1].values[1]);
+    try std.testing.expectEqualStrings("3", r.rows.rows[2].values[0]);
+    try std.testing.expectEqualStrings("charlie", r.rows.rows[2].values[1]);
 }

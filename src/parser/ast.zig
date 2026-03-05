@@ -195,7 +195,7 @@ pub const CreateTable = struct {
 
 pub const Insert = struct {
     table_name: []const u8,
-    values: []const LiteralValue,
+    rows: []const []const LiteralValue,
 };
 
 pub const OrderByClause = struct {
