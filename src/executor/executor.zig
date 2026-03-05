@@ -6766,3 +6766,81 @@ test "executor CAST text to int" {
     defer exec.freeResult(r);
     try std.testing.expectEqualStrings("123", r.rows.rows[0].values[0]);
 }
+
+test "executor NOT LIKE" {
+    const test_file = "test_exec_not_like.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (name TEXT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES ('alice'), ('bob'), ('alex')");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT * FROM t WHERE name NOT LIKE 'al%'");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 1), r.rows.rows.len);
+    try std.testing.expectEqualStrings("bob", r.rows.rows[0].values[0]);
+}
+
+test "executor NOT IN" {
+    const test_file = "test_exec_not_in.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (x INT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT * FROM t WHERE x NOT IN (2, 4)");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 3), r.rows.rows.len);
+    try std.testing.expectEqualStrings("1", r.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("3", r.rows.rows[1].values[0]);
+    try std.testing.expectEqualStrings("5", r.rows.rows[2].values[0]);
+}
+
+test "executor NOT BETWEEN" {
+    const test_file = "test_exec_not_between.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (x INT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (1), (5), (10), (15)");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT * FROM t WHERE x NOT BETWEEN 3 AND 12");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 2), r.rows.rows.len);
+    try std.testing.expectEqualStrings("1", r.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("15", r.rows.rows[1].values[0]);
+}

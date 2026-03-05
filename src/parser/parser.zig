@@ -649,6 +649,22 @@ pub const Parser = struct {
             return expr;
         }
 
+        // NOT BETWEEN / NOT LIKE / NOT IN
+        if (self.current.type == .kw_not) {
+            const next = self.lexer.peek();
+            if (next.type == .kw_between or next.type == .kw_like or next.type == .kw_in) {
+                self.advance(); // consume NOT
+                const inner = try self.parseComparisonInfix(left, alloc);
+                const neg = try alloc.create(ast.Expression);
+                neg.* = .{ .not_expr = .{ .operand = inner } };
+                return neg;
+            }
+        }
+
+        return self.parseComparisonInfix(left, alloc);
+    }
+
+    fn parseComparisonInfix(self: *Self, left: *const ast.Expression, alloc: std.mem.Allocator) ParseError!*const ast.Expression {
         // BETWEEN low AND high
         if (self.current.type == .kw_between) {
             self.advance();
@@ -1889,4 +1905,31 @@ test "parse CAST in WHERE" {
     const where = stmt.select.where_clause.?;
     try std.testing.expect(where.* == .comparison);
     try std.testing.expect(where.comparison.left.* == .cast_expr);
+}
+
+test "parse NOT LIKE" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t WHERE name NOT LIKE '%test%'");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const where = stmt.select.where_clause.?;
+    try std.testing.expect(where.* == .not_expr);
+    try std.testing.expect(where.not_expr.operand.* == .like_expr);
+}
+
+test "parse NOT IN" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t WHERE x NOT IN (1, 2, 3)");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const where = stmt.select.where_clause.?;
+    try std.testing.expect(where.* == .not_expr);
+    try std.testing.expect(where.not_expr.operand.* == .in_list);
+}
+
+test "parse NOT BETWEEN" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t WHERE x NOT BETWEEN 1 AND 10");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const where = stmt.select.where_clause.?;
+    try std.testing.expect(where.* == .not_expr);
+    try std.testing.expect(where.not_expr.operand.* == .between_expr);
 }
