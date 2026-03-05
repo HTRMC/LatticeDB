@@ -11,6 +11,7 @@ const btree_mod = @import("../index/btree.zig");
 const planner_mod = @import("../planner/planner.zig");
 const plan_mod = @import("../planner/plan.zig");
 const vec_exec_mod = @import("vec_exec.zig");
+const expr_eval = @import("expr_eval.zig");
 
 const Value = tuple_mod.Value;
 const Column = tuple_mod.Column;
@@ -2518,7 +2519,7 @@ pub const Executor = struct {
                     .bytes => |s| s,
                     else => return false,
                 };
-                return matchLike(text, pattern);
+                return expr_eval.matchLike(text, pattern);
             },
             .in_list => |il| {
                 const val = resolveExprValue(il.value, schema, values, params);
@@ -2573,8 +2574,16 @@ pub const Executor = struct {
                 }
                 return true;
             },
-            // CASE and function_call: stub — not yet evaluated in WHERE
-            .case_expr, .function_call => return true,
+            .case_expr, .function_call => {
+                const result = expr_eval.evalExprToValue(self.allocator, expr, schema, values, params);
+                defer result.deinit(self.allocator);
+                return switch (result.value) {
+                    .null_value => false,
+                    .boolean => |b| b,
+                    .integer => |i| i != 0,
+                    else => true,
+                };
+            },
         }
     }
 
@@ -2603,44 +2612,6 @@ pub const Executor = struct {
             },
             .null_value => return .{ .null_value = {} },
         }
-    }
-
-    /// SQL LIKE pattern matching: % = any chars, _ = single char
-    fn matchLike(text: []const u8, pattern: []const u8) bool {
-        var ti: usize = 0;
-        var pi: usize = 0;
-        var star_pi: ?usize = null;
-        var star_ti: usize = 0;
-
-        while (ti < text.len) {
-            if (pi < pattern.len and pattern[pi] == '_') {
-                // _ matches any single character
-                ti += 1;
-                pi += 1;
-            } else if (pi < pattern.len and pattern[pi] == '%') {
-                // % matches zero or more characters - try matching zero first
-                star_pi = pi;
-                star_ti = ti;
-                pi += 1;
-            } else if (pi < pattern.len and pattern[pi] == text[ti]) {
-                ti += 1;
-                pi += 1;
-            } else if (star_pi) |sp| {
-                // Backtrack: try matching one more character with %
-                pi = sp + 1;
-                star_ti += 1;
-                ti = star_ti;
-            } else {
-                return false;
-            }
-        }
-
-        // Consume trailing % in pattern
-        while (pi < pattern.len and pattern[pi] == '%') {
-            pi += 1;
-        }
-
-        return pi == pattern.len;
     }
 
     fn resolveExprValue(expr: *const ast.Expression, schema: *const Schema, values: []const Value, params: ?[]const ast.LiteralValue) Value {

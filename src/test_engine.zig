@@ -3,6 +3,7 @@
 
 comptime {
     _ = @import("executor/executor.zig");
+    _ = @import("executor/expr_eval.zig");
     _ = @import("executor/vec_filter.zig");
     _ = @import("executor/vec_agg.zig");
     _ = @import("executor/vec_scan.zig");

@@ -2,6 +2,7 @@ const std = @import("std");
 const vector_mod = @import("vector.zig");
 const tuple_mod = @import("../storage/tuple.zig");
 const ast = @import("../parser/ast.zig");
+const expr_eval = @import("expr_eval.zig");
 
 const DataChunk = vector_mod.DataChunk;
 const ColumnVector = vector_mod.ColumnVector;
@@ -420,7 +421,7 @@ fn evalExprOnChunk(expr: *const ast.Expression, chunk: *DataChunk, schema: *cons
                 .bytes => |s| s,
                 else => return false,
             };
-            return matchLike(text, pattern);
+            return expr_eval.matchLike(text, pattern);
         },
         .in_list => |il| {
             const val = resolveExprValueFromChunk(il.value, chunk, schema, row);
@@ -466,100 +467,10 @@ fn resolveExprValueFromChunk(expr: *const ast.Expression, chunk: *DataChunk, sch
 }
 
 fn litToStorageValue(lit: ast.LiteralValue) Value {
-    return switch (lit) {
-        .integer => |v| blk: {
-            if (v >= std.math.minInt(i32) and v <= std.math.maxInt(i32)) {
-                break :blk .{ .integer = @intCast(v) };
-            }
-            break :blk .{ .bigint = v };
-        },
-        .float => |v| .{ .float = v },
-        .string => |v| .{ .bytes = v },
-        .boolean => |v| .{ .boolean = v },
-        .null_value => .{ .null_value = {} },
-        .parameter => .{ .null_value = {} },
-    };
+    return expr_eval.litToStorageValue(lit, null);
 }
 
-fn compareValues(left: Value, op: ast.CompOp, right: Value) bool {
-    if (left == .null_value or right == .null_value) return false;
-
-    switch (left) {
-        .integer => |li| {
-            const li_wide: i64 = li;
-            const ri: i64 = switch (right) {
-                .integer => |v| v,
-                .bigint => |v| v,
-                else => return false,
-            };
-            return switch (op) {
-                .eq => li_wide == ri,
-                .neq => li_wide != ri,
-                .lt => li_wide < ri,
-                .gt => li_wide > ri,
-                .lte => li_wide <= ri,
-                .gte => li_wide >= ri,
-            };
-        },
-        .bigint => |li| {
-            const ri: i64 = switch (right) {
-                .integer => |v| v,
-                .bigint => |v| v,
-                else => return false,
-            };
-            return switch (op) {
-                .eq => li == ri,
-                .neq => li != ri,
-                .lt => li < ri,
-                .gt => li > ri,
-                .lte => li <= ri,
-                .gte => li >= ri,
-            };
-        },
-        .float => |lf| {
-            const rf: f64 = switch (right) {
-                .float => |v| v,
-                .integer => |v| @floatFromInt(v),
-                else => return false,
-            };
-            return switch (op) {
-                .eq => lf == rf,
-                .neq => lf != rf,
-                .lt => lf < rf,
-                .gt => lf > rf,
-                .lte => lf <= rf,
-                .gte => lf >= rf,
-            };
-        },
-        .bytes => |ls| {
-            const rs = switch (right) {
-                .bytes => |v| v,
-                else => return false,
-            };
-            const cmp = std.mem.order(u8, ls, rs);
-            return switch (op) {
-                .eq => cmp == .eq,
-                .neq => cmp != .eq,
-                .lt => cmp == .lt,
-                .gt => cmp == .gt,
-                .lte => cmp != .gt,
-                .gte => cmp != .lt,
-            };
-        },
-        .boolean => |lb| {
-            const rb = switch (right) {
-                .boolean => |v| v,
-                else => return false,
-            };
-            return switch (op) {
-                .eq => lb == rb,
-                .neq => lb != rb,
-                else => false,
-            };
-        },
-        .null_value => return false,
-    }
-}
+const compareValues = expr_eval.compareValues;
 
 // ── Scalar helpers ───────────────────────────────────────────────
 
@@ -617,38 +528,6 @@ fn hasNullInRange(col: *const ColumnVector, start: u16, comptime width: u16) boo
         if (col.isNull(start + i)) return true;
     }
     return false;
-}
-
-/// SQL LIKE pattern matching (same algorithm as executor.zig)
-fn matchLike(text: []const u8, pattern: []const u8) bool {
-    var ti: usize = 0;
-    var pi: usize = 0;
-    var star_pi: ?usize = null;
-    var star_ti: usize = 0;
-
-    while (ti < text.len) {
-        if (pi < pattern.len and pattern[pi] == '_') {
-            ti += 1;
-            pi += 1;
-        } else if (pi < pattern.len and pattern[pi] == '%') {
-            star_pi = pi;
-            star_ti = ti;
-            pi += 1;
-        } else if (pi < pattern.len and pattern[pi] == text[ti]) {
-            ti += 1;
-            pi += 1;
-        } else if (star_pi) |sp| {
-            pi = sp + 1;
-            star_ti += 1;
-            ti = star_ti;
-        } else {
-            return false;
-        }
-    }
-    while (pi < pattern.len and pattern[pi] == '%') {
-        pi += 1;
-    }
-    return pi == pattern.len;
 }
 
 // ── Tests ────────────────────────────────────────────────────────
