@@ -387,7 +387,7 @@ pub const Parser = struct {
 
     fn isArithmeticOp(self: *Self) bool {
         return switch (self.current.type) {
-            .op_plus, .op_minus, .op_star, .op_slash => true,
+            .op_plus, .op_minus, .op_star, .op_slash, .op_concat => true,
             else => false,
         };
     }
@@ -407,14 +407,25 @@ pub const Parser = struct {
             left = expr;
         }
 
-        // Then handle additive ops
-        while (self.current.type == .op_plus or self.current.type == .op_minus) {
-            const op: ast.ArithOp = if (self.current.type == .op_plus) .add else .sub;
-            self.advance();
-            const right = try self.parseMultiplicative();
-            const expr = try alloc.create(ast.Expression);
-            expr.* = .{ .arithmetic = .{ .left = left, .op = op, .right = right } };
-            left = expr;
+        // Then handle additive ops and concat
+        while (self.current.type == .op_plus or self.current.type == .op_minus or self.current.type == .op_concat) {
+            if (self.current.type == .op_concat) {
+                self.advance();
+                const right = try self.parseMultiplicative();
+                const args = try alloc.alloc(*const ast.Expression, 2);
+                args[0] = left;
+                args[1] = right;
+                const expr = try alloc.create(ast.Expression);
+                expr.* = .{ .function_call = .{ .func = .concat, .args = args } };
+                left = expr;
+            } else {
+                const op: ast.ArithOp = if (self.current.type == .op_plus) .add else .sub;
+                self.advance();
+                const right = try self.parseMultiplicative();
+                const expr = try alloc.create(ast.Expression);
+                expr.* = .{ .arithmetic = .{ .left = left, .op = op, .right = right } };
+                left = expr;
+            }
         }
 
         return left;
@@ -745,13 +756,25 @@ pub const Parser = struct {
         var left = try self.parseMultiplicative();
         const alloc = self.arena();
 
-        while (self.current.type == .op_plus or self.current.type == .op_minus) {
-            const op: ast.ArithOp = if (self.current.type == .op_plus) .add else .sub;
-            self.advance();
-            const right = try self.parseMultiplicative();
-            const expr = try alloc.create(ast.Expression);
-            expr.* = .{ .arithmetic = .{ .left = left, .op = op, .right = right } };
-            left = expr;
+        while (self.current.type == .op_plus or self.current.type == .op_minus or self.current.type == .op_concat) {
+            if (self.current.type == .op_concat) {
+                // Desugar `a || b` into concat(a, b)
+                self.advance();
+                const right = try self.parseMultiplicative();
+                const args = try alloc.alloc(*const ast.Expression, 2);
+                args[0] = left;
+                args[1] = right;
+                const expr = try alloc.create(ast.Expression);
+                expr.* = .{ .function_call = .{ .func = .concat, .args = args } };
+                left = expr;
+            } else {
+                const op: ast.ArithOp = if (self.current.type == .op_plus) .add else .sub;
+                self.advance();
+                const right = try self.parseMultiplicative();
+                const expr = try alloc.create(ast.Expression);
+                expr.* = .{ .arithmetic = .{ .left = left, .op = op, .right = right } };
+                left = expr;
+            }
         }
 
         return left;
@@ -1932,4 +1955,39 @@ test "parse NOT BETWEEN" {
     const where = stmt.select.where_clause.?;
     try std.testing.expect(where.* == .not_expr);
     try std.testing.expect(where.not_expr.operand.* == .between_expr);
+}
+
+test "parse || concat in WHERE" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t WHERE a || b = 'hello'");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const where = stmt.select.where_clause.?;
+    try std.testing.expect(where.* == .comparison);
+    const lhs = where.comparison.left;
+    try std.testing.expect(lhs.* == .function_call);
+    try std.testing.expectEqual(ast.BuiltinFunction.concat, lhs.function_call.func);
+    try std.testing.expectEqual(@as(usize, 2), lhs.function_call.args.len);
+}
+
+test "parse || concat in SELECT column" {
+    var p = Parser.init(std.testing.allocator, "SELECT a || b FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    try std.testing.expect(stmt.select.columns[0] == .expression);
+    const expr = stmt.select.columns[0].expression;
+    try std.testing.expect(expr.* == .function_call);
+    try std.testing.expectEqual(ast.BuiltinFunction.concat, expr.function_call.func);
+}
+
+test "parse || concat chained" {
+    var p = Parser.init(std.testing.allocator, "SELECT a || b || c FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    try std.testing.expect(stmt.select.columns[0] == .expression);
+    const expr = stmt.select.columns[0].expression;
+    // (a || b) || c — outer is concat
+    try std.testing.expect(expr.* == .function_call);
+    try std.testing.expectEqual(ast.BuiltinFunction.concat, expr.function_call.func);
+    // left arg is also concat
+    try std.testing.expect(expr.function_call.args[0].* == .function_call);
 }

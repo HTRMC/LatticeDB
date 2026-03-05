@@ -6844,3 +6844,42 @@ test "executor NOT BETWEEN" {
     try std.testing.expectEqualStrings("1", r.rows.rows[0].values[0]);
     try std.testing.expectEqualStrings("15", r.rows.rows[1].values[0]);
 }
+
+test "executor || concat operator" {
+    const test_file = "test_exec_concat_op.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (first TEXT, last TEXT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES ('hello', ' world'), ('foo', 'bar')");
+    exec.freeResult(ins);
+
+    // || in SELECT
+    const r1 = try exec.execute("SELECT first || last FROM t");
+    defer exec.freeResult(r1);
+    try std.testing.expectEqual(@as(usize, 2), r1.rows.rows.len);
+    try std.testing.expectEqualStrings("hello world", r1.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("foobar", r1.rows.rows[1].values[0]);
+
+    // || in WHERE
+    const r2 = try exec.execute("SELECT * FROM t WHERE first || last = 'foobar'");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqual(@as(usize, 1), r2.rows.rows.len);
+    try std.testing.expectEqualStrings("foo", r2.rows.rows[0].values[0]);
+
+    // chained ||
+    const r3 = try exec.execute("SELECT first || ' ' || last FROM t");
+    defer exec.freeResult(r3);
+    try std.testing.expectEqualStrings("hello  world", r3.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("foo bar", r3.rows.rows[1].values[0]);
+}

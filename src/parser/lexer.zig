@@ -134,6 +134,7 @@ pub const TokenType = enum {
     op_minus, // -
     op_star, // *
     op_slash, // /
+    op_concat, // ||
 
     // Punctuation
     left_paren, // (
@@ -297,6 +298,14 @@ pub const Lexer = struct {
             '/' => {
                 self.pos += 1;
                 return .{ .type = .op_slash, .text = "/", .position = start };
+            },
+            '|' => {
+                self.pos += 1;
+                if (self.pos < self.input.len and self.input[self.pos] == '|') {
+                    self.pos += 1;
+                    return .{ .type = .op_concat, .text = "||", .position = start };
+                }
+                return .{ .type = .invalid, .text = self.input[start..self.pos], .position = start };
             },
             '=' => {
                 self.pos += 1;
@@ -680,4 +689,21 @@ test "lexer negative number as minus then integer" {
     const t2 = lexer.nextToken();
     try std.testing.expectEqual(TokenType.integer_literal, t2.type);
     try std.testing.expectEqualStrings("42", t2.text);
+}
+
+test "lexer concat operator ||" {
+    var lexer = Lexer.init("a || b");
+    const t1 = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.identifier, t1.type);
+    const t2 = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.op_concat, t2.type);
+    try std.testing.expectEqualStrings("||", t2.text);
+    const t3 = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.identifier, t3.type);
+}
+
+test "lexer single pipe is invalid" {
+    var lexer = Lexer.init("|");
+    const t1 = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.invalid, t1.type);
 }
