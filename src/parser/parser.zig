@@ -158,7 +158,23 @@ pub const Parser = struct {
         }
 
         try self.expect(.kw_from);
-        const table_name = try self.expectIdentifier();
+
+        // Check for derived table: FROM (SELECT ...) [AS] alias
+        var subquery: ?*const ast.Select = null;
+        var table_name: []const u8 = undefined;
+        if (self.current.type == .left_paren) {
+            self.advance();
+            const sub = try self.parseSelect();
+            try self.expect(.right_paren);
+            const sub_ptr = try alloc.create(ast.Select);
+            sub_ptr.* = sub;
+            subquery = sub_ptr;
+            // Expect alias
+            if (self.current.type == .kw_as) self.advance();
+            table_name = try self.expectIdentifier();
+        } else {
+            table_name = try self.expectIdentifier();
+        }
 
         // Optional JOIN clauses
         var joins: ?[]const ast.JoinClause = null;
@@ -273,6 +289,7 @@ pub const Parser = struct {
             .aliases = if (has_aliases) alias_list.toOwnedSlice(alloc) catch return ParseError.OutOfMemory else null,
             .distinct = distinct,
             .table_name = table_name,
+            .subquery = subquery,
             .joins = joins,
             .where_clause = where,
             .group_by = group_by,

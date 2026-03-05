@@ -261,6 +261,7 @@ pub const Select = struct {
     aliases: ?[]const ?[]const u8, // parallel to columns: alias name or null
     distinct: bool,
     table_name: []const u8,
+    subquery: ?*const Select = null, // FROM (SELECT ...) AS alias
     joins: ?[]const JoinClause,
     where_clause: ?*const Expression,
     group_by: ?[]const []const u8,

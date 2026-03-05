@@ -1254,7 +1254,106 @@ pub const Executor = struct {
         self.allocator.free(row.values);
     }
 
+    fn execDerivedTable(self: *Self, outer_sel: ast.Select, sub: *const ast.Select) ExecError!ExecResult {
+        // Execute the subquery
+        const sub_result = try self.execSelect(sub.*);
+        defer self.freeResult(sub_result);
+
+        const sub_rows = sub_result.rows;
+
+        // Resolve column indices in subquery result
+        const out_col_count = outer_sel.columns.len;
+        const col_indices = self.allocator.alloc(usize, out_col_count) catch return ExecError.OutOfMemory;
+        defer self.allocator.free(col_indices);
+        var all_star = false;
+
+        for (outer_sel.columns, 0..) |col, i| {
+            switch (col) {
+                .all_columns => {
+                    all_star = true;
+                    break;
+                },
+                .named => |name| {
+                    var found = false;
+                    for (sub_rows.columns, 0..) |sc, si| {
+                        if (std.ascii.eqlIgnoreCase(sc, name)) {
+                            col_indices[i] = si;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) return ExecError.ColumnNotFound;
+                },
+                else => return ExecError.ColumnNotFound,
+            }
+        }
+
+        // Build result
+        const num_out_cols = if (all_star) sub_rows.columns.len else out_col_count;
+        var result_rows: std.ArrayList(ResultRow) = .empty;
+
+        for (sub_rows.rows) |row| {
+            // Apply WHERE filter if any (by building a virtual schema)
+            const out_vals = self.allocator.alloc([]const u8, num_out_cols) catch return ExecError.OutOfMemory;
+            if (all_star) {
+                for (0..num_out_cols) |ci| {
+                    out_vals[ci] = self.allocator.dupe(u8, row.values[ci]) catch return ExecError.OutOfMemory;
+                }
+            } else {
+                for (0..out_col_count) |ci| {
+                    out_vals[ci] = self.allocator.dupe(u8, row.values[col_indices[ci]]) catch return ExecError.OutOfMemory;
+                }
+            }
+            result_rows.append(self.allocator, .{ .values = out_vals }) catch return ExecError.OutOfMemory;
+        }
+
+        // Build column names
+        const col_names = self.allocator.alloc([]const u8, num_out_cols) catch return ExecError.OutOfMemory;
+        if (all_star) {
+            for (sub_rows.columns, 0..) |sc, i| {
+                col_names[i] = self.allocator.dupe(u8, sc) catch return ExecError.OutOfMemory;
+            }
+        } else {
+            for (outer_sel.columns, 0..) |col, i| {
+                const alias_name = if (outer_sel.aliases) |aliases| (if (i < aliases.len) aliases[i] else null) else null;
+                col_names[i] = if (alias_name) |a|
+                    self.allocator.dupe(u8, a) catch return ExecError.OutOfMemory
+                else switch (col) {
+                    .named => |name| self.allocator.dupe(u8, name) catch return ExecError.OutOfMemory,
+                    else => self.allocator.dupe(u8, "?") catch return ExecError.OutOfMemory,
+                };
+            }
+        }
+
+        // Apply LIMIT/OFFSET
+        var rows = result_rows.toOwnedSlice(self.allocator) catch return ExecError.OutOfMemory;
+        const offset = outer_sel.offset orelse 0;
+        if (offset > 0 and offset < rows.len) {
+            for (rows[0..@intCast(offset)]) |row| self.freeRow(row);
+            const remaining = self.allocator.alloc(ResultRow, rows.len - @as(usize, @intCast(offset))) catch return ExecError.OutOfMemory;
+            @memcpy(remaining, rows[@intCast(offset)..]);
+            self.allocator.free(rows);
+            rows = remaining;
+        }
+        if (outer_sel.limit) |lim| {
+            if (lim < rows.len) {
+                for (rows[@intCast(lim)..]) |row| self.freeRow(row);
+                const limited = self.allocator.alloc(ResultRow, @intCast(lim)) catch return ExecError.OutOfMemory;
+                @memcpy(limited, rows[0..@intCast(lim)]);
+                self.allocator.free(rows);
+                rows = limited;
+            }
+        }
+
+        return ExecResult{ .rows = .{ .columns = col_names, .rows = rows } };
+    }
+
     fn execSelect(self: *Self, sel: ast.Select) ExecError!ExecResult {
+        // Handle derived table: FROM (SELECT ...) AS alias
+        if (sel.subquery) |sub| {
+            return self.execDerivedTable(sel, sub);
+        }
+
         // Route to JOIN handler if joins are present
         if (sel.joins) |join_list| {
             if (join_list.len > 0) {
@@ -8031,4 +8130,37 @@ test "executor CHECK constraint" {
     defer exec.freeResult(r);
     try std.testing.expectEqual(@as(usize, 1), r.rows.rows.len);
     try std.testing.expectEqualStrings("25", r.rows.rows[0].values[0]);
+}
+
+test "executor derived table (FROM subquery)" {
+    const test_file = "test_exec_derived.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')");
+    exec.freeResult(ins);
+
+    // SELECT * FROM (SELECT id, name FROM t) AS sub
+    const r = try exec.execute("SELECT * FROM (SELECT id, name FROM t) AS sub");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 3), r.rows.rows.len);
+    try std.testing.expectEqualStrings("1", r.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("alice", r.rows.rows[0].values[1]);
+
+    // SELECT name FROM (SELECT id, name FROM t) AS sub
+    const r2 = try exec.execute("SELECT name FROM (SELECT id, name FROM t) AS sub");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqual(@as(usize, 1), r2.rows.columns.len);
+    try std.testing.expectEqualStrings("alice", r2.rows.rows[0].values[0]);
 }
