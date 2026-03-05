@@ -64,7 +64,7 @@ pub const Parser = struct {
                 }
                 break :blk ast.Statement{ .select = sel };
             },
-            .kw_insert => ast.Statement{ .insert = try self.parseInsert() },
+            .kw_insert => try self.parseInsert(),
             .kw_update => ast.Statement{ .update = try self.parseUpdate() },
             .kw_delete => ast.Statement{ .delete = try self.parseDelete() },
             .kw_create => blk: {
@@ -260,10 +260,17 @@ pub const Parser = struct {
     // ============================================================
     // INSERT INTO table VALUES (val, val, ...)
     // ============================================================
-    fn parseInsert(self: *Self) ParseError!ast.Insert {
+    fn parseInsert(self: *Self) ParseError!ast.Statement {
         try self.expect(.kw_insert);
         try self.expect(.kw_into);
         const table_name = try self.expectIdentifier();
+
+        // INSERT INTO ... SELECT ...
+        if (self.current.type == .kw_select) {
+            const query = try self.parseSelect();
+            return .{ .insert_select = .{ .table_name = table_name, .query = query } };
+        }
+
         try self.expect(.kw_values);
 
         const alloc = self.arena();
@@ -274,10 +281,10 @@ pub const Parser = struct {
             rows.append(alloc, try self.parseValueRow()) catch return ParseError.OutOfMemory;
         }
 
-        return .{
+        return .{ .insert = .{
             .table_name = table_name,
             .rows = rows.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
-        };
+        } };
     }
 
     fn parseValueRow(self: *Self) ParseError![]const ast.LiteralValue {
@@ -2019,4 +2026,14 @@ test "parse UNION ALL" {
     const stmt = try p.parse();
     try std.testing.expect(stmt == .union_query);
     try std.testing.expect(stmt.union_query.all);
+}
+
+test "parse INSERT INTO SELECT" {
+    var p = Parser.init(std.testing.allocator, "INSERT INTO t2 SELECT x FROM t1 WHERE x > 5");
+    defer p.deinit();
+    const stmt = try p.parse();
+    try std.testing.expect(stmt == .insert_select);
+    try std.testing.expectEqualStrings("t2", stmt.insert_select.table_name);
+    try std.testing.expectEqualStrings("t1", stmt.insert_select.query.table_name);
+    try std.testing.expect(stmt.insert_select.query.where_clause != null);
 }

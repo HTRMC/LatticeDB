@@ -193,6 +193,7 @@ pub const Statement = union(enum) {
     create_table: CreateTable,
     create_index: CreateIndex,
     insert: Insert,
+    insert_select: InsertSelect,
     select: Select,
     update: Update,
     delete: Delete,
@@ -214,6 +215,11 @@ pub const CreateTable = struct {
 pub const Insert = struct {
     table_name: []const u8,
     rows: []const []const LiteralValue,
+};
+
+pub const InsertSelect = struct {
+    table_name: []const u8,
+    query: Select,
 };
 
 pub const OrderByClause = struct {

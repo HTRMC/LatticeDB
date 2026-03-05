@@ -124,6 +124,7 @@ pub const Executor = struct {
             .create_table => |ct| self.execCreateTable(ct),
             .create_index => |ci| self.execCreateIndex(ci),
             .insert => |ins| self.execInsertWithParams(ins, params),
+            .insert_select => |is| self.execInsertSelect(is),
             .select => |sel| self.execSelectWithParams(sel, params),
             .update => |upd| self.execUpdateWithParams(upd, params),
             .delete => |del| self.execDeleteWithParams(del, params),
@@ -151,6 +152,7 @@ pub const Executor = struct {
             .create_table => |ct| self.execCreateTable(ct),
             .create_index => |ci| self.execCreateIndex(ci),
             .insert => |ins| self.execInsert(ins),
+            .insert_select => |is| self.execInsertSelect(is),
             .select => |sel| self.execSelect(sel),
             .update => |upd| self.execUpdate(upd),
             .delete => |del| self.execDelete(del),
@@ -812,6 +814,75 @@ pub const Executor = struct {
     // ============================================================
     // INSERT INTO
     // ============================================================
+    fn execInsertSelect(self: *Self, is: ast.InsertSelect) ExecError!ExecResult {
+        // Execute the SELECT query
+        const select_result = try self.execSelect(is.query);
+        const sel_rows = select_result.rows;
+        defer {
+            for (sel_rows.rows) |row| {
+                for (row.values) |v| self.allocator.free(v);
+                self.allocator.free(row.values);
+            }
+            self.allocator.free(sel_rows.rows);
+            for (sel_rows.columns) |col| self.allocator.free(col);
+            self.allocator.free(sel_rows.columns);
+        }
+
+        // Open target table
+        const result = self.catalog.openTable(is.table_name) catch {
+            return ExecError.StorageError;
+        } orelse return ExecError.TableNotFound;
+        defer self.catalog.freeSchema(result.schema);
+        var table = result.table;
+        table.txn_manager = self.txn_manager;
+        table.undo_log = self.undo_log;
+        const schema = result.schema;
+
+        // Column count must match
+        if (sel_rows.columns.len != schema.columns.len) {
+            return ExecError.ColumnCountMismatch;
+        }
+
+        const values = self.allocator.alloc(Value, schema.columns.len) catch {
+            return ExecError.OutOfMemory;
+        };
+        defer self.allocator.free(values);
+
+        const txn = self.current_txn orelse self.beginImplicitTxn();
+
+        var row_count: usize = 0;
+        for (sel_rows.rows) |row| {
+            for (row.values, schema.columns, 0..) |str_val, col, i| {
+                values[i] = strToValue(str_val, col.col_type) catch {
+                    self.abortImplicitTxn(txn);
+                    return ExecError.TypeMismatch;
+                };
+            }
+
+            const tid = table.insertTuple(txn, values) catch {
+                self.abortImplicitTxn(txn);
+                return ExecError.StorageError;
+            };
+
+            self.maintainIndexesInsert(table.table_id, schema, values, tid);
+            row_count += 1;
+        }
+
+        self.commitImplicitTxn(txn);
+        return .{ .row_count = row_count };
+    }
+
+    fn strToValue(str: []const u8, col_type: ColumnType) !Value {
+        if (std.mem.eql(u8, str, "NULL")) return .{ .null_value = {} };
+        return switch (col_type) {
+            .boolean => Value{ .boolean = std.mem.eql(u8, str, "true") },
+            .integer => Value{ .integer = std.fmt.parseInt(i32, str, 10) catch return error.TypeMismatch },
+            .bigint => Value{ .bigint = std.fmt.parseInt(i64, str, 10) catch return error.TypeMismatch },
+            .float => Value{ .float = std.fmt.parseFloat(f64, str) catch return error.TypeMismatch },
+            .varchar, .text => Value{ .bytes = str },
+        };
+    }
+
     fn execInsert(self: *Self, ins: ast.Insert) ExecError!ExecResult {
         return self.execInsertImpl(ins);
     }
@@ -7023,4 +7094,40 @@ test "executor UNION ALL keeps duplicates" {
     try std.testing.expectEqualStrings("2", r.rows.rows[3].values[0]);
     try std.testing.expectEqualStrings("3", r.rows.rows[4].values[0]);
     try std.testing.expectEqualStrings("4", r.rows.rows[5].values[0]);
+}
+
+test "executor INSERT INTO SELECT" {
+    const test_file = "test_exec_insert_select.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct1 = try exec.execute("CREATE TABLE src (x INT, name TEXT)");
+    exec.freeResult(ct1);
+    const ct2 = try exec.execute("CREATE TABLE dst (x INT, name TEXT)");
+    exec.freeResult(ct2);
+    const ins = try exec.execute("INSERT INTO src VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')");
+    exec.freeResult(ins);
+
+    // INSERT INTO dst SELECT * FROM src WHERE x > 1
+    const r1 = try exec.execute("INSERT INTO dst SELECT * FROM src WHERE x > 1");
+    defer exec.freeResult(r1);
+    try std.testing.expectEqual(@as(u64, 2), r1.row_count);
+
+    // Verify dst has the right rows
+    const r2 = try exec.execute("SELECT * FROM dst");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqual(@as(usize, 2), r2.rows.rows.len);
+    try std.testing.expectEqualStrings("2", r2.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("bob", r2.rows.rows[0].values[1]);
+    try std.testing.expectEqualStrings("3", r2.rows.rows[1].values[0]);
+    try std.testing.expectEqualStrings("charlie", r2.rows.rows[1].values[1]);
 }
