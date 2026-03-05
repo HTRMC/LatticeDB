@@ -708,7 +708,7 @@ pub const Executor = struct {
         sel: ast.Select,
         table: *Table,
         schema: *const Schema,
-        col_indices: []const usize,
+        col_proj: []const ProjectionColumn,
         txn: ?*Transaction,
         rows: *std.ArrayList(ResultRow),
     ) bool {
@@ -732,28 +732,28 @@ pub const Executor = struct {
                 // Point lookup: single key
                 const tid = btree.search(key) catch return false;
                 if (tid) |t| {
-                    self.fetchAndAppendRow(table, t, txn, sel, schema, col_indices, rows) catch return false;
+                    self.fetchAndAppendRow(table, t, txn, sel, schema, col_proj, rows) catch return false;
                 }
             },
             .range => |r| {
                 // Range scan [low, high]
                 var range_iter = btree.rangeScan(r.low, r.high) catch return false;
                 while (range_iter.next() catch return false) |entry| {
-                    self.fetchAndAppendRow(table, entry.tid, txn, sel, schema, col_indices, rows) catch return false;
+                    self.fetchAndAppendRow(table, entry.tid, txn, sel, schema, col_proj, rows) catch return false;
                 }
             },
             .range_from => |key| {
                 // key >= value → scan from key to max
                 var range_iter = btree.rangeScan(key, std.math.maxInt(i32)) catch return false;
                 while (range_iter.next() catch return false) |entry| {
-                    self.fetchAndAppendRow(table, entry.tid, txn, sel, schema, col_indices, rows) catch return false;
+                    self.fetchAndAppendRow(table, entry.tid, txn, sel, schema, col_proj, rows) catch return false;
                 }
             },
             .range_to => |key| {
                 // key <= value → scan from min to key
                 var range_iter = btree.rangeScan(std.math.minInt(i32), key) catch return false;
                 while (range_iter.next() catch return false) |entry| {
-                    self.fetchAndAppendRow(table, entry.tid, txn, sel, schema, col_indices, rows) catch return false;
+                    self.fetchAndAppendRow(table, entry.tid, txn, sel, schema, col_proj, rows) catch return false;
                 }
             },
         }
@@ -779,7 +779,7 @@ pub const Executor = struct {
         txn: ?*Transaction,
         sel: ast.Select,
         schema: *const Schema,
-        col_indices: []const usize,
+        col_proj: []const ProjectionColumn,
         rows: *std.ArrayList(ResultRow),
     ) !void {
         // Fetch tuple with MVCC visibility
@@ -798,10 +798,10 @@ pub const Executor = struct {
         }
 
         // Format selected columns
-        const formatted = try self.allocator.alloc([]const u8, col_indices.len);
+        const formatted = try self.allocator.alloc([]const u8, col_proj.len);
         errdefer self.allocator.free(formatted);
-        for (col_indices, 0..) |ci, i| {
-            formatted[i] = try formatValue(self.allocator, vals[ci]);
+        for (col_proj, 0..) |cp, i| {
+            formatted[i] = try expr_eval.formatProjection(self.allocator, cp, vals, schema, self.current_params);
         }
 
         try rows.append(self.allocator, .{ .values = formatted });
@@ -908,17 +908,18 @@ pub const Executor = struct {
             return self.execSelectAggregate(sel, &table, schema);
         }
 
-        // Determine which column indices to output
-        const col_indices = try self.resolveSelectColumns(sel.columns, schema);
-        defer self.allocator.free(col_indices);
+        // Determine which columns to output
+        const col_proj = try self.resolveSelectColumns(sel.columns, schema);
+        defer self.allocator.free(col_proj);
 
         // Build column name headers (prefer alias if present)
-        const col_names = self.allocator.alloc([]const u8, col_indices.len) catch {
+        const col_names = self.allocator.alloc([]const u8, col_proj.len) catch {
             return ExecError.OutOfMemory;
         };
-        for (col_indices, 0..) |ci, i| {
+        var func_name_buf: [32]u8 = undefined;
+        for (col_proj, 0..) |cp, i| {
             const alias_name = if (sel.aliases) |aliases| (if (i < aliases.len) aliases[i] else null) else null;
-            const name_src = alias_name orelse schema.columns[ci].name;
+            const name_src = alias_name orelse expr_eval.projectionColumnName(cp, schema, &func_name_buf);
             col_names[i] = self.allocator.dupe(u8, name_src) catch {
                 for (col_names[0..i]) |cn| self.allocator.free(cn);
                 self.allocator.free(col_names);
@@ -949,7 +950,7 @@ pub const Executor = struct {
         }
 
         // Try index scan first
-        const used_index = self.tryIndexScan(sel, &table, schema, col_indices, txn, &rows);
+        const used_index = self.tryIndexScan(sel, &table, schema, col_proj, txn, &rows);
 
         if (!used_index) {
             // Planner chose seq_scan — try vectorized execution (reuse already-opened table)
@@ -995,14 +996,14 @@ pub const Executor = struct {
                 }
 
                 // Format selected columns
-                const formatted = self.allocator.alloc([]const u8, col_indices.len) catch {
+                const formatted = self.allocator.alloc([]const u8, col_proj.len) catch {
                     for (col_names) |cn| self.allocator.free(cn);
                     self.allocator.free(col_names);
                     self.abortImplicitTxn(txn);
                     return ExecError.OutOfMemory;
                 };
-                for (col_indices, 0..) |ci, i| {
-                    formatted[i] = formatValue(self.allocator, row.values[ci]) catch {
+                for (col_proj, 0..) |cp, i| {
+                    formatted[i] = expr_eval.formatProjection(self.allocator, cp, row.values, schema, self.current_params) catch {
                         for (formatted[0..i]) |f| self.allocator.free(f);
                         self.allocator.free(formatted);
                         for (col_names) |cn| self.allocator.free(cn);
@@ -1778,13 +1779,16 @@ pub const Executor = struct {
         const combined_schema: *const Schema = &combined_schema_val;
 
         // Resolve output columns (with table name context for qualified refs)
-        const col_indices = try self.resolveSelectColumnsJoin(sel.columns, combined_schema, sel.table_name, join.table_name, left_schema.columns.len);
-        defer self.allocator.free(col_indices);
+        const col_proj = try self.resolveSelectColumnsJoin(sel.columns, combined_schema, sel.table_name, join.table_name, left_schema.columns.len);
+        defer self.allocator.free(col_proj);
 
         // Build column headers
-        const col_names = self.allocator.alloc([]const u8, col_indices.len) catch return ExecError.OutOfMemory;
-        for (col_indices, 0..) |ci, i| {
-            col_names[i] = self.allocator.dupe(u8, combined_cols[ci].name) catch {
+        var join_func_buf: [32]u8 = undefined;
+        const col_names = self.allocator.alloc([]const u8, col_proj.len) catch return ExecError.OutOfMemory;
+        for (col_proj, 0..) |cp, i| {
+            const alias_name = if (sel.aliases) |aliases| (if (i < aliases.len) aliases[i] else null) else null;
+            const name_src = alias_name orelse expr_eval.projectionColumnName(cp, combined_schema, &join_func_buf);
+            col_names[i] = self.allocator.dupe(u8, name_src) catch {
                 for (col_names[0..i]) |cn| self.allocator.free(cn);
                 self.allocator.free(col_names);
                 return ExecError.OutOfMemory;
@@ -1872,11 +1876,11 @@ pub const Executor = struct {
                                     // WHERE failed, not a match
                                 } else {
                                     matched = true;
-                                    try self.formatAndAppendJoinRow(col_indices, combined_values, &rows);
+                                    try self.formatAndAppendJoinRow(col_proj, combined_schema, combined_values, &rows);
                                 }
                             } else {
                                 matched = true;
-                                try self.formatAndAppendJoinRow(col_indices, combined_values, &rows);
+                                try self.formatAndAppendJoinRow(col_proj, combined_schema, combined_values, &rows);
                             }
                         }
                     }
@@ -1894,7 +1898,7 @@ pub const Executor = struct {
                         true;
 
                     if (emit) {
-                        try self.formatAndAppendJoinRow(col_indices, combined_values, &rows);
+                        try self.formatAndAppendJoinRow(col_proj, combined_schema, combined_values, &rows);
                     }
                 }
 
@@ -1912,7 +1916,7 @@ pub const Executor = struct {
                 right_schema,
                 combined_schema,
                 combined_count,
-                col_indices,
+                col_proj,
                 txn,
                 &rows,
             );
@@ -1985,7 +1989,7 @@ pub const Executor = struct {
                     }
 
                     matched = true;
-                    try self.formatAndAppendJoinRow(col_indices, combined_values, &rows);
+                    try self.formatAndAppendJoinRow(col_proj, combined_schema, combined_values, &rows);
                 }
 
                 // LEFT JOIN: emit row with NULLs for right side if no match
@@ -2000,7 +2004,7 @@ pub const Executor = struct {
                         true;
 
                     if (emit) {
-                        try self.formatAndAppendJoinRow(col_indices, combined_values, &rows);
+                        try self.formatAndAppendJoinRow(col_proj, combined_schema, combined_values, &rows);
                     }
                 }
 
@@ -2035,7 +2039,7 @@ pub const Executor = struct {
         right_schema: *const Schema,
         combined_schema: *const Schema,
         combined_count: usize,
-        col_indices: []const usize,
+        col_proj: []const ProjectionColumn,
         txn: ?*Transaction,
         rows: *std.ArrayList(ResultRow),
     ) ExecError!void {
@@ -2142,7 +2146,7 @@ pub const Executor = struct {
 
                                 if (emit) {
                                     matched = true;
-                                    self.formatAndAppendJoinRow(col_indices, combined_values, rows) catch {
+                                    self.formatAndAppendJoinRow(col_proj, combined_schema, combined_values, rows) catch {
                                         self.allocator.free(combined_values);
                                         return ExecError.OutOfMemory;
                                     };
@@ -2168,7 +2172,7 @@ pub const Executor = struct {
                         true;
 
                     if (emit) {
-                        self.formatAndAppendJoinRow(col_indices, combined_values, rows) catch {
+                        self.formatAndAppendJoinRow(col_proj, combined_schema, combined_values, rows) catch {
                             self.allocator.free(combined_values);
                             return ExecError.OutOfMemory;
                         };
@@ -2183,14 +2187,15 @@ pub const Executor = struct {
     /// Format selected columns from combined values and append to result rows.
     fn formatAndAppendJoinRow(
         self: *Self,
-        col_indices: []const usize,
+        col_proj: []const ProjectionColumn,
+        combined_schema: *const Schema,
         combined_values: []const Value,
         rows: *std.ArrayList(ResultRow),
     ) ExecError!void {
-        const formatted = self.allocator.alloc([]const u8, col_indices.len) catch return ExecError.OutOfMemory;
+        const formatted = self.allocator.alloc([]const u8, col_proj.len) catch return ExecError.OutOfMemory;
         errdefer self.allocator.free(formatted);
-        for (col_indices, 0..) |ci, i| {
-            formatted[i] = formatValue(self.allocator, combined_values[ci]) catch {
+        for (col_proj, 0..) |cp, i| {
+            formatted[i] = expr_eval.formatProjection(self.allocator, cp, combined_values, combined_schema, self.current_params) catch {
                 for (formatted[0..i]) |f| self.allocator.free(f);
                 self.allocator.free(formatted);
                 return ExecError.OutOfMemory;
@@ -2735,7 +2740,9 @@ pub const Executor = struct {
     // Helpers
     // ============================================================
 
-    fn resolveSelectColumns(self: *Self, sel_cols: []const ast.SelectColumn, schema: *const Schema) ExecError![]usize {
+    const ProjectionColumn = expr_eval.ProjectionColumn;
+
+    fn resolveSelectColumns(self: *Self, sel_cols: []const ast.SelectColumn, schema: *const Schema) ExecError![]ProjectionColumn {
         return self.resolveSelectColumnsJoin(sel_cols, schema, null, null, 0);
     }
 
@@ -2746,19 +2753,19 @@ pub const Executor = struct {
         left_table: ?[]const u8,
         right_table: ?[]const u8,
         left_col_count: usize,
-    ) ExecError![]usize {
+    ) ExecError![]ProjectionColumn {
         if (sel_cols.len == 1 and sel_cols[0] == .all_columns) {
             // SELECT * — all columns
-            const indices = self.allocator.alloc(usize, schema.columns.len) catch {
+            const proj = self.allocator.alloc(ProjectionColumn, schema.columns.len) catch {
                 return ExecError.OutOfMemory;
             };
             for (0..schema.columns.len) |i| {
-                indices[i] = i;
+                proj[i] = .{ .index = i };
             }
-            return indices;
+            return proj;
         }
 
-        const indices = self.allocator.alloc(usize, sel_cols.len) catch {
+        const proj = self.allocator.alloc(ProjectionColumn, sel_cols.len) catch {
             return ExecError.OutOfMemory;
         };
 
@@ -2768,18 +2775,17 @@ pub const Executor = struct {
                     var found = false;
                     for (schema.columns, 0..) |col, ci| {
                         if (std.ascii.eqlIgnoreCase(col.name, name)) {
-                            indices[i] = ci;
+                            proj[i] = .{ .index = ci };
                             found = true;
                             break;
                         }
                     }
                     if (!found) {
-                        self.allocator.free(indices);
+                        self.allocator.free(proj);
                         return ExecError.ColumnNotFound;
                     }
                 },
                 .qualified => |q| {
-                    // Determine which table region to search
                     var search_start: usize = 0;
                     var search_end: usize = schema.columns.len;
                     if (left_table != null and right_table != null) {
@@ -2792,24 +2798,27 @@ pub const Executor = struct {
                     var found = false;
                     for (schema.columns[search_start..search_end], search_start..) |col, ci| {
                         if (std.ascii.eqlIgnoreCase(col.name, q.column)) {
-                            indices[i] = ci;
+                            proj[i] = .{ .index = ci };
                             found = true;
                             break;
                         }
                     }
                     if (!found) {
-                        self.allocator.free(indices);
+                        self.allocator.free(proj);
                         return ExecError.ColumnNotFound;
                     }
                 },
+                .expression => |expr| {
+                    proj[i] = .{ .expression = expr };
+                },
                 else => {
-                    self.allocator.free(indices);
+                    self.allocator.free(proj);
                     return ExecError.ColumnNotFound;
                 },
             }
         }
 
-        return indices;
+        return proj;
     }
 
     fn mapDataType(dt: ast.DataType) ColumnType {

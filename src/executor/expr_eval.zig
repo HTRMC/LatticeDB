@@ -5,6 +5,68 @@ const tuple_mod = @import("../storage/tuple.zig");
 const Value = tuple_mod.Value;
 const Schema = tuple_mod.Schema;
 
+/// Describes how to produce one output column: either a direct index or a computed expression.
+pub const ProjectionColumn = union(enum) {
+    /// Direct column from the row
+    index: usize,
+    /// Computed expression
+    expression: *const ast.Expression,
+};
+
+/// Format a single projection column from row values to a string.
+pub fn formatProjection(
+    allocator: std.mem.Allocator,
+    proj: ProjectionColumn,
+    values: []const Value,
+    schema: *const Schema,
+    params: ?[]const ast.LiteralValue,
+) ![]const u8 {
+    switch (proj) {
+        .index => |ci| return formatValue(allocator, values[ci]),
+        .expression => |expr| {
+            const result = evalExprToValue(allocator, expr, schema, values, params);
+            defer result.deinit(allocator);
+            return formatValue(allocator, result.value);
+        },
+    }
+}
+
+pub fn formatValue(allocator: std.mem.Allocator, val: Value) ![]const u8 {
+    return switch (val) {
+        .null_value => try allocator.dupe(u8, "NULL"),
+        .boolean => |b| try allocator.dupe(u8, if (b) "true" else "false"),
+        .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+        .bigint => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+        .float => |f| try std.fmt.allocPrint(allocator, "{d:.6}", .{f}),
+        .bytes => |s| try allocator.dupe(u8, s),
+    };
+}
+
+/// Get the display name for a projection column.
+pub fn projectionColumnName(proj: ProjectionColumn, schema: *const Schema, func_name_buf: *[32]u8) []const u8 {
+    switch (proj) {
+        .index => |ci| return schema.columns[ci].name,
+        .expression => |expr| {
+            switch (expr.*) {
+                .function_call => |fc| {
+                    const name = switch (fc.func) {
+                        .lower => "lower",
+                        .upper => "upper",
+                        .trim => "trim",
+                        .length => "length",
+                        .substring => "substring",
+                        .concat => "concat",
+                    };
+                    return name;
+                },
+                .case_expr => return "case",
+                else => return "?expr?",
+            }
+        },
+    }
+    _ = func_name_buf;
+}
+
 /// Result of evaluating an expression — tracks whether the value's bytes are owned.
 pub const ExprResult = struct {
     value: Value,
