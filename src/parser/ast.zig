@@ -249,6 +249,7 @@ pub const Select = struct {
     having_clause: ?*const Expression,
     order_by: ?[]const OrderByClause,
     limit: ?u64,
+    offset: ?u64,
 };
 
 pub const Delete = struct {

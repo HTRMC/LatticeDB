@@ -225,13 +225,20 @@ pub const Parser = struct {
             order_by = order_cols.toOwnedSlice(alloc) catch return ParseError.OutOfMemory;
         }
 
-        // Optional LIMIT n
+        // Optional LIMIT n [OFFSET m]
         var limit: ?u64 = null;
+        var offset: ?u64 = null;
         if (self.current.type == .kw_limit) {
             self.advance();
             if (self.current.type != .integer_literal) return ParseError.UnexpectedToken;
             limit = std.fmt.parseInt(u64, self.current.text, 10) catch return ParseError.InvalidSyntax;
             self.advance();
+            if (self.current.type == .kw_offset) {
+                self.advance();
+                if (self.current.type != .integer_literal) return ParseError.UnexpectedToken;
+                offset = std.fmt.parseInt(u64, self.current.text, 10) catch return ParseError.InvalidSyntax;
+                self.advance();
+            }
         }
 
         // Check if any aliases were set
@@ -254,6 +261,7 @@ pub const Parser = struct {
             .having_clause = having,
             .order_by = order_by,
             .limit = limit,
+            .offset = offset,
         };
     }
 
@@ -2036,4 +2044,20 @@ test "parse INSERT INTO SELECT" {
     try std.testing.expectEqualStrings("t2", stmt.insert_select.table_name);
     try std.testing.expectEqualStrings("t1", stmt.insert_select.query.table_name);
     try std.testing.expect(stmt.insert_select.query.where_clause != null);
+}
+
+test "parse LIMIT OFFSET" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t LIMIT 10 OFFSET 20");
+    defer p.deinit();
+    const stmt = try p.parse();
+    try std.testing.expectEqual(@as(u64, 10), stmt.select.limit.?);
+    try std.testing.expectEqual(@as(u64, 20), stmt.select.offset.?);
+}
+
+test "parse LIMIT without OFFSET" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t LIMIT 5");
+    defer p.deinit();
+    const stmt = try p.parse();
+    try std.testing.expectEqual(@as(u64, 5), stmt.select.limit.?);
+    try std.testing.expect(stmt.select.offset == null);
 }

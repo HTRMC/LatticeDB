@@ -254,6 +254,7 @@ pub const Executor = struct {
             .having_clause = null,
             .order_by = null,
             .limit = null,
+            .offset = null,
         };
 
         // Run planner
@@ -1207,7 +1208,8 @@ pub const Executor = struct {
 
             // Top-N optimization: when ORDER BY + LIMIT, use bounded partial sort
             if (sel.limit) |limit_val| {
-                const n: usize = @intCast(@min(limit_val, rows.items.len));
+                const offset_val = sel.offset orelse 0;
+                const n: usize = @intCast(@min(limit_val + offset_val, rows.items.len));
                 if (n > 0 and n < rows.items.len) {
                     // Bounded sort: maintain a sorted window of size N
                     // First, sort the first N elements (initial window)
@@ -1337,6 +1339,20 @@ pub const Executor = struct {
                 }
             }
             rows.shrinkRetainingCapacity(write_idx);
+        }
+
+        // OFFSET: skip rows
+        if (sel.offset) |offset_val| {
+            const off: usize = @intCast(@min(offset_val, rows.items.len));
+            // Free skipped rows
+            for (rows.items[0..off]) |row| {
+                for (row.values) |v| self.allocator.free(v);
+                self.allocator.free(row.values);
+            }
+            // Shift remaining rows down
+            const remaining = rows.items.len - off;
+            std.mem.copyForwards(ResultRow, rows.items[0..remaining], rows.items[off..]);
+            rows.shrinkRetainingCapacity(remaining);
         }
 
         // LIMIT: truncate (skip if already applied by Top-N)
@@ -7130,4 +7146,38 @@ test "executor INSERT INTO SELECT" {
     try std.testing.expectEqualStrings("bob", r2.rows.rows[0].values[1]);
     try std.testing.expectEqualStrings("3", r2.rows.rows[1].values[0]);
     try std.testing.expectEqualStrings("charlie", r2.rows.rows[1].values[1]);
+}
+
+test "executor LIMIT OFFSET" {
+    const test_file = "test_exec_offset.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (x INT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)");
+    exec.freeResult(ins);
+
+    // LIMIT 2 OFFSET 2 -> rows 3, 4
+    const r = try exec.execute("SELECT * FROM t LIMIT 2 OFFSET 2");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 2), r.rows.rows.len);
+    try std.testing.expectEqualStrings("3", r.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("4", r.rows.rows[1].values[0]);
+
+    // LIMIT 10 OFFSET 3 -> rows 4, 5
+    const r2 = try exec.execute("SELECT * FROM t LIMIT 10 OFFSET 3");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqual(@as(usize, 2), r2.rows.rows.len);
+    try std.testing.expectEqualStrings("4", r2.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("5", r2.rows.rows[1].values[0]);
 }

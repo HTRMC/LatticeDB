@@ -203,6 +203,7 @@ pub fn execSelectVectorized(
     }
 
     const limit: ?usize = if (sel.limit) |l| @intCast(l) else null;
+    const offset: ?usize = if (sel.offset) |o| @intCast(o) else null;
 
     // === ORDER BY path: deferred materialization with Value-based sorting ===
     if (sel.order_by) |order_clauses| {
@@ -263,10 +264,23 @@ pub fn execSelectVectorized(
         // Directly format matching rows to strings (no intermediate Value collection)
         try materializeChunkDirect(allocator, chunk, col_indices, &rows);
 
-        // Early termination for LIMIT
+        // Early termination for LIMIT+OFFSET
         if (limit) |lim| {
-            if (rows.items.len >= lim) break;
+            const need = lim + (offset orelse 0);
+            if (rows.items.len >= need) break;
         }
+    }
+
+    // OFFSET
+    if (offset) |off| {
+        const skip = @min(off, rows.items.len);
+        for (rows.items[0..skip]) |row| {
+            for (row.values) |v| allocator.free(v);
+            allocator.free(row.values);
+        }
+        const remaining = rows.items.len - skip;
+        std.mem.copyForwards(ResultRow, rows.items[0..remaining], rows.items[skip..]);
+        rows.shrinkRetainingCapacity(remaining);
     }
 
     // LIMIT
@@ -399,9 +413,10 @@ fn execVectorizedWithOrderBy(
     }
 
     // Top-N optimization: when ORDER BY + LIMIT, use bounded partial sort
+    const offset_val: usize = if (sel.offset) |o| @intCast(o) else 0;
     var order_by_applied = false;
     if (limit) |lim| {
-        const n: usize = @min(lim, collected.items.len);
+        const n: usize = @min(lim + offset_val, collected.items.len);
         if (n > 0 and n < collected.items.len) {
             const items = collected.items;
             {
@@ -453,6 +468,15 @@ fn execVectorizedWithOrderBy(
             .clauses = order_clauses,
             .indices = order_indices,
         }, SortCtx.lessThan);
+    }
+
+    // OFFSET
+    if (offset_val > 0) {
+        const skip = @min(offset_val, collected.items.len);
+        for (collected.items[0..skip]) |row| freeCollectedRow(allocator, row);
+        const remaining = collected.items.len - skip;
+        std.mem.copyForwards(CollectedRow, collected.items[0..remaining], collected.items[skip..]);
+        collected.shrinkRetainingCapacity(remaining);
     }
 
     // LIMIT
