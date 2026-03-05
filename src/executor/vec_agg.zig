@@ -24,6 +24,7 @@ const GroupState = struct {
     str_maxs: []?[]const u8,
     non_null_counts: []u64,
     group_values: [][]const u8,
+    distinct_sets: []?std.StringHashMapUnmanaged(void),
 };
 
 /// Vectorized hash aggregate operator.
@@ -34,6 +35,7 @@ pub const VecHashAggregate = struct {
     num_cols: usize,
     agg_col_indices: []?usize,
     group_by_indices: []usize,
+    distinct_flags: []bool,
     groups: std.StringArrayHashMap(GroupState),
     // Reusable key buffer to avoid per-row allocation
     key_buf: std.ArrayList(u8) = .empty,
@@ -81,6 +83,15 @@ pub const VecHashAggregate = struct {
             }
         }
 
+        // Build distinct flags
+        const distinct_flags = try allocator.alloc(bool, num_cols);
+        for (sel.columns, 0..) |col, i| {
+            distinct_flags[i] = switch (col) {
+                .aggregate => |a| a.distinct,
+                else => false,
+            };
+        }
+
         var agg = VecHashAggregate{
             .allocator = allocator,
             .sel = sel,
@@ -88,13 +99,14 @@ pub const VecHashAggregate = struct {
             .num_cols = num_cols,
             .agg_col_indices = agg_col_indices,
             .group_by_indices = group_by_indices,
+            .distinct_flags = distinct_flags,
             .groups = std.StringArrayHashMap(GroupState).init(allocator),
         };
 
         // For non-GROUP BY aggregates, create a single group
         if (group_by_indices.len == 0) {
             const empty_vals = try allocator.alloc([]const u8, 0);
-            const state = try initGroupState(allocator, num_cols, empty_vals);
+            const state = try initGroupState(allocator, num_cols, empty_vals, distinct_flags);
             const key = try allocator.dupe(u8, "");
             try agg.groups.put(key, state);
         }
@@ -109,6 +121,7 @@ pub const VecHashAggregate = struct {
         self.groups.deinit();
         if (self.group_by_indices.len > 0) self.allocator.free(self.group_by_indices);
         self.allocator.free(self.agg_col_indices);
+        self.allocator.free(self.distinct_flags);
     }
 
     /// Consume a DataChunk, accumulating values into groups.
@@ -150,7 +163,7 @@ pub const VecHashAggregate = struct {
                         return;
                     };
                 }
-                gop.value_ptr.* = initGroupState(self.allocator, self.num_cols, gv) catch {
+                gop.value_ptr.* = initGroupState(self.allocator, self.num_cols, gv, self.distinct_flags) catch {
                     for (gv) |v| self.allocator.free(v);
                     self.allocator.free(gv);
                     return;
@@ -199,8 +212,9 @@ pub const VecHashAggregate = struct {
                         .min => "min",
                         .max => "max",
                     };
+                    const dist_prefix: []const u8 = if (agg.distinct) "DISTINCT " else "";
                     break :blk if (agg.column) |cn|
-                        std.fmt.allocPrint(allocator, "{s}({s})", .{ func_name, cn }) catch return ExecError.OutOfMemory
+                        std.fmt.allocPrint(allocator, "{s}({s}{s})", .{ func_name, dist_prefix, cn }) catch return ExecError.OutOfMemory
                     else
                         std.fmt.allocPrint(allocator, "{s}(*)", .{func_name}) catch return ExecError.OutOfMemory;
                 },
@@ -270,12 +284,20 @@ pub const VecHashAggregate = struct {
         for (state.str_maxs) |s| if (s) |v| self.allocator.free(v);
         self.allocator.free(state.str_maxs);
         self.allocator.free(state.non_null_counts);
+        for (0..state.distinct_sets.len) |di| {
+            if (state.distinct_sets[di]) |*set| {
+                var it = set.keyIterator();
+                while (it.next()) |k| self.allocator.free(k.*);
+                set.deinit(self.allocator);
+            }
+        }
+        self.allocator.free(state.distinct_sets);
         for (state.group_values) |gv| self.allocator.free(gv);
         self.allocator.free(state.group_values);
     }
 };
 
-fn initGroupState(allocator: std.mem.Allocator, num_cols: usize, group_vals: [][]const u8) !GroupState {
+fn initGroupState(allocator: std.mem.Allocator, num_cols: usize, group_vals: [][]const u8, distinct_flags: []const bool) !GroupState {
     var state: GroupState = .{
         .count = 0,
         .sums = try allocator.alloc(f64, num_cols),
@@ -285,6 +307,7 @@ fn initGroupState(allocator: std.mem.Allocator, num_cols: usize, group_vals: [][
         .str_maxs = try allocator.alloc(?[]const u8, num_cols),
         .non_null_counts = try allocator.alloc(u64, num_cols),
         .group_values = group_vals,
+        .distinct_sets = try allocator.alloc(?std.StringHashMapUnmanaged(void), num_cols),
     };
     for (0..num_cols) |i| {
         state.sums[i] = 0;
@@ -293,12 +316,27 @@ fn initGroupState(allocator: std.mem.Allocator, num_cols: usize, group_vals: [][
         state.str_mins[i] = null;
         state.str_maxs[i] = null;
         state.non_null_counts[i] = 0;
+        state.distinct_sets[i] = if (distinct_flags.len > i and distinct_flags[i]) std.StringHashMapUnmanaged(void).empty else null;
     }
     return state;
 }
 
 fn accumulateAgg(allocator: std.mem.Allocator, state: *GroupState, col_idx: usize, val: Value) void {
     if (val == .null_value) return;
+
+    // For DISTINCT aggregates, check if value already seen
+    if (state.distinct_sets[col_idx]) |*set| {
+        const key = formatValue(allocator, val) catch return;
+        const gop = set.getOrPut(allocator, key) catch {
+            allocator.free(key);
+            return;
+        };
+        if (gop.found_existing) {
+            allocator.free(key);
+            return;
+        }
+    }
+
     state.non_null_counts[col_idx] += 1;
 
     const num_val: ?f64 = switch (val) {

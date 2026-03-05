@@ -404,6 +404,12 @@ pub const Parser = struct {
             self.advance(); // consume function name
             try self.expect(.left_paren);
 
+            var distinct = false;
+            if (self.current.type == .kw_distinct) {
+                distinct = true;
+                self.advance();
+            }
+
             var column: ?[]const u8 = null;
             if (self.current.type == .op_star) {
                 // COUNT(*)
@@ -413,7 +419,7 @@ pub const Parser = struct {
             }
 
             try self.expect(.right_paren);
-            return .{ .aggregate = .{ .func = func, .column = column } };
+            return .{ .aggregate = .{ .func = func, .column = column, .distinct = distinct } };
         }
 
         // Check for CASE or scalar function — parse as expression column
@@ -1369,6 +1375,17 @@ test "parse SELECT with aggregates" {
         try std.testing.expectEqual(ast.AggregateFunc.count, sel.columns[0].aggregate.func);
         try std.testing.expectEqualStrings("name", sel.columns[0].aggregate.column.?);
     }
+}
+
+test "parse COUNT(DISTINCT col)" {
+    var p = Parser.init(std.testing.allocator, "SELECT COUNT(DISTINCT name) FROM users");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    const agg = sel.columns[0].aggregate;
+    try std.testing.expectEqual(ast.AggregateFunc.count, agg.func);
+    try std.testing.expectEqualStrings("name", agg.column.?);
+    try std.testing.expect(agg.distinct);
 }
 
 test "parse SELECT with GROUP BY" {

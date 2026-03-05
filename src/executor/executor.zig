@@ -1442,9 +1442,10 @@ pub const Executor = struct {
         str_maxs: []?[]const u8,
         non_null_counts: []u64,
         group_values: [][]const u8, // formatted GROUP BY column values
+        distinct_sets: []?std.StringHashMapUnmanaged(void), // per-column distinct value sets
     };
 
-    fn initGroupState(allocator: std.mem.Allocator, num_cols: usize, group_vals: [][]const u8) ExecError!GroupState {
+    fn initGroupState(allocator: std.mem.Allocator, num_cols: usize, group_vals: [][]const u8, distinct_flags: []const bool) ExecError!GroupState {
         var state: GroupState = .{
             .count = 0,
             .sums = allocator.alloc(f64, num_cols) catch return ExecError.OutOfMemory,
@@ -1454,6 +1455,7 @@ pub const Executor = struct {
             .str_maxs = allocator.alloc(?[]const u8, num_cols) catch return ExecError.OutOfMemory,
             .non_null_counts = allocator.alloc(u64, num_cols) catch return ExecError.OutOfMemory,
             .group_values = group_vals,
+            .distinct_sets = allocator.alloc(?std.StringHashMapUnmanaged(void), num_cols) catch return ExecError.OutOfMemory,
         };
         for (0..num_cols) |i| {
             state.sums[i] = 0;
@@ -1462,6 +1464,7 @@ pub const Executor = struct {
             state.str_mins[i] = null;
             state.str_maxs[i] = null;
             state.non_null_counts[i] = 0;
+            state.distinct_sets[i] = if (distinct_flags.len > i and distinct_flags[i]) std.StringHashMapUnmanaged(void).empty else null;
         }
         return state;
     }
@@ -1475,12 +1478,34 @@ pub const Executor = struct {
         for (state.str_maxs) |s| if (s) |v| self.allocator.free(v);
         self.allocator.free(state.str_maxs);
         self.allocator.free(state.non_null_counts);
+        for (0..state.distinct_sets.len) |di| {
+            if (state.distinct_sets[di]) |*set| {
+                var it = set.keyIterator();
+                while (it.next()) |k| self.allocator.free(k.*);
+                set.deinit(self.allocator);
+            }
+        }
+        self.allocator.free(state.distinct_sets);
         for (state.group_values) |gv| self.allocator.free(gv);
         self.allocator.free(state.group_values);
     }
 
     fn accumulateAgg(self: *Self, state: *GroupState, col_idx: usize, val: Value) void {
         if (val == .null_value) return;
+
+        // For DISTINCT aggregates, check if value already seen
+        if (state.distinct_sets[col_idx]) |*set| {
+            const key = formatValue(self.allocator, val) catch return;
+            const gop = set.getOrPut(self.allocator, key) catch {
+                self.allocator.free(key);
+                return;
+            };
+            if (gop.found_existing) {
+                self.allocator.free(key);
+                return; // skip duplicate
+            }
+        }
+
         state.non_null_counts[col_idx] += 1;
 
         const num_val: ?f64 = switch (val) {
@@ -1599,6 +1624,16 @@ pub const Executor = struct {
 
         const has_group_by = group_by_indices.len > 0;
 
+        // Build distinct flags for each column
+        const distinct_flags = self.allocator.alloc(bool, num_cols) catch return ExecError.OutOfMemory;
+        defer self.allocator.free(distinct_flags);
+        for (sel.columns, 0..) |col, i| {
+            distinct_flags[i] = switch (col) {
+                .aggregate => |agg| agg.distinct,
+                else => false,
+            };
+        }
+
         // Use explicit txn or begin implicit for read
         const txn = self.current_txn orelse self.beginImplicitTxn();
 
@@ -1613,7 +1648,7 @@ pub const Executor = struct {
         // For non-GROUP BY aggregates, use a single group with empty key
         if (!has_group_by) {
             const empty_vals = self.allocator.alloc([]const u8, 0) catch return ExecError.OutOfMemory;
-            const state = initGroupState(self.allocator, num_cols, empty_vals) catch return ExecError.OutOfMemory;
+            const state = initGroupState(self.allocator, num_cols, empty_vals, distinct_flags) catch return ExecError.OutOfMemory;
             const key = self.allocator.dupe(u8, "") catch return ExecError.OutOfMemory;
             groups.put(key, state) catch return ExecError.OutOfMemory;
         }
@@ -1684,7 +1719,7 @@ pub const Executor = struct {
                         return ExecError.OutOfMemory;
                     };
                 }
-                const state = initGroupState(self.allocator, num_cols, gv) catch {
+                const state = initGroupState(self.allocator, num_cols, gv, distinct_flags) catch {
                     for (gv) |v| self.allocator.free(v);
                     self.allocator.free(gv);
                     self.allocator.free(group_key);
@@ -1761,8 +1796,9 @@ pub const Executor = struct {
                         .min => "min",
                         .max => "max",
                     };
+                    const dist_prefix: []const u8 = if (agg.distinct) "DISTINCT " else "";
                     break :blk if (agg.column) |cn|
-                        std.fmt.allocPrint(self.allocator, "{s}({s})", .{ func_name, cn }) catch return ExecError.OutOfMemory
+                        std.fmt.allocPrint(self.allocator, "{s}({s}{s})", .{ func_name, dist_prefix, cn }) catch return ExecError.OutOfMemory
                     else
                         std.fmt.allocPrint(self.allocator, "{s}(*)", .{func_name}) catch return ExecError.OutOfMemory;
                 },
@@ -7585,4 +7621,76 @@ test "executor NOT NULL with DEFAULT" {
     try std.testing.expectEqual(@as(usize, 1), r.rows.rows.len);
     try std.testing.expectEqualStrings("1", r.rows.rows[0].values[0]);
     try std.testing.expectEqualStrings("active", r.rows.rows[0].values[1]);
+}
+
+test "executor COUNT(DISTINCT col)" {
+    const test_file = "test_exec_count_distinct.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (category TEXT, val INT)");
+    exec.freeResult(ct);
+
+    const ins = try exec.execute("INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', 1), ('b', 1), ('a', 1)");
+    exec.freeResult(ins);
+
+    // COUNT(DISTINCT category) should be 2
+    const r1 = try exec.execute("SELECT COUNT(DISTINCT category) FROM t");
+    defer exec.freeResult(r1);
+    try std.testing.expectEqualStrings("2", r1.rows.rows[0].values[0]);
+
+    // COUNT(DISTINCT val) should be 2
+    const r2 = try exec.execute("SELECT COUNT(DISTINCT val) FROM t");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqualStrings("2", r2.rows.rows[0].values[0]);
+
+    // Regular COUNT(val) should be 5
+    const r3 = try exec.execute("SELECT COUNT(val) FROM t");
+    defer exec.freeResult(r3);
+    try std.testing.expectEqualStrings("5", r3.rows.rows[0].values[0]);
+
+    // SUM(DISTINCT val) should be 3 (1 + 2)
+    const r4 = try exec.execute("SELECT SUM(DISTINCT val) FROM t");
+    defer exec.freeResult(r4);
+    try std.testing.expectEqualStrings("3.000000", r4.rows.rows[0].values[0]);
+}
+
+test "executor COUNT(DISTINCT) with GROUP BY" {
+    const test_file = "test_exec_count_distinct_gb.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (category TEXT, val INT)");
+    exec.freeResult(ct);
+
+    const ins = try exec.execute("INSERT INTO t VALUES ('a', 1), ('a', 2), ('a', 1), ('b', 3), ('b', 3)");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT category, COUNT(DISTINCT val) FROM t GROUP BY category");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 2), r.rows.rows.len);
+    // Group 'a' has distinct vals {1, 2} = 2
+    try std.testing.expectEqualStrings("a", r.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("2", r.rows.rows[0].values[1]);
+    // Group 'b' has distinct vals {3} = 1
+    try std.testing.expectEqualStrings("b", r.rows.rows[1].values[0]);
+    try std.testing.expectEqualStrings("1", r.rows.rows[1].values[1]);
 }

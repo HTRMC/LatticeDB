@@ -184,6 +184,7 @@ pub const SelectColumn = union(enum) {
     aggregate: struct {
         func: AggregateFunc,
         column: ?[]const u8, // null for COUNT(*)
+        distinct: bool = false,
     },
     /// SELECT expression (function call, CASE, etc.)
     expression: *const Expression,
