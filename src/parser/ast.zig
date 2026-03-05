@@ -214,6 +214,7 @@ pub const CreateTable = struct {
 
 pub const Insert = struct {
     table_name: []const u8,
+    columns: ?[]const []const u8, // optional column list
     rows: []const []const LiteralValue,
 };
 

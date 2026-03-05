@@ -913,23 +913,64 @@ pub const Executor = struct {
         };
         defer self.allocator.free(values);
 
+        // Resolve column mapping if column list is specified
+        var col_map: ?[]const usize = null;
+        defer if (col_map) |cm| self.allocator.free(cm);
+        if (ins.columns) |col_names| {
+            const map = self.allocator.alloc(usize, col_names.len) catch return ExecError.OutOfMemory;
+            for (col_names, 0..) |name, i| {
+                var found = false;
+                for (schema.columns, 0..) |sc, si| {
+                    if (std.mem.eql(u8, sc.name, name)) {
+                        map[i] = si;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    self.allocator.free(map);
+                    return ExecError.ColumnNotFound;
+                }
+            }
+            col_map = map;
+        }
+
         // Use explicit txn or auto-commit
         const txn = self.current_txn orelse self.beginImplicitTxn();
 
         var row_count: usize = 0;
         for (ins.rows) |row_vals| {
-            // Check column count matches
-            if (row_vals.len != schema.columns.len) {
-                self.abortImplicitTxn(txn);
-                return ExecError.ColumnCountMismatch;
-            }
-
-            for (row_vals, schema.columns, 0..) |lit, col, i| {
-                const resolved = resolveParam(lit, self.current_params);
-                values[i] = litToValue(resolved, col.col_type) catch {
+            if (col_map) |map| {
+                // Column list: check value count matches column list length
+                if (row_vals.len != map.len) {
                     self.abortImplicitTxn(txn);
-                    return ExecError.TypeMismatch;
-                };
+                    return ExecError.ColumnCountMismatch;
+                }
+                // Fill all columns with NULL first
+                for (0..schema.columns.len) |i| {
+                    values[i] = .{ .null_value = {} };
+                }
+                // Place values at mapped positions
+                for (row_vals, map) |lit, target_idx| {
+                    const resolved = resolveParam(lit, self.current_params);
+                    values[target_idx] = litToValue(resolved, schema.columns[target_idx].col_type) catch {
+                        self.abortImplicitTxn(txn);
+                        return ExecError.TypeMismatch;
+                    };
+                }
+            } else {
+                // No column list: check value count matches schema
+                if (row_vals.len != schema.columns.len) {
+                    self.abortImplicitTxn(txn);
+                    return ExecError.ColumnCountMismatch;
+                }
+                for (row_vals, schema.columns, 0..) |lit, col, i| {
+                    const resolved = resolveParam(lit, self.current_params);
+                    values[i] = litToValue(resolved, col.col_type) catch {
+                        self.abortImplicitTxn(txn);
+                        return ExecError.TypeMismatch;
+                    };
+                }
             }
 
             const tid = table.insertTuple(txn, values) catch {
@@ -7180,4 +7221,33 @@ test "executor LIMIT OFFSET" {
     try std.testing.expectEqual(@as(usize, 2), r2.rows.rows.len);
     try std.testing.expectEqualStrings("4", r2.rows.rows[0].values[0]);
     try std.testing.expectEqualStrings("5", r2.rows.rows[1].values[0]);
+}
+
+test "executor INSERT with column list" {
+    const test_file = "test_exec_insert_cols.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (a INT, b TEXT, c INT)");
+    exec.freeResult(ct);
+
+    // Insert with only some columns — missing ones get NULL
+    const ins = try exec.execute("INSERT INTO t (b, a) VALUES ('hello', 42)");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT * FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 1), r.rows.rows.len);
+    try std.testing.expectEqualStrings("42", r.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("hello", r.rows.rows[0].values[1]);
+    try std.testing.expectEqualStrings("NULL", r.rows.rows[0].values[2]);
 }

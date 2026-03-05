@@ -272,6 +272,26 @@ pub const Parser = struct {
         try self.expect(.kw_insert);
         try self.expect(.kw_into);
         const table_name = try self.expectIdentifier();
+        const alloc = self.arena();
+
+        // Optional column list: INSERT INTO t (col1, col2) ...
+        var columns: ?[]const []const u8 = null;
+        if (self.current.type == .left_paren) {
+            // Could be column list or VALUES row — peek to distinguish
+            // Column list starts with identifier, values start with literal/minus
+            const next = self.lexer.peek();
+            if (next.type == .identifier) {
+                self.advance(); // consume (
+                var col_list: std.ArrayList([]const u8) = .empty;
+                col_list.append(alloc, try self.expectIdentifier()) catch return ParseError.OutOfMemory;
+                while (self.current.type == .comma) {
+                    self.advance();
+                    col_list.append(alloc, try self.expectIdentifier()) catch return ParseError.OutOfMemory;
+                }
+                try self.expect(.right_paren);
+                columns = col_list.toOwnedSlice(alloc) catch return ParseError.OutOfMemory;
+            }
+        }
 
         // INSERT INTO ... SELECT ...
         if (self.current.type == .kw_select) {
@@ -281,7 +301,6 @@ pub const Parser = struct {
 
         try self.expect(.kw_values);
 
-        const alloc = self.arena();
         var rows: std.ArrayList([]const ast.LiteralValue) = .empty;
         rows.append(alloc, try self.parseValueRow()) catch return ParseError.OutOfMemory;
         while (self.current.type == .comma) {
@@ -291,6 +310,7 @@ pub const Parser = struct {
 
         return .{ .insert = .{
             .table_name = table_name,
+            .columns = columns,
             .rows = rows.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
         } };
     }
@@ -2060,4 +2080,15 @@ test "parse LIMIT without OFFSET" {
     const stmt = try p.parse();
     try std.testing.expectEqual(@as(u64, 5), stmt.select.limit.?);
     try std.testing.expect(stmt.select.offset == null);
+}
+
+test "parse INSERT with column list" {
+    var p = Parser.init(std.testing.allocator, "INSERT INTO t (a, b) VALUES (1, 2)");
+    defer p.deinit();
+    const stmt = try p.parse();
+    try std.testing.expect(stmt == .insert);
+    const cols = stmt.insert.columns.?;
+    try std.testing.expectEqual(@as(usize, 2), cols.len);
+    try std.testing.expectEqualStrings("a", cols[0]);
+    try std.testing.expectEqualStrings("b", cols[1]);
 }
