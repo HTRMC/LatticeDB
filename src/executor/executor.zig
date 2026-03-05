@@ -40,6 +40,7 @@ pub const ExecError = error{
     IndexAlreadyExists,
     NotNullViolation,
     CheckViolation,
+    ForeignKeyViolation,
 };
 
 /// A result row — an array of string-formatted values
@@ -60,6 +61,12 @@ pub const ExecResult = union(enum) {
     },
 };
 
+pub const FkDef = struct {
+    column: []const u8, // local column name
+    ref_table: []const u8, // referenced table name
+    ref_column: []const u8, // referenced column name
+};
+
 pub const Executor = struct {
     allocator: std.mem.Allocator,
     catalog: *Catalog,
@@ -75,6 +82,8 @@ pub const Executor = struct {
     check_constraints: std.StringHashMapUnmanaged([]const []const u8) = .empty,
     /// In-memory view definitions (view_name → SELECT SQL text)
     views: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// In-memory foreign key constraints (child_table → []FkDef)
+    foreign_keys: std.StringHashMapUnmanaged([]const FkDef) = .empty,
 
     const Self = @This();
 
@@ -112,6 +121,18 @@ pub const Executor = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.views.deinit(self.allocator);
+
+        var fkit = self.foreign_keys.iterator();
+        while (fkit.next()) |entry| {
+            for (entry.value_ptr.*) |fk| {
+                self.allocator.free(fk.column);
+                self.allocator.free(fk.ref_table);
+                self.allocator.free(fk.ref_column);
+            }
+            self.allocator.free(entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.foreign_keys.deinit(self.allocator);
     }
 
     /// A prepared statement that can be executed multiple times with different parameters.
@@ -553,6 +574,20 @@ pub const Executor = struct {
             self.check_constraints.put(self.allocator, name_copy, exprs) catch return ExecError.OutOfMemory;
         }
 
+        // Store FOREIGN KEY constraints in memory
+        if (ct.foreign_keys.len > 0) {
+            const fks = self.allocator.alloc(FkDef, ct.foreign_keys.len) catch return ExecError.OutOfMemory;
+            for (ct.foreign_keys, 0..) |fk, i| {
+                fks[i] = .{
+                    .column = self.allocator.dupe(u8, fk.column) catch return ExecError.OutOfMemory,
+                    .ref_table = self.allocator.dupe(u8, fk.ref_table) catch return ExecError.OutOfMemory,
+                    .ref_column = self.allocator.dupe(u8, fk.ref_column) catch return ExecError.OutOfMemory,
+                };
+            }
+            const name_copy = self.allocator.dupe(u8, ct.table_name) catch return ExecError.OutOfMemory;
+            self.foreign_keys.put(self.allocator, name_copy, fks) catch return ExecError.OutOfMemory;
+        }
+
         const msg = std.fmt.allocPrint(self.allocator, "CREATE TABLE", .{}) catch {
             return ExecError.OutOfMemory;
         };
@@ -644,6 +679,138 @@ pub const Executor = struct {
             }
         }
         return true;
+    }
+
+    fn validateForeignKeys(self: *Self, fks: []const FkDef, schema: *const Schema, values: []const Value) bool {
+        for (fks) |fk| {
+            // Find the local column index
+            var local_idx: ?usize = null;
+            for (schema.columns, 0..) |col, ci| {
+                if (std.mem.eql(u8, col.name, fk.column)) {
+                    local_idx = ci;
+                    break;
+                }
+            }
+            const idx = local_idx orelse continue;
+            const val = values[idx];
+
+            // NULL values pass FK checks
+            if (val == .null_value) continue;
+
+            // Open the referenced table and check if value exists
+            const ref_result = self.catalog.openTable(fk.ref_table) catch continue;
+            if (ref_result) |res| {
+                defer self.catalog.freeSchema(res.schema);
+                var ref_table = res.table;
+                ref_table.txn_manager = self.txn_manager;
+                ref_table.undo_log = self.undo_log;
+
+                // Find referenced column index
+                var ref_idx: ?usize = null;
+                for (res.schema.columns, 0..) |col, ci| {
+                    if (std.mem.eql(u8, col.name, fk.ref_column)) {
+                        ref_idx = ci;
+                        break;
+                    }
+                }
+                const ri = ref_idx orelse continue;
+
+                // Scan referenced table for matching value
+                var found = false;
+                var scan_iter = ref_table.scanWithTxn(self.current_txn) catch continue;
+                while (scan_iter.next() catch null) |row| {
+                    if (ri < row.values.len and valuesEqual(val, row.values[ri])) {
+                        scan_iter.freeValues(row.values);
+                        found = true;
+                        break;
+                    }
+                    scan_iter.freeValues(row.values);
+                }
+                if (!found) return false;
+            } else {
+                return false; // referenced table doesn't exist
+            }
+        }
+        return true;
+    }
+
+    fn validateForeignKeyDelete(self: *Self, parent_table: []const u8, parent_schema: *const Schema, deleted_values: []const Value) bool {
+        // Check all FK definitions to find child tables referencing this parent
+        var fk_it = self.foreign_keys.iterator();
+        while (fk_it.next()) |entry| {
+            const fks = entry.value_ptr.*;
+            for (fks) |fk| {
+                if (!std.mem.eql(u8, fk.ref_table, parent_table)) continue;
+
+                // Find which column in parent is referenced
+                var parent_idx: ?usize = null;
+                for (parent_schema.columns, 0..) |col, ci| {
+                    if (std.mem.eql(u8, col.name, fk.ref_column)) {
+                        parent_idx = ci;
+                        break;
+                    }
+                }
+                const pi = parent_idx orelse continue;
+                const deleted_val = deleted_values[pi];
+                if (deleted_val == .null_value) continue;
+
+                // Open the child table and check for references
+                const child_name = entry.key_ptr.*;
+                const child_result = self.catalog.openTable(child_name) catch continue;
+                if (child_result) |res| {
+                    defer self.catalog.freeSchema(res.schema);
+                    var child_table = res.table;
+                    child_table.txn_manager = self.txn_manager;
+                    child_table.undo_log = self.undo_log;
+
+                    var child_idx: ?usize = null;
+                    for (res.schema.columns, 0..) |col, ci| {
+                        if (std.mem.eql(u8, col.name, fk.column)) {
+                            child_idx = ci;
+                            break;
+                        }
+                    }
+                    const ci = child_idx orelse continue;
+
+                    var scan_iter = child_table.scanWithTxn(self.current_txn) catch continue;
+                    while (scan_iter.next() catch null) |row| {
+                        if (ci < row.values.len and valuesEqual(deleted_val, row.values[ci])) {
+                            scan_iter.freeValues(row.values);
+                            return false;
+                        }
+                        scan_iter.freeValues(row.values);
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    fn valuesEqual(a: Value, b: Value) bool {
+        const tag_a = std.meta.activeTag(a);
+        const tag_b = std.meta.activeTag(b);
+        if (tag_a != tag_b) {
+            // Cross-type integer comparison
+            const int_a = switch (a) {
+                .integer => |v| @as(i64, v),
+                .bigint => |v| v,
+                else => return false,
+            };
+            const int_b = switch (b) {
+                .integer => |v| @as(i64, v),
+                .bigint => |v| v,
+                else => return false,
+            };
+            return int_a == int_b;
+        }
+        return switch (a) {
+            .integer => |v| v == b.integer,
+            .bigint => |v| v == b.bigint,
+            .float => |v| v == b.float,
+            .boolean => |v| v == b.boolean,
+            .bytes => |v| std.mem.eql(u8, v, b.bytes),
+            .null_value => true,
+        };
     }
 
     // ============================================================
@@ -1314,6 +1481,14 @@ pub const Executor = struct {
                 if (!self.validateChecks(checks, schema, values)) {
                     self.abortImplicitTxn(txn);
                     return ExecError.CheckViolation;
+                }
+            }
+
+            // Enforce FOREIGN KEY constraints
+            if (self.foreign_keys.get(ins.table_name)) |fks| {
+                if (!self.validateForeignKeys(fks, schema, values)) {
+                    self.abortImplicitTxn(txn);
+                    return ExecError.ForeignKeyViolation;
                 }
             }
 
@@ -3148,6 +3323,14 @@ pub const Executor = struct {
             self.abortImplicitTxn(txn);
             return ExecError.StorageError;
         };
+
+        // Enforce FOREIGN KEY: check no child rows reference deleted values
+        for (to_delete.items) |entry| {
+            if (!self.validateForeignKeyDelete(del.table_name, schema, entry.values)) {
+                self.abortImplicitTxn(txn);
+                return ExecError.ForeignKeyViolation;
+            }
+        }
 
         // Now delete collected tuples
         var deleted: u64 = 0;
@@ -8456,4 +8639,51 @@ test "executor CREATE VIEW duplicate name" {
     // View name same as existing table
     const err2 = exec.execute("CREATE VIEW t AS SELECT id FROM t");
     try std.testing.expectError(ExecError.TableAlreadyExists, err2);
+}
+
+test "executor FOREIGN KEY constraint" {
+    const test_file = "test_exec_fk.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+    defer exec.deinit();
+
+    // Create parent table
+    const ct1 = try exec.execute("CREATE TABLE departments (id INT PRIMARY KEY, name TEXT)");
+    exec.freeResult(ct1);
+    const ins1 = try exec.execute("INSERT INTO departments VALUES (1, 'Eng'), (2, 'Sales')");
+    exec.freeResult(ins1);
+
+    // Create child table with FK
+    const ct2 = try exec.execute("CREATE TABLE employees (id INT, name TEXT, dept_id INT, FOREIGN KEY (dept_id) REFERENCES departments(id))");
+    exec.freeResult(ct2);
+
+    // Valid FK insert
+    const ins2 = try exec.execute("INSERT INTO employees VALUES (1, 'Alice', 1)");
+    exec.freeResult(ins2);
+
+    // Invalid FK insert — dept_id 99 doesn't exist
+    const err = exec.execute("INSERT INTO employees VALUES (2, 'Bob', 99)");
+    try std.testing.expectError(ExecError.ForeignKeyViolation, err);
+
+    // NULL FK value should be allowed
+    const ins3 = try exec.execute("INSERT INTO employees (id, name) VALUES (3, 'Carol')");
+    exec.freeResult(ins3);
+
+    // Delete from parent that is referenced should fail
+    const del_err = exec.execute("DELETE FROM departments WHERE id = 1");
+    try std.testing.expectError(ExecError.ForeignKeyViolation, del_err);
+
+    // Delete from parent that is NOT referenced should succeed
+    const del = try exec.execute("DELETE FROM departments WHERE id = 2");
+    defer exec.freeResult(del);
+    try std.testing.expectEqual(@as(u64, 1), del.row_count);
 }

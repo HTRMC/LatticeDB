@@ -211,9 +211,16 @@ pub const Statement = union(enum) {
     alter_table: AlterTable,
     explain: Explain,
     union_query: UnionQuery,
+    create_view: CreateView,
+    drop_view: []const u8, // view name
     begin_txn: void,
     commit_txn: void,
     rollback_txn: void,
+};
+
+pub const CreateView = struct {
+    view_name: []const u8,
+    query: Select,
 };
 
 pub const CheckConstraint = struct {
@@ -221,10 +228,17 @@ pub const CheckConstraint = struct {
     expr: *const Expression,
 };
 
+pub const ForeignKey = struct {
+    column: []const u8, // local column
+    ref_table: []const u8, // referenced table
+    ref_column: []const u8, // referenced column
+};
+
 pub const CreateTable = struct {
     table_name: []const u8,
     columns: []const ColumnDef,
     checks: []const CheckConstraint = &.{},
+    foreign_keys: []const ForeignKey = &.{},
 };
 
 pub const Insert = struct {

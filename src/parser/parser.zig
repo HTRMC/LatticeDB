@@ -74,10 +74,17 @@ pub const Parser = struct {
             .kw_update => ast.Statement{ .update = try self.parseUpdate() },
             .kw_delete => ast.Statement{ .delete = try self.parseDelete() },
             .kw_create => blk: {
-                // Peek ahead to distinguish CREATE TABLE from CREATE [UNIQUE] INDEX
                 const next = self.lexer.peek();
                 if (next.type == .kw_index or next.type == .kw_unique) {
                     break :blk ast.Statement{ .create_index = try self.parseCreateIndex() };
+                }
+                if (next.type == .kw_view) {
+                    self.advance(); // consume CREATE
+                    self.advance(); // consume VIEW
+                    const view_name = try self.expectIdentifier();
+                    try self.expect(.kw_as);
+                    const query = try self.parseSelect();
+                    break :blk ast.Statement{ .create_view = .{ .view_name = view_name, .query = query } };
                 }
                 break :blk ast.Statement{ .create_table = try self.parseCreateTable() };
             },
@@ -85,6 +92,11 @@ pub const Parser = struct {
                 const next = self.lexer.peek();
                 if (next.type == .kw_index) {
                     break :blk ast.Statement{ .drop_index = try self.parseDropIndex() };
+                }
+                if (next.type == .kw_view) {
+                    self.advance(); // consume DROP
+                    self.advance(); // consume VIEW
+                    break :blk ast.Statement{ .drop_view = try self.expectIdentifier() };
                 }
                 break :blk ast.Statement{ .drop_table = try self.parseDropTable() };
             },
@@ -556,21 +568,50 @@ pub const Parser = struct {
         const alloc = self.arena();
         var cols: std.ArrayList(ast.ColumnDef) = .empty;
         var checks: std.ArrayList(ast.CheckConstraint) = .empty;
+        var fkeys: std.ArrayList(ast.ForeignKey) = .empty;
 
         // Parse column defs and table-level constraints
         while (true) {
             if (self.current.type == .kw_check or self.current.type == .kw_constraint) {
-                // Table-level CHECK constraint
+                // Table-level CHECK or CONSTRAINT name CHECK/FOREIGN KEY
                 var name: ?[]const u8 = null;
                 if (self.current.type == .kw_constraint) {
                     self.advance();
                     name = try self.expectIdentifier();
                 }
-                try self.expect(.kw_check);
+                if (self.current.type == .kw_foreign) {
+                    // FOREIGN KEY (col) REFERENCES table(col)
+                    self.advance(); // consume FOREIGN
+                    try self.expect(.kw_key);
+                    try self.expect(.left_paren);
+                    const fk_col = try self.expectIdentifier();
+                    try self.expect(.right_paren);
+                    try self.expect(.kw_references);
+                    const ref_table = try self.expectIdentifier();
+                    try self.expect(.left_paren);
+                    const ref_col = try self.expectIdentifier();
+                    try self.expect(.right_paren);
+                    fkeys.append(alloc, .{ .column = fk_col, .ref_table = ref_table, .ref_column = ref_col }) catch return ParseError.OutOfMemory;
+                } else {
+                    try self.expect(.kw_check);
+                    try self.expect(.left_paren);
+                    const expr = try self.parseExpression();
+                    try self.expect(.right_paren);
+                    checks.append(alloc, .{ .name = name, .expr = expr }) catch return ParseError.OutOfMemory;
+                }
+            } else if (self.current.type == .kw_foreign) {
+                // FOREIGN KEY (col) REFERENCES table(col)
+                self.advance(); // consume FOREIGN
+                try self.expect(.kw_key);
                 try self.expect(.left_paren);
-                const expr = try self.parseExpression();
+                const fk_col = try self.expectIdentifier();
                 try self.expect(.right_paren);
-                checks.append(alloc, .{ .name = name, .expr = expr }) catch return ParseError.OutOfMemory;
+                try self.expect(.kw_references);
+                const ref_table = try self.expectIdentifier();
+                try self.expect(.left_paren);
+                const ref_col = try self.expectIdentifier();
+                try self.expect(.right_paren);
+                fkeys.append(alloc, .{ .column = fk_col, .ref_table = ref_table, .ref_column = ref_col }) catch return ParseError.OutOfMemory;
             } else {
                 cols.append(alloc, try self.parseColumnDef()) catch return ParseError.OutOfMemory;
             }
@@ -584,6 +625,7 @@ pub const Parser = struct {
             .table_name = table_name,
             .columns = cols.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
             .checks = checks.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
+            .foreign_keys = fkeys.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
         };
     }
 
