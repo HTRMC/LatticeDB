@@ -625,18 +625,32 @@ pub const Parser = struct {
         }
 
         var is_primary_key = false;
-        if (self.current.type == .kw_primary) {
-            self.advance();
-            try self.expect(.kw_key);
-            is_primary_key = true;
+        var not_null = false;
+        var default_value: ?ast.LiteralValue = null;
+
+        // Parse optional constraints in any order: PRIMARY KEY, NOT NULL, DEFAULT
+        while (true) {
+            if (self.current.type == .kw_primary) {
+                self.advance();
+                try self.expect(.kw_key);
+                is_primary_key = true;
+            } else if (self.current.type == .kw_not) {
+                self.advance();
+                try self.expect(.kw_null);
+                not_null = true;
+            } else if (self.current.type == .kw_default) {
+                self.advance();
+                default_value = try self.parseLiteral();
+            } else break;
         }
 
         return .{
             .name = name,
             .data_type = data_type,
             .max_length = max_length,
-            .nullable = !is_primary_key,
+            .nullable = !is_primary_key and !not_null,
             .is_primary_key = is_primary_key,
+            .default_value = default_value,
         };
     }
 
@@ -1186,6 +1200,20 @@ test "parse CREATE TABLE" {
 
     try std.testing.expectEqualStrings("email", ct.columns[2].name);
     try std.testing.expectEqual(ast.DataType.text, ct.columns[2].data_type);
+}
+
+test "parse CREATE TABLE with NOT NULL" {
+    var parser = Parser.init(std.testing.allocator, "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL DEFAULT 'x', note TEXT)");
+    defer parser.deinit();
+
+    const stmt = try parser.parse();
+    const ct = stmt.create_table;
+
+    try std.testing.expect(!ct.columns[0].nullable);
+    try std.testing.expect(!ct.columns[0].is_primary_key);
+    try std.testing.expect(!ct.columns[1].nullable);
+    try std.testing.expectEqualStrings("x", ct.columns[1].default_value.?.string);
+    try std.testing.expect(ct.columns[2].nullable);
 }
 
 test "parse INSERT" {
@@ -2092,6 +2120,15 @@ test "parse LIMIT without OFFSET" {
     const stmt = try p.parse();
     try std.testing.expectEqual(@as(u64, 5), stmt.select.limit.?);
     try std.testing.expect(stmt.select.offset == null);
+}
+
+test "parse DEFAULT column" {
+    var p = Parser.init(std.testing.allocator, "CREATE TABLE t (x INT DEFAULT 42, name TEXT DEFAULT 'anon')");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const cols = stmt.create_table.columns;
+    try std.testing.expectEqual(@as(i64, 42), cols[0].default_value.?.integer);
+    try std.testing.expectEqualStrings("anon", cols[1].default_value.?.string);
 }
 
 test "parse RIGHT JOIN" {

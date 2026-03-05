@@ -38,6 +38,7 @@ pub const ExecError = error{
     WriteConflict,
     IndexNotFound,
     IndexAlreadyExists,
+    NotNullViolation,
 };
 
 /// A result row — an array of string-formatted values
@@ -504,6 +505,7 @@ pub const Executor = struct {
                 .col_type = mapDataType(col_def.data_type),
                 .max_length = col_def.max_length,
                 .nullable = col_def.nullable,
+                .default_value = if (col_def.default_value) |dv| litToValue(dv, mapDataType(col_def.data_type)) catch null else null,
             };
         }
 
@@ -946,9 +948,9 @@ pub const Executor = struct {
                     self.abortImplicitTxn(txn);
                     return ExecError.ColumnCountMismatch;
                 }
-                // Fill all columns with NULL first
-                for (0..schema.columns.len) |i| {
-                    values[i] = .{ .null_value = {} };
+                // Fill all columns with defaults or NULL
+                for (schema.columns, 0..) |col, i| {
+                    values[i] = col.default_value orelse .{ .null_value = {} };
                 }
                 // Place values at mapped positions
                 for (row_vals, map) |lit, target_idx| {
@@ -970,6 +972,14 @@ pub const Executor = struct {
                         self.abortImplicitTxn(txn);
                         return ExecError.TypeMismatch;
                     };
+                }
+            }
+
+            // Enforce NOT NULL constraints
+            for (schema.columns, values) |col, val| {
+                if (!col.nullable and val == .null_value) {
+                    self.abortImplicitTxn(txn);
+                    return ExecError.NotNullViolation;
                 }
             }
 
@@ -2736,6 +2746,14 @@ pub const Executor = struct {
                     }
                 } else {
                     new_values[ci] = expr_result.value;
+                }
+            }
+
+            // Enforce NOT NULL constraints on updated values
+            for (schema.columns, new_values) |col, val| {
+                if (!col.nullable and val == .null_value) {
+                    self.abortImplicitTxn(txn);
+                    return ExecError.NotNullViolation;
                 }
             }
 
@@ -7441,4 +7459,130 @@ test "executor CROSS JOIN" {
     const r = try exec.execute("SELECT * FROM t1 CROSS JOIN t2");
     defer exec.freeResult(r);
     try std.testing.expectEqual(@as(usize, 4), r.rows.rows.len);
+}
+
+test "executor DEFAULT column values" {
+    const test_file = "test_exec_default.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (x INT, status TEXT DEFAULT 'active', score INT DEFAULT 0)");
+    exec.freeResult(ct);
+
+    // Insert with only x — others get defaults
+    const ins = try exec.execute("INSERT INTO t (x) VALUES (1)");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT * FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 1), r.rows.rows.len);
+    try std.testing.expectEqualStrings("1", r.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("active", r.rows.rows[0].values[1]);
+    try std.testing.expectEqualStrings("0", r.rows.rows[0].values[2]);
+}
+
+test "executor NOT NULL constraint on INSERT" {
+    const test_file = "test_exec_notnull.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)");
+    exec.freeResult(ct);
+
+    // Valid insert should succeed
+    const ins1 = try exec.execute("INSERT INTO t VALUES (1, 'alice')");
+    exec.freeResult(ins1);
+
+    // NULL in NOT NULL column should fail
+    const result = exec.execute("INSERT INTO t VALUES (NULL, 'bob')");
+    try std.testing.expectError(ExecError.NotNullViolation, result);
+
+    // Insert with column list omitting NOT NULL column should fail (gets NULL default)
+    const result2 = exec.execute("INSERT INTO t (name) VALUES ('carol')");
+    try std.testing.expectError(ExecError.NotNullViolation, result2);
+
+    // Verify only the valid row exists
+    const r = try exec.execute("SELECT * FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 1), r.rows.rows.len);
+    try std.testing.expectEqualStrings("1", r.rows.rows[0].values[0]);
+}
+
+test "executor NOT NULL constraint on UPDATE" {
+    const test_file = "test_exec_notnull_upd.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)");
+    exec.freeResult(ct);
+
+    const ins = try exec.execute("INSERT INTO t VALUES (1, 'alice')");
+    exec.freeResult(ins);
+
+    // Setting NOT NULL column to NULL should fail
+    const result = exec.execute("UPDATE t SET id = NULL WHERE name = 'alice'");
+    try std.testing.expectError(ExecError.NotNullViolation, result);
+
+    // Valid update should work
+    const upd = try exec.execute("UPDATE t SET id = 2 WHERE name = 'alice'");
+    exec.freeResult(upd);
+
+    const r = try exec.execute("SELECT id FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqualStrings("2", r.rows.rows[0].values[0]);
+}
+
+test "executor NOT NULL with DEFAULT" {
+    const test_file = "test_exec_notnull_def.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT NOT NULL, status TEXT NOT NULL DEFAULT 'active')");
+    exec.freeResult(ct);
+
+    // Omitting status should use default and pass NOT NULL check
+    const ins = try exec.execute("INSERT INTO t (id) VALUES (1)");
+    exec.freeResult(ins);
+
+    const r = try exec.execute("SELECT * FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 1), r.rows.rows.len);
+    try std.testing.expectEqualStrings("1", r.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("active", r.rows.rows[0].values[1]);
 }
