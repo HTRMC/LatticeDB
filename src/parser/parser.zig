@@ -348,6 +348,15 @@ pub const Parser = struct {
             return .{ .aggregate = .{ .func = func, .column = column } };
         }
 
+        // Check for CASE or scalar function — parse as expression column
+        if (self.isScalarFunctionToken() or self.current.type == .kw_case) {
+            const alloc = self.arena();
+            const expr = try self.parsePrimary();
+            const expr_ptr = try alloc.create(ast.Expression);
+            expr_ptr.* = expr.*;
+            return .{ .expression = expr_ptr };
+        }
+
         const first = try self.expectIdentifier();
         // Handle table.column — preserve as qualified reference
         if (self.current.type == .dot) {
@@ -355,6 +364,13 @@ pub const Parser = struct {
             return .{ .qualified = .{ .table = first, .column = try self.expectIdentifier() } };
         }
         return .{ .named = first };
+    }
+
+    fn isScalarFunctionToken(self: *Self) bool {
+        return switch (self.current.type) {
+            .kw_lower, .kw_upper, .kw_trim, .kw_length, .kw_substring, .kw_concat => true,
+            else => false,
+        };
     }
 
     fn parseOrderByColumn(self: *Self) ParseError!ast.OrderByClause {
@@ -696,6 +712,13 @@ pub const Parser = struct {
                 sub_ptr.* = subquery;
                 expr.* = .{ .exists_subquery = .{ .subquery = sub_ptr } };
             },
+            .kw_case => return self.parseCaseExpr(),
+            .kw_lower => return self.parseFunctionCall(.lower),
+            .kw_upper => return self.parseFunctionCall(.upper),
+            .kw_trim => return self.parseFunctionCall(.trim),
+            .kw_length => return self.parseFunctionCall(.length),
+            .kw_substring => return self.parseFunctionCall(.substring),
+            .kw_concat => return self.parseFunctionCall(.concat),
             .positional_param => {
                 const idx = try self.resolvePositionalParam();
                 expr.* = .{ .literal = .{ .parameter = idx } };
@@ -713,6 +736,82 @@ pub const Parser = struct {
             else => return ParseError.UnexpectedToken,
         }
 
+        return expr;
+    }
+
+    /// Parse CASE WHEN cond THEN result [WHEN...] [ELSE default] END
+    fn parseCaseExpr(self: *Self) ParseError!*const ast.Expression {
+        const alloc = self.arena();
+        self.advance(); // consume CASE
+
+        // Simple CASE (CASE expr WHEN val THEN ...) is desugared to searched CASE
+        var operand: ?*const ast.Expression = null;
+        if (self.current.type != .kw_when) {
+            operand = try self.parseExpression();
+        }
+
+        var when_clauses: std.ArrayList(ast.WhenClause) = .empty;
+        while (self.current.type == .kw_when) {
+            self.advance(); // consume WHEN
+            const condition = if (operand) |op| blk: {
+                // Simple CASE: desugar WHEN val -> WHEN operand = val
+                const val = try self.parseExpression();
+                const cmp = try alloc.create(ast.Expression);
+                cmp.* = .{ .comparison = .{ .left = op, .op = .eq, .right = val } };
+                break :blk @as(*const ast.Expression, cmp);
+            } else try self.parseExpression();
+            try self.expect(.kw_then);
+            const result = try self.parseExpression();
+            when_clauses.append(alloc, .{ .condition = condition, .result = result }) catch return ParseError.OutOfMemory;
+        }
+
+        if (when_clauses.items.len == 0) return ParseError.InvalidSyntax;
+
+        var else_result: ?*const ast.Expression = null;
+        if (self.current.type == .kw_else) {
+            self.advance();
+            else_result = try self.parseExpression();
+        }
+
+        try self.expect(.kw_end);
+
+        const expr = try alloc.create(ast.Expression);
+        expr.* = .{ .case_expr = .{
+            .when_clauses = when_clauses.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
+            .else_result = else_result,
+        } };
+        return expr;
+    }
+
+    /// Parse FUNC(arg1, arg2, ...)
+    fn parseFunctionCall(self: *Self, func: ast.BuiltinFunction) ParseError!*const ast.Expression {
+        const alloc = self.arena();
+        self.advance(); // consume function name keyword
+        try self.expect(.left_paren);
+
+        var args: std.ArrayList(*const ast.Expression) = .empty;
+        if (self.current.type != .right_paren) {
+            args.append(alloc, try self.parseExpression()) catch return ParseError.OutOfMemory;
+            while (self.current.type == .comma) {
+                self.advance();
+                args.append(alloc, try self.parseExpression()) catch return ParseError.OutOfMemory;
+            }
+        }
+        try self.expect(.right_paren);
+
+        // Validate argument count
+        const n = args.items.len;
+        switch (func) {
+            .lower, .upper, .trim, .length => if (n != 1) return ParseError.InvalidSyntax,
+            .substring => if (n < 2 or n > 3) return ParseError.InvalidSyntax,
+            .concat => if (n < 2) return ParseError.InvalidSyntax,
+        }
+
+        const expr = try alloc.create(ast.Expression);
+        expr.* = .{ .function_call = .{
+            .func = func,
+            .args = args.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
+        } };
         return expr;
     }
 
@@ -1307,4 +1406,131 @@ test "parse mixing positional and named params fails" {
     var p = Parser.init(std.testing.allocator, "INSERT INTO t VALUES ($1, @name)");
     defer p.deinit();
     try std.testing.expectError(ParseError.InvalidSyntax, p.parse());
+}
+
+test "parse LOWER function in SELECT" {
+    var p = Parser.init(std.testing.allocator, "SELECT LOWER(name) FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    try std.testing.expectEqual(@as(usize, 1), sel.columns.len);
+    try std.testing.expectEqual(ast.SelectColumn.expression, std.meta.activeTag(sel.columns[0]));
+    const expr = sel.columns[0].expression;
+    try std.testing.expectEqual(ast.BuiltinFunction.lower, expr.function_call.func);
+    try std.testing.expectEqual(@as(usize, 1), expr.function_call.args.len);
+}
+
+test "parse UPPER function in WHERE" {
+    var p = Parser.init(std.testing.allocator, "SELECT name FROM t WHERE UPPER(name) = 'FOO'");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    try std.testing.expect(sel.where_clause != null);
+    // WHERE is a comparison: UPPER(name) = 'FOO'
+    const cmp = sel.where_clause.?.comparison;
+    try std.testing.expectEqual(ast.BuiltinFunction.upper, cmp.left.function_call.func);
+}
+
+test "parse CONCAT with multiple args" {
+    var p = Parser.init(std.testing.allocator, "SELECT CONCAT(a, b, c) FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    const expr = sel.columns[0].expression;
+    try std.testing.expectEqual(ast.BuiltinFunction.concat, expr.function_call.func);
+    try std.testing.expectEqual(@as(usize, 3), expr.function_call.args.len);
+}
+
+test "parse SUBSTRING with 2 args" {
+    var p = Parser.init(std.testing.allocator, "SELECT SUBSTRING(name, 1) FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const expr = stmt.select.columns[0].expression;
+    try std.testing.expectEqual(ast.BuiltinFunction.substring, expr.function_call.func);
+    try std.testing.expectEqual(@as(usize, 2), expr.function_call.args.len);
+}
+
+test "parse SUBSTRING with 3 args" {
+    var p = Parser.init(std.testing.allocator, "SELECT SUBSTRING(name, 1, 3) FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const expr = stmt.select.columns[0].expression;
+    try std.testing.expectEqual(@as(usize, 3), expr.function_call.args.len);
+}
+
+test "parse searched CASE expression" {
+    var p = Parser.init(std.testing.allocator, "SELECT CASE WHEN x > 5 THEN 'big' ELSE 'small' END FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const expr = stmt.select.columns[0].expression;
+    const ce = expr.case_expr;
+    try std.testing.expectEqual(@as(usize, 1), ce.when_clauses.len);
+    try std.testing.expect(ce.else_result != null);
+}
+
+test "parse simple CASE expression" {
+    var p = Parser.init(std.testing.allocator, "SELECT CASE status WHEN 1 THEN 'on' WHEN 0 THEN 'off' END FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const expr = stmt.select.columns[0].expression;
+    const ce = expr.case_expr;
+    // Simple CASE desugars to searched: each WHEN becomes a comparison
+    try std.testing.expectEqual(@as(usize, 2), ce.when_clauses.len);
+    try std.testing.expectEqual(ast.CompOp.eq, ce.when_clauses[0].condition.comparison.op);
+    try std.testing.expect(ce.else_result == null);
+}
+
+test "parse CASE without WHEN fails" {
+    var p = Parser.init(std.testing.allocator, "SELECT CASE END FROM t");
+    defer p.deinit();
+    try std.testing.expectError(ParseError.UnexpectedToken, p.parse());
+}
+
+test "parse nested function in SELECT" {
+    var p = Parser.init(std.testing.allocator, "SELECT UPPER(SUBSTRING(name, 1, 3)) FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const expr = stmt.select.columns[0].expression;
+    try std.testing.expectEqual(ast.BuiltinFunction.upper, expr.function_call.func);
+    // The argument to UPPER is itself a function_call (SUBSTRING)
+    const inner = expr.function_call.args[0];
+    try std.testing.expectEqual(ast.BuiltinFunction.substring, inner.function_call.func);
+}
+
+test "parse LOWER with wrong arg count fails" {
+    var p = Parser.init(std.testing.allocator, "SELECT LOWER(a, b) FROM t");
+    defer p.deinit();
+    try std.testing.expectError(ParseError.InvalidSyntax, p.parse());
+}
+
+test "parse CONCAT with one arg fails" {
+    var p = Parser.init(std.testing.allocator, "SELECT CONCAT(a) FROM t");
+    defer p.deinit();
+    try std.testing.expectError(ParseError.InvalidSyntax, p.parse());
+}
+
+test "parse LENGTH function" {
+    var p = Parser.init(std.testing.allocator, "SELECT LENGTH(name) FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const expr = stmt.select.columns[0].expression;
+    try std.testing.expectEqual(ast.BuiltinFunction.length, expr.function_call.func);
+}
+
+test "parse TRIM function" {
+    var p = Parser.init(std.testing.allocator, "SELECT TRIM(name) FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const expr = stmt.select.columns[0].expression;
+    try std.testing.expectEqual(ast.BuiltinFunction.trim, expr.function_call.func);
+}
+
+test "parse function with alias" {
+    var p = Parser.init(std.testing.allocator, "SELECT LOWER(name) AS lname FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    try std.testing.expectEqual(ast.SelectColumn.expression, std.meta.activeTag(sel.columns[0]));
+    const alias = sel.aliases.?[0].?;
+    try std.testing.expectEqualStrings("lname", alias);
 }
