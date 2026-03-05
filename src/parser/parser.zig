@@ -744,13 +744,19 @@ pub const Parser = struct {
         try self.expect(.kw_on);
         const table_name = try self.expectIdentifier();
         try self.expect(.left_paren);
-        const column_name = try self.expectIdentifier();
+        const alloc = self.arena();
+        var cols: std.ArrayList([]const u8) = .empty;
+        cols.append(alloc, try self.expectIdentifier()) catch return ParseError.OutOfMemory;
+        while (self.current.type == .comma) {
+            self.advance();
+            cols.append(alloc, try self.expectIdentifier()) catch return ParseError.OutOfMemory;
+        }
         try self.expect(.right_paren);
 
         return .{
             .index_name = index_name,
             .table_name = table_name,
-            .column_name = column_name,
+            .columns = cols.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
             .is_unique = is_unique,
         };
     }
@@ -1799,7 +1805,8 @@ test "parse CREATE INDEX" {
     const ci = stmt.create_index;
     try std.testing.expectEqualStrings("idx_users_id", ci.index_name);
     try std.testing.expectEqualStrings("users", ci.table_name);
-    try std.testing.expectEqualStrings("id", ci.column_name);
+    try std.testing.expectEqual(@as(usize, 1), ci.columns.len);
+    try std.testing.expectEqualStrings("id", ci.columns[0]);
     try std.testing.expect(!ci.is_unique);
 }
 
@@ -1810,6 +1817,18 @@ test "parse CREATE UNIQUE INDEX" {
     const ci = stmt.create_index;
     try std.testing.expectEqualStrings("idx_u", ci.index_name);
     try std.testing.expect(ci.is_unique);
+}
+
+test "parse CREATE INDEX multi-column" {
+    var p = Parser.init(std.testing.allocator, "CREATE INDEX idx_mc ON t (a, b, c)");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const ci = stmt.create_index;
+    try std.testing.expectEqualStrings("idx_mc", ci.index_name);
+    try std.testing.expectEqual(@as(usize, 3), ci.columns.len);
+    try std.testing.expectEqualStrings("a", ci.columns[0]);
+    try std.testing.expectEqualStrings("b", ci.columns[1]);
+    try std.testing.expectEqualStrings("c", ci.columns[2]);
 }
 
 test "parse DROP INDEX" {

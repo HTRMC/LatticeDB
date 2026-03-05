@@ -876,7 +876,9 @@ pub const Executor = struct {
     // CREATE INDEX
     // ============================================================
     fn execCreateIndex(self: *Self, ci: ast.CreateIndex) ExecError!ExecResult {
-        const index_id = self.catalog.createIndex(ci.table_name, ci.index_name, ci.column_name, ci.is_unique) catch |err| {
+        // For catalog storage, use first column name (composite index metadata stored in AST)
+        const first_col = if (ci.columns.len > 0) ci.columns[0] else return ExecError.ColumnNotFound;
+        const index_id = self.catalog.createIndex(ci.table_name, ci.index_name, first_col, ci.is_unique) catch |err| {
             return switch (err) {
                 catalog_mod.CatalogError.IndexAlreadyExists => ExecError.IndexAlreadyExists,
                 catalog_mod.CatalogError.TableNotFound => ExecError.TableNotFound,
@@ -895,10 +897,10 @@ pub const Executor = struct {
 
         const schema = table_result.schema;
 
-        // Find column ordinal
+        // Find column ordinal (use first column for btree index)
         var col_ord: ?usize = null;
         for (schema.columns, 0..) |col, i| {
-            if (std.ascii.eqlIgnoreCase(col.name, ci.column_name)) {
+            if (std.ascii.eqlIgnoreCase(col.name, first_col)) {
                 col_ord = i;
                 break;
             }

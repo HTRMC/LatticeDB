@@ -339,7 +339,7 @@ pub const AlterTable = struct {
 pub const CreateIndex = struct {
     index_name: []const u8,
     table_name: []const u8,
-    column_name: []const u8,
+    columns: []const []const u8, // one or more column names
     is_unique: bool,
 };
 
