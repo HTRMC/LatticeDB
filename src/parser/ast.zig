@@ -116,6 +116,11 @@ pub const Expression = union(enum) {
     unary_minus: struct {
         operand: *const Expression,
     },
+    /// IS NULL / IS NOT NULL
+    is_null: struct {
+        operand: *const Expression,
+        negated: bool, // true = IS NOT NULL
+    },
 };
 
 /// Arithmetic operators
@@ -134,6 +139,8 @@ pub const BuiltinFunction = enum {
     length,
     substring,
     concat,
+    coalesce,
+    nullif,
 };
 
 /// CASE WHEN clause

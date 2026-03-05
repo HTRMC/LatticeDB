@@ -76,6 +76,9 @@ pub const TokenType = enum {
     kw_else,
     kw_end,
 
+    // IS keyword
+    kw_is,
+
     // String functions
     kw_lower,
     kw_upper,
@@ -83,6 +86,10 @@ pub const TokenType = enum {
     kw_length,
     kw_substring,
     kw_concat,
+
+    // NULL functions
+    kw_coalesce,
+    kw_nullif,
 
     // Transaction keywords
     kw_begin,
@@ -201,6 +208,9 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "length", .kw_length },
     .{ "substring", .kw_substring },
     .{ "concat", .kw_concat },
+    .{ "is", .kw_is },
+    .{ "coalesce", .kw_coalesce },
+    .{ "nullif", .kw_nullif },
     .{ "int", .kw_int },
     .{ "integer", .kw_integer },
     .{ "bigint", .kw_bigint },

@@ -422,7 +422,7 @@ pub const Parser = struct {
 
     fn isScalarFunctionToken(self: *Self) bool {
         return switch (self.current.type) {
-            .kw_lower, .kw_upper, .kw_trim, .kw_length, .kw_substring, .kw_concat => true,
+            .kw_lower, .kw_upper, .kw_trim, .kw_length, .kw_substring, .kw_concat, .kw_coalesce, .kw_nullif => true,
             else => false,
         };
     }
@@ -638,6 +638,17 @@ pub const Parser = struct {
         const left = try self.parseAdditive();
         const alloc = self.arena();
 
+        // IS NULL / IS NOT NULL
+        if (self.current.type == .kw_is) {
+            self.advance();
+            const negated = self.current.type == .kw_not;
+            if (negated) self.advance();
+            try self.expect(.kw_null);
+            const expr = try alloc.create(ast.Expression);
+            expr.* = .{ .is_null = .{ .operand = left, .negated = negated } };
+            return expr;
+        }
+
         // BETWEEN low AND high
         if (self.current.type == .kw_between) {
             self.advance();
@@ -816,6 +827,8 @@ pub const Parser = struct {
             .kw_length => return self.parseFunctionCall(.length),
             .kw_substring => return self.parseFunctionCall(.substring),
             .kw_concat => return self.parseFunctionCall(.concat),
+            .kw_coalesce => return self.parseFunctionCall(.coalesce),
+            .kw_nullif => return self.parseFunctionCall(.nullif),
             .positional_param => {
                 const idx = try self.resolvePositionalParam();
                 expr.* = .{ .literal = .{ .parameter = idx } };
@@ -902,6 +915,8 @@ pub const Parser = struct {
             .lower, .upper, .trim, .length => if (n != 1) return ParseError.InvalidSyntax,
             .substring => if (n < 2 or n > 3) return ParseError.InvalidSyntax,
             .concat => if (n < 2) return ParseError.InvalidSyntax,
+            .coalesce => if (n < 1) return ParseError.InvalidSyntax,
+            .nullif => if (n != 2) return ParseError.InvalidSyntax,
         }
 
         const expr = try alloc.create(ast.Expression);
@@ -1721,4 +1736,50 @@ test "parse multi-row INSERT" {
     try std.testing.expectEqualStrings("b", ins.rows[1][1].string);
     try std.testing.expectEqual(@as(i64, 3), ins.rows[2][0].integer);
     try std.testing.expectEqualStrings("c", ins.rows[2][1].string);
+}
+
+test "parse IS NULL" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t WHERE x IS NULL");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const where = stmt.select.where_clause.?;
+    try std.testing.expect(where.* == .is_null);
+    try std.testing.expect(!where.is_null.negated);
+}
+
+test "parse IS NOT NULL" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t WHERE x IS NOT NULL");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const where = stmt.select.where_clause.?;
+    try std.testing.expect(where.* == .is_null);
+    try std.testing.expect(where.is_null.negated);
+}
+
+test "parse COALESCE" {
+    var p = Parser.init(std.testing.allocator, "SELECT COALESCE(a, b, 0) FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    try std.testing.expect(stmt.select.columns[0] == .expression);
+    const expr = stmt.select.columns[0].expression;
+    try std.testing.expect(expr.* == .function_call);
+    try std.testing.expectEqual(ast.BuiltinFunction.coalesce, expr.function_call.func);
+    try std.testing.expectEqual(@as(usize, 3), expr.function_call.args.len);
+}
+
+test "parse NULLIF" {
+    var p = Parser.init(std.testing.allocator, "SELECT NULLIF(a, 0) FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    try std.testing.expect(stmt.select.columns[0] == .expression);
+    const expr = stmt.select.columns[0].expression;
+    try std.testing.expect(expr.* == .function_call);
+    try std.testing.expectEqual(ast.BuiltinFunction.nullif, expr.function_call.func);
+    try std.testing.expectEqual(@as(usize, 2), expr.function_call.args.len);
+}
+
+test "parse NULLIF wrong arg count fails" {
+    var p = Parser.init(std.testing.allocator, "SELECT NULLIF(a) FROM t");
+    defer p.deinit();
+    try std.testing.expectError(ParseError.InvalidSyntax, p.parse());
 }

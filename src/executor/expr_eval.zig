@@ -56,6 +56,8 @@ pub fn projectionColumnName(proj: ProjectionColumn, schema: *const Schema, func_
                         .length => "length",
                         .substring => "substring",
                         .concat => "concat",
+                        .coalesce => "coalesce",
+                        .nullif => "nullif",
                     };
                     return name;
                 },
@@ -270,6 +272,12 @@ pub fn evalExprToValue(
         .case_expr => |ce| return evalCaseExpr(allocator, ce, schema, values, params),
         .arithmetic => |ar| return evalArithmetic(allocator, ar, schema, values, params),
         .unary_minus => |um| return evalUnaryMinus(allocator, um, schema, values, params),
+        .is_null => |isn| {
+            const operand = evalExprToValue(allocator, isn.operand, schema, values, params);
+            defer operand.deinit(allocator);
+            const result = operand.value == .null_value;
+            return ExprResult.borrowed(.{ .boolean = if (isn.negated) !result else result });
+        },
         else => return ExprResult.borrowed(.{ .null_value = {} }),
     }
 }
@@ -316,6 +324,24 @@ fn evalFunctionCall(
         },
         .concat => {
             return strConcat(allocator, fc.args, schema, values, params);
+        },
+        .coalesce => {
+            for (fc.args) |arg| {
+                const res = evalExprToValue(allocator, arg, schema, values, params);
+                if (res.value != .null_value) return res;
+                res.deinit(allocator);
+            }
+            return ExprResult.borrowed(.{ .null_value = {} });
+        },
+        .nullif => {
+            const a = evalExprToValue(allocator, fc.args[0], schema, values, params);
+            const b = evalExprToValue(allocator, fc.args[1], schema, values, params);
+            defer b.deinit(allocator);
+            if (compareValues(a.value, .eq, b.value)) {
+                a.deinit(allocator);
+                return ExprResult.borrowed(.{ .null_value = {} });
+            }
+            return a;
         },
     }
 }
@@ -411,6 +437,12 @@ fn evalExprToBool(
                 }
             }
             return true;
+        },
+        .is_null => |isn| {
+            const operand = evalExprToValue(allocator, isn.operand, schema, values, params);
+            defer operand.deinit(allocator);
+            const result = operand.value == .null_value;
+            return if (isn.negated) !result else result;
         },
         .case_expr, .function_call, .arithmetic, .unary_minus => {
             const result = evalExprToValue(allocator, expr, schema, values, params);

@@ -2594,6 +2594,12 @@ pub const Executor = struct {
                 }
                 return true;
             },
+            .is_null => |isn| {
+                const operand = expr_eval.evalExprToValue(self.allocator, isn.operand, schema, values, params);
+                defer operand.deinit(self.allocator);
+                const result = operand.value == .null_value;
+                return if (isn.negated) !result else result;
+            },
             .case_expr, .function_call, .arithmetic, .unary_minus => {
                 const result = expr_eval.evalExprToValue(self.allocator, expr, schema, values, params);
                 defer result.deinit(self.allocator);
@@ -6515,4 +6521,91 @@ test "executor multi-row INSERT" {
     try std.testing.expectEqualStrings("bob", r.rows.rows[1].values[1]);
     try std.testing.expectEqualStrings("3", r.rows.rows[2].values[0]);
     try std.testing.expectEqualStrings("charlie", r.rows.rows[2].values[1]);
+}
+
+test "executor IS NULL and IS NOT NULL" {
+    const test_file = "test_exec_is_null.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (id INT, name TEXT)");
+    exec.freeResult(ct);
+    const ins1 = try exec.execute("INSERT INTO t VALUES (1, 'alice')");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO t VALUES (2, NULL)");
+    exec.freeResult(ins2);
+
+    const r1 = try exec.execute("SELECT * FROM t WHERE name IS NULL");
+    defer exec.freeResult(r1);
+    try std.testing.expectEqual(@as(usize, 1), r1.rows.rows.len);
+    try std.testing.expectEqualStrings("2", r1.rows.rows[0].values[0]);
+
+    const r2 = try exec.execute("SELECT * FROM t WHERE name IS NOT NULL");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqual(@as(usize, 1), r2.rows.rows.len);
+    try std.testing.expectEqualStrings("1", r2.rows.rows[0].values[0]);
+}
+
+test "executor COALESCE" {
+    const test_file = "test_exec_coalesce.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (a INT, b INT)");
+    exec.freeResult(ct);
+    const ins1 = try exec.execute("INSERT INTO t VALUES (NULL, 10)");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO t VALUES (5, 10)");
+    exec.freeResult(ins2);
+
+    const r = try exec.execute("SELECT COALESCE(a, b) FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 2), r.rows.rows.len);
+    try std.testing.expectEqualStrings("10", r.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("5", r.rows.rows[1].values[0]);
+}
+
+test "executor NULLIF" {
+    const test_file = "test_exec_nullif.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct = try exec.execute("CREATE TABLE t (x INT)");
+    exec.freeResult(ct);
+    const ins1 = try exec.execute("INSERT INTO t VALUES (0)");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO t VALUES (5)");
+    exec.freeResult(ins2);
+
+    const r = try exec.execute("SELECT NULLIF(x, 0) FROM t");
+    defer exec.freeResult(r);
+    try std.testing.expectEqualStrings("NULL", r.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("5", r.rows.rows[1].values[0]);
 }
