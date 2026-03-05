@@ -106,6 +106,24 @@ pub const Expression = union(enum) {
         func: BuiltinFunction,
         args: []const *const Expression,
     },
+    /// Arithmetic: left op right
+    arithmetic: struct {
+        left: *const Expression,
+        op: ArithOp,
+        right: *const Expression,
+    },
+    /// Unary minus: -expr
+    unary_minus: struct {
+        operand: *const Expression,
+    },
+};
+
+/// Arithmetic operators
+pub const ArithOp = enum {
+    add, // +
+    sub, // -
+    mul, // *
+    div, // /
 };
 
 /// Built-in scalar function type

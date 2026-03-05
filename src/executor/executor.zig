@@ -2588,7 +2588,7 @@ pub const Executor = struct {
                 }
                 return true;
             },
-            .case_expr, .function_call => {
+            .case_expr, .function_call, .arithmetic, .unary_minus => {
                 const result = expr_eval.evalExprToValue(self.allocator, expr, schema, values, params);
                 defer result.deinit(self.allocator);
                 return switch (result.value) {

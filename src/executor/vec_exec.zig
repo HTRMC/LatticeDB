@@ -83,6 +83,8 @@ fn hasSubquery(expr: *const ast.Expression) bool {
             }
             break :blk false;
         },
+        .arithmetic => |ar| hasSubquery(ar.left) or hasSubquery(ar.right),
+        .unary_minus => |um| hasSubquery(um.operand),
         .column_ref, .qualified_ref, .literal => false,
     };
 }

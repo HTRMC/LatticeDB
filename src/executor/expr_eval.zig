@@ -60,6 +60,8 @@ pub fn projectionColumnName(proj: ProjectionColumn, schema: *const Schema, func_
                     return name;
                 },
                 .case_expr => return "case",
+                .arithmetic => return "?expr?",
+                .unary_minus => return "?expr?",
                 else => return "?expr?",
             }
         },
@@ -266,6 +268,8 @@ pub fn evalExprToValue(
         .column_ref, .qualified_ref, .literal => return ExprResult.borrowed(resolveExprValue(expr, schema, values, params)),
         .function_call => |fc| return evalFunctionCall(allocator, fc, schema, values, params),
         .case_expr => |ce| return evalCaseExpr(allocator, ce, schema, values, params),
+        .arithmetic => |ar| return evalArithmetic(allocator, ar, schema, values, params),
+        .unary_minus => |um| return evalUnaryMinus(allocator, um, schema, values, params),
         else => return ExprResult.borrowed(.{ .null_value = {} }),
     }
 }
@@ -408,7 +412,7 @@ fn evalExprToBool(
             }
             return true;
         },
-        .case_expr, .function_call => {
+        .case_expr, .function_call, .arithmetic, .unary_minus => {
             const result = evalExprToValue(allocator, expr, schema, values, params);
             defer result.deinit(allocator);
             return switch (result.value) {
@@ -420,6 +424,99 @@ fn evalExprToBool(
         },
         .in_list, .in_subquery, .exists_subquery => return true,
     }
+}
+
+// ── Arithmetic ──────────────────────────────────────────────────
+
+fn evalArithmetic(
+    allocator: std.mem.Allocator,
+    ar: anytype,
+    schema: *const Schema,
+    values: []const Value,
+    params: ?[]const ast.LiteralValue,
+) ExprResult {
+    const left_res = evalExprToValue(allocator, ar.left, schema, values, params);
+    defer left_res.deinit(allocator);
+    const right_res = evalExprToValue(allocator, ar.right, schema, values, params);
+    defer right_res.deinit(allocator);
+
+    const lv = left_res.value;
+    const rv = right_res.value;
+
+    // NULL propagation
+    if (lv == .null_value or rv == .null_value) return ExprResult.borrowed(.{ .null_value = {} });
+
+    // If either side is float, promote to float arithmetic
+    const lf = toFloat(lv);
+    const rf = toFloat(rv);
+    if (lf != null or rf != null) {
+        const l = lf orelse toFloatFromInt(lv) orelse return ExprResult.borrowed(.{ .null_value = {} });
+        const r = rf orelse toFloatFromInt(rv) orelse return ExprResult.borrowed(.{ .null_value = {} });
+        const result: f64 = switch (ar.op) {
+            .add => l + r,
+            .sub => l - r,
+            .mul => l * r,
+            .div => if (r == 0.0) return ExprResult.borrowed(.{ .null_value = {} }) else l / r,
+        };
+        return ExprResult.borrowed(.{ .float = result });
+    }
+
+    // Integer arithmetic
+    const li = toInt(lv) orelse return ExprResult.borrowed(.{ .null_value = {} });
+    const ri = toInt(rv) orelse return ExprResult.borrowed(.{ .null_value = {} });
+    const result: i64 = switch (ar.op) {
+        .add => li +% ri,
+        .sub => li -% ri,
+        .mul => li *% ri,
+        .div => if (ri == 0) return ExprResult.borrowed(.{ .null_value = {} }) else @divTrunc(li, ri),
+    };
+    // Fit into i32 if possible
+    if (result >= std.math.minInt(i32) and result <= std.math.maxInt(i32)) {
+        return ExprResult.borrowed(.{ .integer = @intCast(result) });
+    }
+    return ExprResult.borrowed(.{ .bigint = result });
+}
+
+fn evalUnaryMinus(
+    allocator: std.mem.Allocator,
+    um: anytype,
+    schema: *const Schema,
+    values: []const Value,
+    params: ?[]const ast.LiteralValue,
+) ExprResult {
+    const res = evalExprToValue(allocator, um.operand, schema, values, params);
+    defer res.deinit(allocator);
+
+    return switch (res.value) {
+        .integer => |i| ExprResult.borrowed(.{ .integer = -%i }),
+        .bigint => |i| ExprResult.borrowed(.{ .bigint = -%i }),
+        .float => |f| ExprResult.borrowed(.{ .float = -f }),
+        .null_value => ExprResult.borrowed(.{ .null_value = {} }),
+        else => ExprResult.borrowed(.{ .null_value = {} }),
+    };
+}
+
+fn toFloat(val: Value) ?f64 {
+    return switch (val) {
+        .float => |f| f,
+        else => null,
+    };
+}
+
+fn toFloatFromInt(val: Value) ?f64 {
+    return switch (val) {
+        .integer => |i| @floatFromInt(i),
+        .bigint => |i| @floatFromInt(i),
+        else => null,
+    };
+}
+
+fn toInt(val: Value) ?i64 {
+    return switch (val) {
+        .integer => |i| i,
+        .bigint => |i| i,
+        else => null,
+    };
 }
 
 // ── String functions ─────────────────────────────────────────────
@@ -654,4 +751,79 @@ test "compareValues null returns false" {
 test "compareValues strings" {
     try std.testing.expect(compareValues(.{ .bytes = "abc" }, .eq, .{ .bytes = "abc" }));
     try std.testing.expect(compareValues(.{ .bytes = "abc" }, .lt, .{ .bytes = "def" }));
+}
+
+test "arithmetic integer add" {
+    const empty_schema: Schema = .{ .columns = &.{} };
+    const expr = ast.Expression{ .arithmetic = .{
+        .left = &ast.Expression{ .literal = .{ .integer = 3 } },
+        .op = .add,
+        .right = &ast.Expression{ .literal = .{ .integer = 7 } },
+    } };
+    const r = evalExprToValue(std.testing.allocator, &expr, &empty_schema, &.{}, null);
+    try std.testing.expectEqual(@as(i32, 10), r.value.integer);
+}
+
+test "arithmetic integer mul" {
+    const empty_schema: Schema = .{ .columns = &.{} };
+    const expr = ast.Expression{ .arithmetic = .{
+        .left = &ast.Expression{ .literal = .{ .integer = 4 } },
+        .op = .mul,
+        .right = &ast.Expression{ .literal = .{ .integer = 5 } },
+    } };
+    const r = evalExprToValue(std.testing.allocator, &expr, &empty_schema, &.{}, null);
+    try std.testing.expectEqual(@as(i32, 20), r.value.integer);
+}
+
+test "arithmetic float division" {
+    const empty_schema: Schema = .{ .columns = &.{} };
+    const expr = ast.Expression{ .arithmetic = .{
+        .left = &ast.Expression{ .literal = .{ .float = 10.0 } },
+        .op = .div,
+        .right = &ast.Expression{ .literal = .{ .float = 4.0 } },
+    } };
+    const r = evalExprToValue(std.testing.allocator, &expr, &empty_schema, &.{}, null);
+    try std.testing.expectEqual(@as(f64, 2.5), r.value.float);
+}
+
+test "arithmetic null propagation" {
+    const empty_schema: Schema = .{ .columns = &.{} };
+    const expr = ast.Expression{ .arithmetic = .{
+        .left = &ast.Expression{ .literal = .{ .integer = 5 } },
+        .op = .add,
+        .right = &ast.Expression{ .literal = .{ .null_value = {} } },
+    } };
+    const r = evalExprToValue(std.testing.allocator, &expr, &empty_schema, &.{}, null);
+    try std.testing.expect(r.value == .null_value);
+}
+
+test "arithmetic division by zero" {
+    const empty_schema: Schema = .{ .columns = &.{} };
+    const expr = ast.Expression{ .arithmetic = .{
+        .left = &ast.Expression{ .literal = .{ .integer = 5 } },
+        .op = .div,
+        .right = &ast.Expression{ .literal = .{ .integer = 0 } },
+    } };
+    const r = evalExprToValue(std.testing.allocator, &expr, &empty_schema, &.{}, null);
+    try std.testing.expect(r.value == .null_value);
+}
+
+test "arithmetic int-float promotion" {
+    const empty_schema: Schema = .{ .columns = &.{} };
+    const expr = ast.Expression{ .arithmetic = .{
+        .left = &ast.Expression{ .literal = .{ .integer = 3 } },
+        .op = .mul,
+        .right = &ast.Expression{ .literal = .{ .float = 2.5 } },
+    } };
+    const r = evalExprToValue(std.testing.allocator, &expr, &empty_schema, &.{}, null);
+    try std.testing.expectEqual(@as(f64, 7.5), r.value.float);
+}
+
+test "unary minus" {
+    const empty_schema: Schema = .{ .columns = &.{} };
+    const expr = ast.Expression{ .unary_minus = .{
+        .operand = &ast.Expression{ .literal = .{ .integer = 42 } },
+    } };
+    const r = evalExprToValue(std.testing.allocator, &expr, &empty_schema, &.{}, null);
+    try std.testing.expectEqual(@as(i32, -42), r.value.integer);
 }

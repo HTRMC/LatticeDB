@@ -442,8 +442,8 @@ fn evalExprOnChunk(expr: *const ast.Expression, chunk: *DataChunk, schema: *cons
         .column_ref => return true,
         // Subqueries and exists not supported in vectorized path
         .in_subquery, .exists_subquery, .qualified_ref => return true,
-        // CASE and function_call: stub — not yet evaluated in vectorized filter
-        .case_expr, .function_call => return true,
+        // CASE, function_call, arithmetic, unary_minus: delegate to resolveExprValueFromChunk for evaluation
+        .case_expr, .function_call, .arithmetic, .unary_minus => return true,
     }
 }
 
@@ -462,7 +462,7 @@ fn resolveExprValueFromChunk(expr: *const ast.Expression, chunk: *DataChunk, sch
             return .{ .null_value = {} };
         },
         .literal => |lit| return litToStorageValue(lit),
-        .function_call, .case_expr => {
+        .function_call, .case_expr, .arithmetic, .unary_minus => {
             // Build row values from chunk for expr_eval
             var row_values: [128]Value = undefined;
             const ncols = @min(schema.columns.len, 128);

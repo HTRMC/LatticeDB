@@ -363,7 +363,51 @@ pub const Parser = struct {
             self.advance();
             return .{ .qualified = .{ .table = first, .column = try self.expectIdentifier() } };
         }
+        // Check for arithmetic operator after identifier — parse as expression column
+        if (self.isArithmeticOp()) {
+            const alloc = self.arena();
+            // Build a column_ref for the first identifier, then parse the rest as arithmetic
+            const col_ref = try alloc.create(ast.Expression);
+            col_ref.* = .{ .column_ref = first };
+            const result = try self.parseArithmeticContinuation(col_ref);
+            return .{ .expression = result };
+        }
         return .{ .named = first };
+    }
+
+    fn isArithmeticOp(self: *Self) bool {
+        return switch (self.current.type) {
+            .op_plus, .op_minus, .op_star, .op_slash => true,
+            else => false,
+        };
+    }
+
+    fn parseArithmeticContinuation(self: *Self, initial_left: anytype) ParseError!*const ast.Expression {
+        // We have the left operand already parsed. Continue with additive-level parsing.
+        const alloc = self.arena();
+        var left = initial_left;
+
+        // First handle any pending multiplicative ops
+        while (self.current.type == .op_star or self.current.type == .op_slash) {
+            const op: ast.ArithOp = if (self.current.type == .op_star) .mul else .div;
+            self.advance();
+            const right = try self.parseUnary();
+            const expr = try alloc.create(ast.Expression);
+            expr.* = .{ .arithmetic = .{ .left = left, .op = op, .right = right } };
+            left = expr;
+        }
+
+        // Then handle additive ops
+        while (self.current.type == .op_plus or self.current.type == .op_minus) {
+            const op: ast.ArithOp = if (self.current.type == .op_plus) .add else .sub;
+            self.advance();
+            const right = try self.parseMultiplicative();
+            const expr = try alloc.create(ast.Expression);
+            expr.* = .{ .arithmetic = .{ .left = left, .op = op, .right = right } };
+            left = expr;
+        }
+
+        return left;
     }
 
     fn isScalarFunctionToken(self: *Self) bool {
@@ -581,15 +625,15 @@ pub const Parser = struct {
     }
 
     fn parseComparison(self: *Self) ParseError!*const ast.Expression {
-        const left = try self.parsePrimary();
+        const left = try self.parseAdditive();
         const alloc = self.arena();
 
         // BETWEEN low AND high
         if (self.current.type == .kw_between) {
             self.advance();
-            const low = try self.parsePrimary();
+            const low = try self.parseAdditive();
             try self.expect(.kw_and);
-            const high = try self.parsePrimary();
+            const high = try self.parseAdditive();
             const expr = try alloc.create(ast.Expression);
             expr.* = .{ .between_expr = .{ .value = left, .low = low, .high = high } };
             return expr;
@@ -598,7 +642,7 @@ pub const Parser = struct {
         // LIKE pattern
         if (self.current.type == .kw_like) {
             self.advance();
-            const pattern = try self.parsePrimary();
+            const pattern = try self.parseAdditive();
             const expr = try alloc.create(ast.Expression);
             expr.* = .{ .like_expr = .{ .value = left, .pattern = pattern } };
             return expr;
@@ -624,10 +668,10 @@ pub const Parser = struct {
             }
 
             var items: std.ArrayList(*const ast.Expression) = .empty;
-            items.append(alloc, try self.parsePrimary()) catch return ParseError.OutOfMemory;
+            items.append(alloc, try self.parseAdditive()) catch return ParseError.OutOfMemory;
             while (self.current.type == .comma) {
                 self.advance();
-                items.append(alloc, try self.parsePrimary()) catch return ParseError.OutOfMemory;
+                items.append(alloc, try self.parseAdditive()) catch return ParseError.OutOfMemory;
             }
             try self.expect(.right_paren);
 
@@ -651,13 +695,56 @@ pub const Parser = struct {
 
         if (op) |comp_op| {
             self.advance();
-            const right = try self.parsePrimary();
+            const right = try self.parseAdditive();
             const expr = try alloc.create(ast.Expression);
             expr.* = .{ .comparison = .{ .left = left, .op = comp_op, .right = right } };
             return expr;
         }
 
         return left;
+    }
+
+    fn parseAdditive(self: *Self) ParseError!*const ast.Expression {
+        var left = try self.parseMultiplicative();
+        const alloc = self.arena();
+
+        while (self.current.type == .op_plus or self.current.type == .op_minus) {
+            const op: ast.ArithOp = if (self.current.type == .op_plus) .add else .sub;
+            self.advance();
+            const right = try self.parseMultiplicative();
+            const expr = try alloc.create(ast.Expression);
+            expr.* = .{ .arithmetic = .{ .left = left, .op = op, .right = right } };
+            left = expr;
+        }
+
+        return left;
+    }
+
+    fn parseMultiplicative(self: *Self) ParseError!*const ast.Expression {
+        var left = try self.parseUnary();
+        const alloc = self.arena();
+
+        while (self.current.type == .op_star or self.current.type == .op_slash) {
+            const op: ast.ArithOp = if (self.current.type == .op_star) .mul else .div;
+            self.advance();
+            const right = try self.parseUnary();
+            const expr = try alloc.create(ast.Expression);
+            expr.* = .{ .arithmetic = .{ .left = left, .op = op, .right = right } };
+            left = expr;
+        }
+
+        return left;
+    }
+
+    fn parseUnary(self: *Self) ParseError!*const ast.Expression {
+        if (self.current.type == .op_minus) {
+            self.advance();
+            const operand = try self.parseUnary();
+            const expr = try self.arena().create(ast.Expression);
+            expr.* = .{ .unary_minus = .{ .operand = operand } };
+            return expr;
+        }
+        return self.parsePrimary();
     }
 
     fn parsePrimary(self: *Self) ParseError!*const ast.Expression {
@@ -1533,4 +1620,79 @@ test "parse function with alias" {
     try std.testing.expectEqual(ast.SelectColumn.expression, std.meta.activeTag(sel.columns[0]));
     const alias = sel.aliases.?[0].?;
     try std.testing.expectEqualStrings("lname", alias);
+}
+
+test "parse arithmetic in WHERE" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t WHERE a + b > 10");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    const where = sel.where_clause.?;
+    // Should be comparison: (a + b) > 10
+    try std.testing.expect(where.* == .comparison);
+    const cmp = where.comparison;
+    try std.testing.expectEqual(ast.CompOp.gt, cmp.op);
+    try std.testing.expect(cmp.left.* == .arithmetic);
+    try std.testing.expectEqual(ast.ArithOp.add, cmp.left.arithmetic.op);
+}
+
+test "parse arithmetic precedence" {
+    // a + b * c should parse as a + (b * c)
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t WHERE a + b * c = 10");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    const where = sel.where_clause.?;
+    const cmp = where.comparison;
+    const add = cmp.left.arithmetic;
+    try std.testing.expectEqual(ast.ArithOp.add, add.op);
+    // right side of add should be mul
+    try std.testing.expect(add.right.* == .arithmetic);
+    try std.testing.expectEqual(ast.ArithOp.mul, add.right.arithmetic.op);
+}
+
+test "parse arithmetic in SELECT column" {
+    var p = Parser.init(std.testing.allocator, "SELECT price * quantity FROM orders");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    try std.testing.expectEqual(@as(usize, 1), sel.columns.len);
+    try std.testing.expect(sel.columns[0] == .expression);
+    const expr = sel.columns[0].expression;
+    try std.testing.expect(expr.* == .arithmetic);
+    try std.testing.expectEqual(ast.ArithOp.mul, expr.arithmetic.op);
+}
+
+test "parse unary minus" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t WHERE x = -5");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    const where = sel.where_clause.?;
+    const cmp = where.comparison;
+    try std.testing.expect(cmp.right.* == .unary_minus);
+}
+
+test "parse arithmetic with parens" {
+    var p = Parser.init(std.testing.allocator, "SELECT * FROM t WHERE (a + b) * c = 10");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    const where = sel.where_clause.?;
+    const cmp = where.comparison;
+    const mul = cmp.left.arithmetic;
+    try std.testing.expectEqual(ast.ArithOp.mul, mul.op);
+    // left side of mul should be add (from parens)
+    try std.testing.expect(mul.left.* == .arithmetic);
+    try std.testing.expectEqual(ast.ArithOp.add, mul.left.arithmetic.op);
+}
+
+test "parse arithmetic with alias" {
+    var p = Parser.init(std.testing.allocator, "SELECT a + b AS total FROM t");
+    defer p.deinit();
+    const stmt = try p.parse();
+    const sel = stmt.select;
+    try std.testing.expect(sel.columns[0] == .expression);
+    const alias = sel.aliases.?[0].?;
+    try std.testing.expectEqualStrings("total", alias);
 }
