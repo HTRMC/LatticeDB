@@ -62,6 +62,22 @@ fn hasSubquery(expr: *const ast.Expression) bool {
             }
             break :blk false;
         },
+        .case_expr => |ce| blk: {
+            for (ce.when_clauses) |wc| {
+                if (hasSubquery(wc.condition)) break :blk true;
+                if (hasSubquery(wc.result)) break :blk true;
+            }
+            if (ce.else_result) |er| {
+                if (hasSubquery(er)) break :blk true;
+            }
+            break :blk false;
+        },
+        .function_call => |fc| blk: {
+            for (fc.args) |arg| {
+                if (hasSubquery(arg)) break :blk true;
+            }
+            break :blk false;
+        },
         .column_ref, .qualified_ref, .literal => false,
     };
 }
@@ -645,7 +661,7 @@ fn resolveSelectColumns(allocator: std.mem.Allocator, sel_cols: []const ast.Sele
                 allocator.free(indices);
                 return null;
             },
-            .aggregate => {
+            .aggregate, .expression => {
                 allocator.free(indices);
                 return null;
             },

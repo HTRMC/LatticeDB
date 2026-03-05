@@ -1361,7 +1361,7 @@ pub const Executor = struct {
                 .qualified => |q| {
                     agg_col_indices[i] = resolveColumnIndex(schema, q.column) orelse return ExecError.ColumnNotFound;
                 },
-                .all_columns => return ExecError.ColumnNotFound,
+                .all_columns, .expression => return ExecError.ColumnNotFound,
             }
         }
 
@@ -1550,6 +1550,7 @@ pub const Executor = struct {
                 .named => |name| self.allocator.dupe(u8, name) catch return ExecError.OutOfMemory,
                 .qualified => |q| self.allocator.dupe(u8, q.column) catch return ExecError.OutOfMemory,
                 .all_columns => unreachable,
+                .expression => return ExecError.ColumnNotFound, // expression columns not supported in aggregates
             };
         }
 
@@ -1591,6 +1592,7 @@ pub const Executor = struct {
                         break :blk self.allocator.dupe(u8, "NULL") catch return ExecError.OutOfMemory;
                     },
                     .all_columns => unreachable,
+                    .expression => return ExecError.ColumnNotFound,
                 };
             }
 
@@ -2571,6 +2573,8 @@ pub const Executor = struct {
                 }
                 return true;
             },
+            // CASE and function_call: stub — not yet evaluated in WHERE
+            .case_expr, .function_call => return true,
         }
     }
 

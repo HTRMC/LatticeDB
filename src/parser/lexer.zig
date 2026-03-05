@@ -69,6 +69,21 @@ pub const TokenType = enum {
     // EXPLAIN
     kw_explain,
 
+    // CASE expression
+    kw_case,
+    kw_when,
+    kw_then,
+    kw_else,
+    kw_end,
+
+    // String functions
+    kw_lower,
+    kw_upper,
+    kw_trim,
+    kw_length,
+    kw_substring,
+    kw_concat,
+
     // Transaction keywords
     kw_begin,
     kw_commit,
@@ -175,6 +190,17 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "index", .kw_index },
     .{ "unique", .kw_unique },
     .{ "explain", .kw_explain },
+    .{ "case", .kw_case },
+    .{ "when", .kw_when },
+    .{ "then", .kw_then },
+    .{ "else", .kw_else },
+    .{ "end", .kw_end },
+    .{ "lower", .kw_lower },
+    .{ "upper", .kw_upper },
+    .{ "trim", .kw_trim },
+    .{ "length", .kw_length },
+    .{ "substring", .kw_substring },
+    .{ "concat", .kw_concat },
     .{ "int", .kw_int },
     .{ "integer", .kw_integer },
     .{ "bigint", .kw_bigint },

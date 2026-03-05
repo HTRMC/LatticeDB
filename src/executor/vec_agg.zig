@@ -61,6 +61,10 @@ pub const VecHashAggregate = struct {
                 .all_columns => {
                     agg_col_indices[i] = null;
                 },
+                .expression => {
+                    allocator.free(agg_col_indices);
+                    return error.OutOfMemory; // expression columns not supported in aggregates
+                },
             }
         }
 
@@ -203,6 +207,7 @@ pub const VecHashAggregate = struct {
                 .named => |name| allocator.dupe(u8, name) catch return ExecError.OutOfMemory,
                 .qualified => |q| allocator.dupe(u8, q.column) catch return ExecError.OutOfMemory,
                 .all_columns => unreachable,
+                .expression => return ExecError.ColumnNotFound,
             };
         }
 
@@ -243,6 +248,7 @@ pub const VecHashAggregate = struct {
                         break :blk allocator.dupe(u8, "NULL") catch return ExecError.OutOfMemory;
                     },
                     .all_columns => unreachable,
+                    .expression => return ExecError.ColumnNotFound,
                 };
             }
 

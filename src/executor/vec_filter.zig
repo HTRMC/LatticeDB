@@ -441,6 +441,8 @@ fn evalExprOnChunk(expr: *const ast.Expression, chunk: *DataChunk, schema: *cons
         .column_ref => return true,
         // Subqueries and exists not supported in vectorized path
         .in_subquery, .exists_subquery, .qualified_ref => return true,
+        // CASE and function_call: stub — not yet evaluated in vectorized filter
+        .case_expr, .function_call => return true,
     }
 }
 

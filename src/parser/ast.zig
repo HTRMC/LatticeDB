@@ -96,6 +96,32 @@ pub const Expression = union(enum) {
     exists_subquery: struct {
         subquery: *const Select,
     },
+    /// CASE [operand] WHEN cond THEN result [ELSE default] END
+    case_expr: struct {
+        when_clauses: []const WhenClause,
+        else_result: ?*const Expression,
+    },
+    /// Scalar function call: LOWER(expr), UPPER(expr), etc.
+    function_call: struct {
+        func: BuiltinFunction,
+        args: []const *const Expression,
+    },
+};
+
+/// Built-in scalar function type
+pub const BuiltinFunction = enum {
+    lower,
+    upper,
+    trim,
+    length,
+    substring,
+    concat,
+};
+
+/// CASE WHEN clause
+pub const WhenClause = struct {
+    condition: *const Expression,
+    result: *const Expression,
 };
 
 /// Aggregate function type
@@ -123,6 +149,8 @@ pub const SelectColumn = union(enum) {
         func: AggregateFunc,
         column: ?[]const u8, // null for COUNT(*)
     },
+    /// SELECT expression (function call, CASE, etc.)
+    expression: *const Expression,
 };
 
 /// Top-level SQL statement
