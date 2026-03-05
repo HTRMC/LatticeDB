@@ -18,6 +18,7 @@ pub const ColumnDef = struct {
     max_length: u16, // for VARCHAR(n)
     nullable: bool, // default true unless PRIMARY KEY
     is_primary_key: bool,
+    default_value: ?LiteralValue, // DEFAULT literal
 };
 
 /// Comparison operators in WHERE clauses

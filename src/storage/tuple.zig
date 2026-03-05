@@ -34,6 +34,7 @@ pub const Column = struct {
     col_type: ColumnType,
     max_length: u16, // Only meaningful for varchar
     nullable: bool,
+    default_value: ?Value = null,
 };
 
 /// Schema - describes the structure of a table's rows

@@ -108,6 +108,9 @@ pub const TokenType = enum {
     // Pagination
     kw_offset,
 
+    // DEFAULT
+    kw_default,
+
     // Transaction keywords
     kw_begin,
     kw_commit,
@@ -214,6 +217,7 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "union", .kw_union },
     .{ "all", .kw_all },
     .{ "offset", .kw_offset },
+    .{ "default", .kw_default },
     .{ "begin", .kw_begin },
     .{ "commit", .kw_commit },
     .{ "rollback", .kw_rollback },
