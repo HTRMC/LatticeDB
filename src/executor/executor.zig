@@ -73,6 +73,8 @@ pub const Executor = struct {
     current_params: ?[]const ast.LiteralValue = null,
     /// In-memory CHECK constraints (table_name → check expressions SQL text)
     check_constraints: std.StringHashMapUnmanaged([]const []const u8) = .empty,
+    /// In-memory view definitions (view_name → SELECT SQL text)
+    views: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     const Self = @This();
 
@@ -103,6 +105,13 @@ pub const Executor = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.check_constraints.deinit(self.allocator);
+
+        var vit = self.views.iterator();
+        while (vit.next()) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.views.deinit(self.allocator);
     }
 
     /// A prepared statement that can be executed multiple times with different parameters.
@@ -147,6 +156,8 @@ pub const Executor = struct {
             .alter_table => |at| self.execAlterTable(at),
             .explain => |ex| self.execExplain(ex),
             .union_query => |uq| self.execUnion(uq),
+            .create_view => |cv| self.execCreateView(cv),
+            .drop_view => |name| self.execDropView(name),
             .begin_txn => self.execBegin(),
             .commit_txn => self.execCommit(),
             .rollback_txn => self.execRollback(),
@@ -175,6 +186,8 @@ pub const Executor = struct {
             .alter_table => |at| self.execAlterTable(at),
             .explain => |ex| self.execExplain(ex),
             .union_query => |uq| self.execUnion(uq),
+            .create_view => |cv| self.execCreateView(cv),
+            .drop_view => |name| self.execDropView(name),
             .begin_txn => self.execBegin(),
             .commit_txn => self.execCommit(),
             .rollback_txn => self.execRollback(),
@@ -824,6 +837,199 @@ pub const Executor = struct {
         return .{ .rows = .{ .columns = columns, .rows = rows } };
     }
 
+    fn execCreateView(self: *Self, cv: ast.CreateView) ExecError!ExecResult {
+        // Check if view already exists
+        if (self.views.contains(cv.view_name)) {
+            return ExecError.TableAlreadyExists;
+        }
+        // Also check if a real table with this name exists
+        const tbl_result = self.catalog.openTable(cv.view_name) catch {
+            return ExecError.StorageError;
+        };
+        if (tbl_result) |res| {
+            self.catalog.freeSchema(res.schema);
+            return ExecError.TableAlreadyExists;
+        }
+
+        // Serialize the SELECT query back to SQL text and store it
+        var sql_buf: std.ArrayList(u8) = .empty;
+        defer sql_buf.deinit(self.allocator);
+        self.writeSelect(cv.query, &sql_buf) catch return ExecError.OutOfMemory;
+
+        const sql_text = self.allocator.dupe(u8, sql_buf.items) catch return ExecError.OutOfMemory;
+        errdefer self.allocator.free(sql_text);
+        const name = self.allocator.dupe(u8, cv.view_name) catch return ExecError.OutOfMemory;
+        errdefer self.allocator.free(name);
+
+        self.views.put(self.allocator, name, sql_text) catch return ExecError.OutOfMemory;
+
+        const msg = std.fmt.allocPrint(self.allocator, "VIEW {s} created.", .{cv.view_name}) catch return ExecError.OutOfMemory;
+        return ExecResult{ .message = msg };
+    }
+
+    fn execDropView(self: *Self, name: []const u8) ExecError!ExecResult {
+        const kv = self.views.fetchRemove(name) orelse return ExecError.TableNotFound;
+        self.allocator.free(kv.value);
+        self.allocator.free(kv.key);
+
+        const msg = std.fmt.allocPrint(self.allocator, "VIEW {s} dropped.", .{name}) catch return ExecError.OutOfMemory;
+        return ExecResult{ .message = msg };
+    }
+
+    fn execViewSelect(self: *Self, outer_sel: ast.Select, view_sql: []const u8) ExecError!ExecResult {
+        // Parse and execute the view's stored query
+        var parser = Parser.init(self.allocator, view_sql);
+        defer parser.deinit();
+        const stmt = parser.parse() catch return ExecError.ParseError;
+        const view_sel = stmt.select;
+
+        // Execute the view query to get the base result
+        const view_result = try self.execSelect(view_sel);
+
+        // If the outer query is just SELECT * with no WHERE/ORDER/LIMIT, return as-is
+        const is_simple = outer_sel.columns.len == 1 and outer_sel.columns[0] == .all_columns and
+            outer_sel.where_clause == null and outer_sel.order_by == null and
+            outer_sel.limit == null and outer_sel.offset == null and !outer_sel.distinct;
+
+        if (is_simple) return view_result;
+
+        // Otherwise, apply outer projections via derived table execution
+        defer self.freeResult(view_result);
+        const sub_rows = view_result.rows;
+
+        const out_col_count = outer_sel.columns.len;
+        const col_indices = self.allocator.alloc(usize, out_col_count) catch return ExecError.OutOfMemory;
+        defer self.allocator.free(col_indices);
+        var all_star = false;
+
+        for (outer_sel.columns, 0..) |col, ci| {
+            switch (col) {
+                .all_columns => {
+                    all_star = true;
+                    break;
+                },
+                .named => |name| {
+                    var found = false;
+                    for (sub_rows.columns, 0..) |sc, si| {
+                        if (std.ascii.eqlIgnoreCase(name, sc)) {
+                            col_indices[ci] = si;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) return ExecError.ColumnNotFound;
+                },
+                else => return ExecError.ColumnNotFound,
+            }
+        }
+
+        if (all_star) {
+            // Copy all columns
+            const cols = self.allocator.alloc([]const u8, sub_rows.columns.len) catch return ExecError.OutOfMemory;
+            for (sub_rows.columns, 0..) |c, i| {
+                cols[i] = self.allocator.dupe(u8, c) catch return ExecError.OutOfMemory;
+            }
+            const rows = self.allocator.alloc(ResultRow, sub_rows.rows.len) catch return ExecError.OutOfMemory;
+            for (sub_rows.rows, 0..) |row, ri| {
+                const vals = self.allocator.alloc([]const u8, row.values.len) catch return ExecError.OutOfMemory;
+                for (row.values, 0..) |v, vi| {
+                    vals[vi] = self.allocator.dupe(u8, v) catch return ExecError.OutOfMemory;
+                }
+                rows[ri] = .{ .values = vals };
+            }
+            return ExecResult{ .rows = .{ .columns = cols, .rows = rows } };
+        }
+
+        // Project specific columns
+        const col_names = self.allocator.alloc([]const u8, out_col_count) catch return ExecError.OutOfMemory;
+        for (0..out_col_count) |ci| {
+            const alias = if (outer_sel.aliases) |a| a[ci] else null;
+            col_names[ci] = self.allocator.dupe(u8, alias orelse sub_rows.columns[col_indices[ci]]) catch return ExecError.OutOfMemory;
+        }
+        const rows = self.allocator.alloc(ResultRow, sub_rows.rows.len) catch return ExecError.OutOfMemory;
+        for (sub_rows.rows, 0..) |row, ri| {
+            const vals = self.allocator.alloc([]const u8, out_col_count) catch return ExecError.OutOfMemory;
+            for (0..out_col_count) |ci| {
+                vals[ci] = self.allocator.dupe(u8, row.values[col_indices[ci]]) catch return ExecError.OutOfMemory;
+            }
+            rows[ri] = .{ .values = vals };
+        }
+        return ExecResult{ .rows = .{ .columns = col_names, .rows = rows } };
+    }
+
+    fn writeSelect(self: *Self, sel: ast.Select, buf: *std.ArrayList(u8)) !void {
+        try buf.appendSlice(self.allocator, "SELECT ");
+        if (sel.distinct) try buf.appendSlice(self.allocator, "DISTINCT ");
+        for (sel.columns, 0..) |col, ci| {
+            if (ci > 0) try buf.appendSlice(self.allocator, ", ");
+            switch (col) {
+                .all_columns => try buf.appendSlice(self.allocator, "*"),
+                .named => |n| try buf.appendSlice(self.allocator, n),
+                .qualified => |q| {
+                    try buf.appendSlice(self.allocator, q.table);
+                    try buf.append(self.allocator, '.');
+                    try buf.appendSlice(self.allocator, q.column);
+                },
+                .aggregate => |agg| {
+                    const fname: []const u8 = switch (agg.func) {
+                        .count => "COUNT",
+                        .sum => "SUM",
+                        .avg => "AVG",
+                        .min => "MIN",
+                        .max => "MAX",
+                    };
+                    try buf.appendSlice(self.allocator, fname);
+                    try buf.append(self.allocator, '(');
+                    if (agg.distinct) try buf.appendSlice(self.allocator, "DISTINCT ");
+                    if (agg.column) |c| try buf.appendSlice(self.allocator, c) else try buf.append(self.allocator, '*');
+                    try buf.append(self.allocator, ')');
+                },
+                .expression => |expr| try self.writeExpr(buf, expr),
+            }
+            if (sel.aliases) |aliases| {
+                if (aliases[ci]) |alias| {
+                    try buf.appendSlice(self.allocator, " AS ");
+                    try buf.appendSlice(self.allocator, alias);
+                }
+            }
+        }
+        try buf.appendSlice(self.allocator, " FROM ");
+        try buf.appendSlice(self.allocator, sel.table_name);
+        if (sel.where_clause) |wc| {
+            try buf.appendSlice(self.allocator, " WHERE ");
+            try self.writeExpr(buf, wc);
+        }
+        if (sel.group_by) |gb| {
+            try buf.appendSlice(self.allocator, " GROUP BY ");
+            for (gb, 0..) |g, gi| {
+                if (gi > 0) try buf.appendSlice(self.allocator, ", ");
+                try buf.appendSlice(self.allocator, g);
+            }
+        }
+        if (sel.having_clause) |hc| {
+            try buf.appendSlice(self.allocator, " HAVING ");
+            try self.writeExpr(buf, hc);
+        }
+        if (sel.order_by) |ob| {
+            try buf.appendSlice(self.allocator, " ORDER BY ");
+            for (ob, 0..) |o, oi| {
+                if (oi > 0) try buf.appendSlice(self.allocator, ", ");
+                try buf.appendSlice(self.allocator, o.column);
+                if (!o.ascending) try buf.appendSlice(self.allocator, " DESC");
+            }
+        }
+        if (sel.limit) |l| {
+            const s = try std.fmt.allocPrint(self.allocator, " LIMIT {d}", .{l});
+            defer self.allocator.free(s);
+            try buf.appendSlice(self.allocator, s);
+        }
+        if (sel.offset) |o| {
+            const s = try std.fmt.allocPrint(self.allocator, " OFFSET {d}", .{o});
+            defer self.allocator.free(s);
+            try buf.appendSlice(self.allocator, s);
+        }
+    }
+
     // ============================================================
     // Index Scan execution
     // ============================================================
@@ -1363,7 +1569,13 @@ pub const Executor = struct {
 
         const result = self.catalog.openTable(sel.table_name) catch {
             return ExecError.StorageError;
-        } orelse return ExecError.TableNotFound;
+        } orelse {
+            // Check if it's a view
+            if (self.views.get(sel.table_name)) |view_sql| {
+                return self.execViewSelect(sel, view_sql);
+            }
+            return ExecError.TableNotFound;
+        };
         defer self.catalog.freeSchema(result.schema);
         var table = result.table;
 
@@ -8163,4 +8375,85 @@ test "executor derived table (FROM subquery)" {
     defer exec.freeResult(r2);
     try std.testing.expectEqual(@as(usize, 1), r2.rows.columns.len);
     try std.testing.expectEqualStrings("alice", r2.rows.rows[0].values[0]);
+}
+
+test "executor CREATE VIEW and SELECT from view" {
+    const test_file = "test_exec_view.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+    defer exec.deinit();
+
+    const ct = try exec.execute("CREATE TABLE employees (id INT, name TEXT, dept TEXT)");
+    exec.freeResult(ct);
+    const ins = try exec.execute("INSERT INTO employees VALUES (1, 'Alice', 'Eng'), (2, 'Bob', 'Sales'), (3, 'Carol', 'Eng')");
+    exec.freeResult(ins);
+
+    // CREATE VIEW
+    const cv = try exec.execute("CREATE VIEW eng_employees AS SELECT id, name FROM employees WHERE dept = 'Eng'");
+    exec.freeResult(cv);
+
+    // SELECT * FROM view
+    const r = try exec.execute("SELECT * FROM eng_employees");
+    defer exec.freeResult(r);
+    try std.testing.expectEqual(@as(usize, 2), r.rows.rows.len);
+    try std.testing.expectEqualStrings("id", r.rows.columns[0]);
+    try std.testing.expectEqualStrings("name", r.rows.columns[1]);
+    try std.testing.expectEqualStrings("1", r.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("Alice", r.rows.rows[0].values[1]);
+    try std.testing.expectEqualStrings("3", r.rows.rows[1].values[0]);
+    try std.testing.expectEqualStrings("Carol", r.rows.rows[1].values[1]);
+
+    // SELECT specific column from view
+    const r2 = try exec.execute("SELECT name FROM eng_employees");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqual(@as(usize, 1), r2.rows.columns.len);
+    try std.testing.expectEqualStrings("Alice", r2.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("Carol", r2.rows.rows[1].values[0]);
+
+    // DROP VIEW
+    const dv = try exec.execute("DROP VIEW eng_employees");
+    exec.freeResult(dv);
+
+    // SELECT from dropped view should fail
+    const err = exec.execute("SELECT * FROM eng_employees");
+    try std.testing.expectError(ExecError.TableNotFound, err);
+}
+
+test "executor CREATE VIEW duplicate name" {
+    const test_file = "test_exec_view_dup.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+    defer exec.deinit();
+
+    const ct = try exec.execute("CREATE TABLE t (id INT)");
+    exec.freeResult(ct);
+
+    const cv = try exec.execute("CREATE VIEW v AS SELECT id FROM t");
+    exec.freeResult(cv);
+
+    // Duplicate view name
+    const err1 = exec.execute("CREATE VIEW v AS SELECT id FROM t");
+    try std.testing.expectError(ExecError.TableAlreadyExists, err1);
+
+    // View name same as existing table
+    const err2 = exec.execute("CREATE VIEW t AS SELECT id FROM t");
+    try std.testing.expectError(ExecError.TableAlreadyExists, err2);
 }
