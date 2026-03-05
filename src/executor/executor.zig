@@ -1021,14 +1021,11 @@ pub const Executor = struct {
             return ExecError.ColumnCountMismatch;
         }
 
-        // Use left's column names
-        // Free right's column names
-        for (right.columns) |col| {
-            self.allocator.free(col);
-        }
+        // Use left's column names, free right's
+        for (right.columns) |col| self.allocator.free(col);
         self.allocator.free(right.columns);
 
-        if (uq.all) {
+        if (uq.op == .@"union" and uq.all) {
             // UNION ALL: just concatenate
             const combined = self.allocator.alloc(ResultRow, left.rows.len + right.rows.len) catch return ExecError.OutOfMemory;
             @memcpy(combined[0..left.rows.len], left.rows);
@@ -1038,43 +1035,95 @@ pub const Executor = struct {
             return ExecResult{ .rows = .{ .columns = left.columns, .rows = combined } };
         }
 
-        // UNION: deduplicate
-        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        // Build right-side hash set for EXCEPT/INTERSECT, or combined dedup for UNION
+        var right_set: std.StringHashMapUnmanaged(void) = .empty;
         defer {
-            var kit = seen.keyIterator();
+            var kit = right_set.keyIterator();
             while (kit.next()) |k| self.allocator.free(k.*);
-            seen.deinit(self.allocator);
+            right_set.deinit(self.allocator);
         }
-        var unique_rows: std.ArrayList(ResultRow) = .empty;
 
-        // Build key for each row and keep unique ones
-        const all_rows = [_][]ResultRow{ left.rows, right.rows };
-        for (&all_rows) |rows| {
-            for (rows) |row| {
-                var key_parts: std.ArrayList(u8) = .empty;
-                for (row.values, 0..) |val, i| {
-                    if (i > 0) key_parts.append(self.allocator, 0) catch return ExecError.OutOfMemory;
-                    key_parts.appendSlice(self.allocator, val) catch return ExecError.OutOfMemory;
+        // Build keys for right rows
+        for (right.rows) |row| {
+            const key = self.buildRowKey(row) catch return ExecError.OutOfMemory;
+            const gop = right_set.getOrPut(self.allocator, key) catch return ExecError.OutOfMemory;
+            if (gop.found_existing) self.allocator.free(key);
+        }
+
+        var result_rows: std.ArrayList(ResultRow) = .empty;
+
+        switch (uq.op) {
+            .@"union" => {
+                // UNION (no ALL): deduplicate across both sides
+                var seen: std.StringHashMapUnmanaged(void) = .empty;
+                defer {
+                    var kit = seen.keyIterator();
+                    while (kit.next()) |k| self.allocator.free(k.*);
+                    seen.deinit(self.allocator);
                 }
-                const key = key_parts.toOwnedSlice(self.allocator) catch return ExecError.OutOfMemory;
-                if (seen.contains(key)) {
-                    self.allocator.free(key);
-                    for (row.values) |val| {
-                        self.allocator.free(val);
+                const all_rows = [_][]ResultRow{ left.rows, right.rows };
+                for (&all_rows) |rows| {
+                    for (rows) |row| {
+                        const key = self.buildRowKey(row) catch return ExecError.OutOfMemory;
+                        if (seen.contains(key)) {
+                            self.allocator.free(key);
+                            self.freeRow(row);
+                        } else {
+                            seen.put(self.allocator, key, {}) catch return ExecError.OutOfMemory;
+                            result_rows.append(self.allocator, row) catch return ExecError.OutOfMemory;
+                        }
                     }
-                    self.allocator.free(row.values);
-                } else {
-                    seen.put(self.allocator, key, {}) catch return ExecError.OutOfMemory;
-                    unique_rows.append(self.allocator, row) catch return ExecError.OutOfMemory;
                 }
-            }
+            },
+            .except => {
+                // EXCEPT: keep left rows not in right
+                for (left.rows) |row| {
+                    const key = self.buildRowKey(row) catch return ExecError.OutOfMemory;
+                    defer self.allocator.free(key);
+                    if (right_set.contains(key)) {
+                        self.freeRow(row);
+                    } else {
+                        result_rows.append(self.allocator, row) catch return ExecError.OutOfMemory;
+                    }
+                }
+                // Free all right rows
+                for (right.rows) |row| self.freeRow(row);
+            },
+            .intersect => {
+                // INTERSECT: keep left rows that are also in right
+                for (left.rows) |row| {
+                    const key = self.buildRowKey(row) catch return ExecError.OutOfMemory;
+                    defer self.allocator.free(key);
+                    if (right_set.contains(key)) {
+                        result_rows.append(self.allocator, row) catch return ExecError.OutOfMemory;
+                    } else {
+                        self.freeRow(row);
+                    }
+                }
+                // Free all right rows
+                for (right.rows) |row| self.freeRow(row);
+            },
         }
 
         self.allocator.free(left.rows);
         self.allocator.free(right.rows);
 
-        const result_rows = unique_rows.toOwnedSlice(self.allocator) catch return ExecError.OutOfMemory;
-        return ExecResult{ .rows = .{ .columns = left.columns, .rows = result_rows } };
+        const rows = result_rows.toOwnedSlice(self.allocator) catch return ExecError.OutOfMemory;
+        return ExecResult{ .rows = .{ .columns = left.columns, .rows = rows } };
+    }
+
+    fn buildRowKey(self: *Self, row: ResultRow) ![]const u8 {
+        var key_parts: std.ArrayList(u8) = .empty;
+        for (row.values, 0..) |val, i| {
+            if (i > 0) key_parts.append(self.allocator, 0) catch return ExecError.OutOfMemory;
+            key_parts.appendSlice(self.allocator, val) catch return ExecError.OutOfMemory;
+        }
+        return key_parts.toOwnedSlice(self.allocator) catch return ExecError.OutOfMemory;
+    }
+
+    fn freeRow(self: *Self, row: ResultRow) void {
+        for (row.values) |val| self.allocator.free(val);
+        self.allocator.free(row.values);
     }
 
     fn execSelect(self: *Self, sel: ast.Select) ExecError!ExecResult {
@@ -7748,4 +7797,40 @@ test "executor string functions REPLACE, POSITION, LEFT, RIGHT, REVERSE, LPAD, R
     const r7 = try exec.execute("SELECT RPAD(name, 15, '-') FROM t");
     defer exec.freeResult(r7);
     try std.testing.expectEqualStrings("hello world----", r7.rows.rows[0].values[0]);
+}
+
+test "executor EXCEPT and INTERSECT" {
+    const test_file = "test_exec_except_intersect.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    const ct1 = try exec.execute("CREATE TABLE t1 (id INT)");
+    exec.freeResult(ct1);
+    const ct2 = try exec.execute("CREATE TABLE t2 (id INT)");
+    exec.freeResult(ct2);
+
+    const ins1 = try exec.execute("INSERT INTO t1 VALUES (1), (2), (3)");
+    exec.freeResult(ins1);
+    const ins2 = try exec.execute("INSERT INTO t2 VALUES (2), (3), (4)");
+    exec.freeResult(ins2);
+
+    // EXCEPT: t1 - t2 = {1}
+    const r1 = try exec.execute("SELECT id FROM t1 EXCEPT SELECT id FROM t2");
+    defer exec.freeResult(r1);
+    try std.testing.expectEqual(@as(usize, 1), r1.rows.rows.len);
+    try std.testing.expectEqualStrings("1", r1.rows.rows[0].values[0]);
+
+    // INTERSECT: t1 & t2 = {2, 3}
+    const r2 = try exec.execute("SELECT id FROM t1 INTERSECT SELECT id FROM t2");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqual(@as(usize, 2), r2.rows.rows.len);
 }

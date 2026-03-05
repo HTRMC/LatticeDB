@@ -304,10 +304,13 @@ pub const DropIndex = struct {
     index_name: []const u8,
 };
 
+pub const SetOpType = enum { @"union", except, intersect };
+
 pub const UnionQuery = struct {
     left: Select,
     right: Select,
-    all: bool, // true = UNION ALL (keep duplicates)
+    all: bool, // true = UNION ALL / EXCEPT ALL / INTERSECT ALL
+    op: SetOpType = .@"union",
 };
 
 pub const Explain = struct {

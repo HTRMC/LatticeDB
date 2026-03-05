@@ -54,13 +54,19 @@ pub const Parser = struct {
         const stmt = switch (self.current.type) {
             .kw_select => blk: {
                 const sel = try self.parseSelect();
-                // Check for UNION [ALL]
-                if (self.current.type == .kw_union) {
+                // Check for UNION/EXCEPT/INTERSECT [ALL]
+                const set_op: ?ast.SetOpType = switch (self.current.type) {
+                    .kw_union => .@"union",
+                    .kw_except => .except,
+                    .kw_intersect => .intersect,
+                    else => null,
+                };
+                if (set_op) |op| {
                     self.advance();
                     const all = self.current.type == .kw_all;
                     if (all) self.advance();
                     const right = try self.parseSelect();
-                    break :blk ast.Statement{ .union_query = .{ .left = sel, .right = right, .all = all } };
+                    break :blk ast.Statement{ .union_query = .{ .left = sel, .right = right, .all = all, .op = op } };
                 }
                 break :blk ast.Statement{ .select = sel };
             },

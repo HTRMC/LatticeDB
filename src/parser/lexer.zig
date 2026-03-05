@@ -111,6 +111,8 @@ pub const TokenType = enum {
     // Set operations
     kw_union,
     kw_all,
+    kw_except,
+    kw_intersect,
 
     // Pagination
     kw_offset,
@@ -223,6 +225,8 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "like", .kw_like },
     .{ "union", .kw_union },
     .{ "all", .kw_all },
+    .{ "except", .kw_except },
+    .{ "intersect", .kw_intersect },
     .{ "offset", .kw_offset },
     .{ "default", .kw_default },
     .{ "begin", .kw_begin },
