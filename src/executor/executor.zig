@@ -196,6 +196,7 @@ pub const Executor = struct {
             .union_query => |uq| self.execUnion(uq),
             .create_view => |cv| self.execCreateView(cv),
             .drop_view => |name| self.execDropView(name),
+            .cte_select => |cs| self.execCTESelect(cs),
             .begin_txn => self.execBegin(),
             .commit_txn => self.execCommit(),
             .rollback_txn => self.execRollback(),
@@ -226,6 +227,7 @@ pub const Executor = struct {
             .union_query => |uq| self.execUnion(uq),
             .create_view => |cv| self.execCreateView(cv),
             .drop_view => |name| self.execDropView(name),
+            .cte_select => |cs| self.execCTESelect(cs),
             .begin_txn => self.execBegin(),
             .commit_txn => self.execCommit(),
             .rollback_txn => self.execRollback(),
@@ -1821,6 +1823,20 @@ pub const Executor = struct {
         }
 
         return ExecResult{ .rows = .{ .columns = col_names, .rows = rows } };
+    }
+
+    fn execCTESelect(self: *Self, cs: ast.CTESelect) ExecError!ExecResult {
+        // Transform the main SELECT by replacing CTE name references with subqueries
+        var main = cs.select;
+        for (cs.ctes) |cte| {
+            if (std.mem.eql(u8, main.table_name, cte.name)) {
+                const sub = self.allocator.create(ast.Select) catch return ExecError.OutOfMemory;
+                sub.* = cte.query;
+                main.subquery = sub;
+                break;
+            }
+        }
+        return self.execSelect(main);
     }
 
     fn execSelect(self: *Self, sel: ast.Select) ExecError!ExecResult {

@@ -52,6 +52,9 @@ pub const Parser = struct {
     /// Parse a single SQL statement
     pub fn parse(self: *Self) ParseError!ast.Statement {
         const stmt = switch (self.current.type) {
+            .kw_with => blk: {
+                break :blk ast.Statement{ .cte_select = try self.parseCTESelect() };
+            },
             .kw_select => blk: {
                 const sel = try self.parseSelect();
                 // Check for UNION/EXCEPT/INTERSECT [ALL]
@@ -128,6 +131,33 @@ pub const Parser = struct {
         }
 
         return stmt;
+    }
+
+    // ============================================================
+    // WITH name AS (SELECT ...) [, name AS (SELECT ...)] SELECT ...
+    // ============================================================
+    fn parseCTESelect(self: *Self) ParseError!ast.CTESelect {
+        try self.expect(.kw_with);
+        var ctes: std.ArrayList(ast.CTE) = .empty;
+        const alloc = self.arena();
+
+        while (true) {
+            const name = try self.expectIdentifier();
+            try self.expect(.kw_as);
+            try self.expect(.left_paren);
+            const query = try self.parseSelect();
+            try self.expect(.right_paren);
+            ctes.append(alloc, .{ .name = name, .query = query }) catch return ParseError.OutOfMemory;
+
+            if (self.current.type != .comma) break;
+            self.advance(); // consume comma
+        }
+
+        const main_select = try self.parseSelect();
+        return .{
+            .ctes = ctes.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
+            .select = main_select,
+        };
     }
 
     // ============================================================

@@ -240,6 +240,7 @@ pub const Statement = union(enum) {
     union_query: UnionQuery,
     create_view: CreateView,
     drop_view: []const u8, // view name
+    cte_select: CTESelect,
     begin_txn: void,
     commit_txn: void,
     rollback_txn: void,
@@ -364,5 +365,15 @@ pub const UnionQuery = struct {
 };
 
 pub const Explain = struct {
+    select: Select,
+};
+
+pub const CTE = struct {
+    name: []const u8,
+    query: Select,
+};
+
+pub const CTESelect = struct {
+    ctes: []const CTE,
     select: Select,
 };
