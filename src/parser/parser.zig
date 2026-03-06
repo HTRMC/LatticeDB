@@ -103,6 +103,11 @@ pub const Parser = struct {
                 }
                 break :blk ast.Statement{ .drop_table = try self.parseDropTable() };
             },
+            .kw_truncate => blk: {
+                self.advance(); // consume TRUNCATE
+                if (self.current.type == .kw_table) self.advance(); // optional TABLE
+                break :blk ast.Statement{ .truncate_table = try self.expectIdentifier() };
+            },
             .kw_alter => ast.Statement{ .alter_table = try self.parseAlterTable() },
             .kw_explain => blk: {
                 self.advance(); // consume EXPLAIN

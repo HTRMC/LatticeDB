@@ -166,6 +166,9 @@ pub const TokenType = enum {
     // CTE
     kw_with,
 
+    // TRUNCATE
+    kw_truncate,
+
     // UPSERT
     kw_conflict,
     kw_do,
@@ -326,6 +329,7 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "json", .kw_json },
     .{ "jsonb", .kw_jsonb },
     .{ "with", .kw_with },
+    .{ "truncate", .kw_truncate },
     .{ "conflict", .kw_conflict },
     .{ "do", .kw_do },
     .{ "nothing", .kw_nothing },

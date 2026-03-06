@@ -196,6 +196,7 @@ pub const Executor = struct {
             .union_query => |uq| self.execUnion(uq),
             .create_view => |cv| self.execCreateView(cv),
             .drop_view => |name| self.execDropView(name),
+            .truncate_table => |name| self.execTruncate(name),
             .cte_select => |cs| self.execCTESelect(cs),
             .begin_txn => self.execBegin(),
             .commit_txn => self.execCommit(),
@@ -227,6 +228,7 @@ pub const Executor = struct {
             .union_query => |uq| self.execUnion(uq),
             .create_view => |cv| self.execCreateView(cv),
             .drop_view => |name| self.execDropView(name),
+            .truncate_table => |name| self.execTruncate(name),
             .cte_select => |cs| self.execCTESelect(cs),
             .begin_txn => self.execBegin(),
             .commit_txn => self.execCommit(),
@@ -1855,6 +1857,47 @@ pub const Executor = struct {
         }
 
         return ExecResult{ .rows = .{ .columns = col_names, .rows = rows } };
+    }
+
+    fn execTruncate(self: *Self, table_name: []const u8) ExecError!ExecResult {
+        const result = self.catalog.openTable(table_name) catch return ExecError.StorageError;
+        const opened = result orelse return ExecError.TableNotFound;
+        defer self.catalog.freeSchema(opened.schema);
+        var table = opened.table;
+        table.txn_manager = self.txn_manager;
+        table.undo_log = self.undo_log;
+
+        const txn = self.current_txn orelse self.beginImplicitTxn();
+
+        // Delete all rows
+        var to_delete: std.ArrayList(page_mod.TupleId) = .empty;
+        defer to_delete.deinit(self.allocator);
+
+        var iter = table.scan() catch {
+            self.abortImplicitTxn(txn);
+            return ExecError.StorageError;
+        };
+        while (iter.next() catch null) |row| {
+            self.allocator.free(row.values);
+            to_delete.append(self.allocator, row.tid) catch {
+                self.abortImplicitTxn(txn);
+                return ExecError.OutOfMemory;
+            };
+        }
+
+        for (to_delete.items) |tid| {
+            _ = table.deleteTuple(txn, tid) catch continue;
+        }
+
+        // Reset serial counters for this table
+        if (self.serial_counters.getPtr(table_name)) |counter| {
+            counter.* = 1;
+        }
+
+        self.commitImplicitTxn(txn);
+
+        const msg = std.fmt.allocPrint(self.allocator, "TRUNCATE TABLE", .{}) catch return ExecError.OutOfMemory;
+        return .{ .message = msg };
     }
 
     fn execCTESelect(self: *Self, cs: ast.CTESelect) ExecError!ExecResult {

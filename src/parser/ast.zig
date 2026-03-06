@@ -240,6 +240,7 @@ pub const Statement = union(enum) {
     union_query: UnionQuery,
     create_view: CreateView,
     drop_view: []const u8, // view name
+    truncate_table: []const u8, // table name
     cte_select: CTESelect,
     begin_txn: void,
     commit_txn: void,
