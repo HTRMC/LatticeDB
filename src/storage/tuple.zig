@@ -15,6 +15,7 @@ pub const ColumnType = enum(u8) {
     timestamp = 8, // epoch seconds as i64
     smallint = 9, // i16
     decimal = 10, // scaled i64 (value * 10^scale), scale in schema
+    uuid = 11, // 16-byte UUID
 
     /// Size of a fixed-length type, null for variable-length
     pub fn fixedSize(self: ColumnType) ?usize {
@@ -23,6 +24,7 @@ pub const ColumnType = enum(u8) {
             .smallint => 2,
             .integer => 4,
             .bigint, .float, .date, .timestamp, .decimal => 8,
+            .uuid => 16,
             .varchar, .text => null,
         };
     }
@@ -83,6 +85,7 @@ pub const Value = union(enum) {
     date: i64, // epoch days
     timestamp: i64, // epoch seconds
     decimal: i64, // scaled integer (value * 10^scale)
+    uuid: []const u8, // 16-byte UUID
 
     pub fn isNull(self: Value) bool {
         return self == .null_value;
@@ -130,6 +133,11 @@ pub const Value = union(enum) {
                 if (buf.len < 8) return error.BufferTooSmall;
                 @memcpy(buf[0..8], std.mem.asBytes(&v));
                 return 8;
+            },
+            .uuid => |v| {
+                if (buf.len < 16) return error.BufferTooSmall;
+                @memcpy(buf[0..16], v[0..16]);
+                return 16;
             },
         }
     }
@@ -199,6 +207,13 @@ pub const Value = union(enum) {
                     .size = 8,
                 };
             },
+            .uuid => {
+                if (buf.len < 16) return error.BufferTooSmall;
+                return .{
+                    .value = .{ .uuid = buf[0..16] },
+                    .size = 16,
+                };
+            },
         }
     }
 
@@ -224,6 +239,9 @@ pub const Value = union(enum) {
             .timestamp => return "TIMESTAMP",
             .decimal => |v| {
                 return std.fmt.bufPrint(buf, "{}", .{v}) catch return error.BufferTooSmall;
+            },
+            .uuid => |v| {
+                return formatUuidBytes(v, buf) catch return error.BufferTooSmall;
             },
         }
     }
@@ -278,6 +296,10 @@ pub const Value = union(enum) {
             .decimal => |v| {
                 hasher.update(&[_]u8{7});
                 hasher.update(std.mem.asBytes(&v));
+            },
+            .uuid => |v| {
+                hasher.update(&[_]u8{8});
+                hasher.update(v[0..16]);
             },
         }
         return hasher.final();
@@ -352,6 +374,12 @@ pub const Value = union(enum) {
             .decimal => |ad| {
                 return switch (b) {
                     .decimal => |bd| ad == bd,
+                    else => false,
+                };
+            },
+            .uuid => |au| {
+                return switch (b) {
+                    .uuid => |bu| std.mem.eql(u8, au[0..16], bu[0..16]),
                     else => false,
                 };
             },
@@ -449,6 +477,7 @@ pub const Tuple = struct {
                 .smallint => size += 2,
                 .integer => size += 4,
                 .bigint, .float, .date, .timestamp, .decimal => size += 8,
+                .uuid => size += 16,
                 .bytes => |v| {
                     _ = i;
                     size += 2 + v.len;
@@ -488,6 +517,47 @@ pub const Tuple = struct {
         return TupleHeader.SIZE + try serializedSize(schema, values);
     }
 };
+
+/// Format 16 UUID bytes as a standard UUID string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
+pub fn formatUuidBytes(bytes: []const u8, buf: []u8) ![]const u8 {
+    if (bytes.len < 16 or buf.len < 36) return error.BufferTooSmall;
+    const hex = "0123456789abcdef";
+    var out: usize = 0;
+    for (0..16) |i| {
+        if (i == 4 or i == 6 or i == 8 or i == 10) {
+            buf[out] = '-';
+            out += 1;
+        }
+        buf[out] = hex[bytes[i] >> 4];
+        buf[out + 1] = hex[bytes[i] & 0x0f];
+        out += 2;
+    }
+    return buf[0..36];
+}
+
+/// Parse a UUID string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx) into 16 bytes.
+pub fn parseUuidString(s: []const u8, out: *[16]u8) bool {
+    if (s.len != 36) return false;
+    if (s[8] != '-' or s[13] != '-' or s[18] != '-' or s[23] != '-') return false;
+    var byte_idx: usize = 0;
+    var i: usize = 0;
+    while (i < 36) : (i += 1) {
+        if (i == 8 or i == 13 or i == 18 or i == 23) continue;
+        const hi = hexVal(s[i]) orelse return false;
+        i += 1;
+        const lo = hexVal(s[i]) orelse return false;
+        out[byte_idx] = (hi << 4) | lo;
+        byte_idx += 1;
+    }
+    return byte_idx == 16;
+}
+
+fn hexVal(c: u8) ?u8 {
+    if (c >= '0' and c <= '9') return c - '0';
+    if (c >= 'a' and c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' and c <= 'F') return c - 'A' + 10;
+    return null;
+}
 
 // Tests
 test "value encode and decode" {

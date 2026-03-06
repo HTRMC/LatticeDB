@@ -856,6 +856,7 @@ pub const Parser = struct {
             .kw_timestamp => .timestamp,
             .kw_decimal, .kw_numeric => .decimal,
             .kw_serial => .serial,
+            .kw_uuid => .uuid,
             else => return ParseError.UnexpectedToken,
         };
         self.advance();

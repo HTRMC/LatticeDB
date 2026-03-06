@@ -43,6 +43,11 @@ pub fn formatValue(allocator: std.mem.Allocator, val: Value) ![]const u8 {
         .date => |d| try formatEpochDays(allocator, d),
         .timestamp => |t| try formatEpochSecs(allocator, t),
         .decimal => |d| try std.fmt.allocPrint(allocator, "{d}", .{d}),
+        .uuid => |u| blk: {
+            var buf: [36]u8 = undefined;
+            const s = tuple_mod.formatUuidBytes(u, &buf) catch return error.OutOfMemory;
+            break :blk try allocator.dupe(u8, s);
+        },
     };
 }
 
@@ -315,6 +320,21 @@ pub fn compareValues(left: Value, op: ast.CompOp, right: Value) bool {
                 .gt => li > ri,
                 .lte => li <= ri,
                 .gte => li >= ri,
+            };
+        },
+        .uuid => |lu| {
+            const ru = switch (right) {
+                .uuid => |v| v,
+                else => return false,
+            };
+            const cmp = std.mem.order(u8, lu[0..16], ru[0..16]);
+            return switch (op) {
+                .eq => cmp == .eq,
+                .neq => cmp != .eq,
+                .lt => cmp == .lt,
+                .gt => cmp == .gt,
+                .lte => cmp != .gt,
+                .gte => cmp != .lt,
             };
         },
         .null_value => return false,
@@ -808,6 +828,19 @@ fn evalCast(
             const i = valToInt(val, allocator) orelse return ExprResult.borrowed(.{ .null_value = {} });
             return ExprResult.borrowed(.{ .timestamp = i });
         },
+        .uuid => {
+            // CAST to UUID from string
+            const s = switch (val) {
+                .bytes => |b| b,
+                .uuid => return ExprResult.borrowed(val),
+                else => return ExprResult.borrowed(.{ .null_value = {} }),
+            };
+            var uuid_buf: [16]u8 = undefined;
+            if (!tuple_mod.parseUuidString(s, &uuid_buf)) return ExprResult.borrowed(.{ .null_value = {} });
+            const mem = allocator.alloc(u8, 16) catch return ExprResult.borrowed(.{ .null_value = {} });
+            @memcpy(mem, &uuid_buf);
+            return ExprResult.owned_val(.{ .uuid = mem });
+        },
     }
 }
 
@@ -826,6 +859,7 @@ fn valToInt(val: Value, allocator: std.mem.Allocator) ?i64 {
         .date => |d| d,
         .timestamp => |t| t,
         .decimal => |d| d,
+        .uuid => null,
         .null_value => null,
     };
 }
@@ -842,6 +876,7 @@ fn valToFloat(val: Value, allocator: std.mem.Allocator) ?f64 {
         .date => |d| @floatFromInt(d),
         .timestamp => |t| @floatFromInt(t),
         .decimal => |d| @floatFromInt(d),
+        .uuid => null,
         .null_value => null,
     };
 }
@@ -1105,6 +1140,11 @@ fn formatValueForConcat(allocator: std.mem.Allocator, val: Value) ![]const u8 {
         .bytes => |s| try allocator.dupe(u8, s),
         .date => |d| try formatEpochDays(allocator, d),
         .timestamp => |t| try formatEpochSecs(allocator, t),
+        .uuid => |u| blk: {
+            var buf: [36]u8 = undefined;
+            const s = tuple_mod.formatUuidBytes(u, &buf) catch return error.OutOfMemory;
+            break :blk try allocator.dupe(u8, s);
+        },
     };
 }
 

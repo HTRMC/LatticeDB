@@ -14,6 +14,7 @@ pub const DataType = enum {
     timestamp,
     decimal,
     serial,
+    uuid,
 };
 
 /// Column definition in CREATE TABLE

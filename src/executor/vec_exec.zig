@@ -663,6 +663,13 @@ fn orderCompareValues(a: Value, b: Value) std.math.Order {
             const bi: u1 = @intFromBool(bb);
             return std.math.order(ai, bi);
         },
+        .uuid => |au| {
+            const bu = switch (b) {
+                .uuid => |v| v,
+                else => return .gt,
+            };
+            return std.mem.order(u8, au[0..16], bu[0..16]);
+        },
         .null_value => return .gt,
     }
 }

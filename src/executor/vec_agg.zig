@@ -438,6 +438,10 @@ fn appendValueToKey(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, val: 
             try buf.appendSlice(allocator, std.mem.asBytes(&len));
             try buf.appendSlice(allocator, s);
         },
+        .uuid => |u| {
+            try buf.append(allocator, 7);
+            try buf.appendSlice(allocator, u[0..16]);
+        },
     }
 }
 

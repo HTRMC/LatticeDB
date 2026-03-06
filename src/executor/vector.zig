@@ -40,7 +40,7 @@ pub const ColumnVector = struct {
             .integer => cv.data = .{ .integers = undefined },
             .bigint, .date, .timestamp, .decimal => cv.data = .{ .bigints = undefined },
             .float => cv.data = .{ .floats = undefined },
-            .varchar, .text => cv.data = .{ .bytes_ptrs = undefined },
+            .varchar, .text, .uuid => cv.data = .{ .bytes_ptrs = undefined },
         }
         return cv;
     }
@@ -70,6 +70,7 @@ pub const ColumnVector = struct {
             .decimal => .{ .decimal = self.data.bigints[row] },
             .float => .{ .float = self.data.floats[row] },
             .varchar, .text => .{ .bytes = self.data.bytes_ptrs[row] },
+            .uuid => .{ .uuid = self.data.bytes_ptrs[row] },
         };
     }
 
@@ -90,6 +91,7 @@ pub const ColumnVector = struct {
             .decimal => self.data.bigints[row] = val.decimal,
             .float => self.data.floats[row] = val.float,
             .varchar, .text => self.data.bytes_ptrs[row] = val.bytes,
+            .uuid => self.data.bytes_ptrs[row] = val.uuid,
         }
     }
 };

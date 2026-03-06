@@ -310,6 +310,11 @@ pub const Catalog = struct {
                     const s = std.fmt.bufPrint(&buf, "{d}", .{iv}) catch break :blk Value{ .null_value = {} };
                     break :blk Value{ .bytes = s };
                 },
+                .uuid => |uv| blk: {
+                    var buf: [36]u8 = undefined;
+                    const s = tuple_mod.formatUuidBytes(uv, &buf) catch break :blk Value{ .null_value = {} };
+                    break :blk Value{ .bytes = s };
+                },
             } else Value{ .null_value = {} };
 
             const col_vals = [_]Value{
@@ -756,6 +761,15 @@ pub const Catalog = struct {
                                 .date => Value{ .date = std.fmt.parseInt(i64, s, 10) catch break :blk null },
                                 .timestamp => Value{ .timestamp = std.fmt.parseInt(i64, s, 10) catch break :blk null },
                                 .decimal => Value{ .decimal = std.fmt.parseInt(i64, s, 10) catch break :blk null },
+                                .uuid => blk2: {
+                                    var uuid_buf: [16]u8 = undefined;
+                                    if (!tuple_mod.parseUuidString(s, &uuid_buf)) break :blk null;
+                                    const mem = self.allocator.alloc(u8, 16) catch {
+                                        return CatalogError.OutOfMemory;
+                                    };
+                                    @memcpy(mem, &uuid_buf);
+                                    break :blk2 Value{ .uuid = mem };
+                                },
                             };
                         },
                         else => break :blk null,

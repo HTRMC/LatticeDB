@@ -569,7 +569,7 @@ pub const Executor = struct {
                 .col_type = mapDataType(col_def.data_type),
                 .max_length = col_def.max_length,
                 .nullable = col_def.nullable,
-                .default_value = if (col_def.default_value) |dv| litToValue(dv, mapDataType(col_def.data_type)) catch null else null,
+                .default_value = if (col_def.default_value) |dv| litToValue(self.allocator, dv, mapDataType(col_def.data_type)) catch null else null,
                 .scale = col_def.scale,
             };
         }
@@ -853,6 +853,7 @@ pub const Executor = struct {
             .date => |v| v == b.date,
             .timestamp => |v| v == b.timestamp,
             .decimal => |v| v == b.decimal,
+            .uuid => |v| std.mem.eql(u8, v[0..16], b.uuid[0..16]),
         };
     }
 
@@ -1452,6 +1453,7 @@ pub const Executor = struct {
             .date => Value{ .date = std.fmt.parseInt(i64, str, 10) catch return error.TypeMismatch },
             .timestamp => Value{ .timestamp = std.fmt.parseInt(i64, str, 10) catch return error.TypeMismatch },
             .decimal => Value{ .decimal = std.fmt.parseInt(i64, str, 10) catch return error.TypeMismatch },
+            .uuid => Value{ .uuid = str }, // raw bytes or formatted string pointer
         };
     }
 
@@ -1524,7 +1526,7 @@ pub const Executor = struct {
                 // Place values at mapped positions
                 for (row_vals, map) |lit, target_idx| {
                     const resolved = resolveParam(lit, self.current_params);
-                    values[target_idx] = litToValue(resolved, schema.columns[target_idx].col_type) catch {
+                    values[target_idx] = litToValue(self.allocator, resolved, schema.columns[target_idx].col_type) catch {
                         self.abortImplicitTxn(txn);
                         return ExecError.TypeMismatch;
                     };
@@ -1537,7 +1539,7 @@ pub const Executor = struct {
                 }
                 for (row_vals, schema.columns, 0..) |lit, col, i| {
                     const resolved = resolveParam(lit, self.current_params);
-                    values[i] = litToValue(resolved, col.col_type) catch {
+                    values[i] = litToValue(self.allocator, resolved, col.col_type) catch {
                         self.abortImplicitTxn(txn);
                         return ExecError.TypeMismatch;
                     };
@@ -2623,6 +2625,7 @@ pub const Executor = struct {
                 .date => |v| std.math.order(v, b.date),
                 .timestamp => |v| std.math.order(v, b.timestamp),
                 .decimal => |v| std.math.order(v, b.decimal),
+                .uuid => |v| std.mem.order(u8, v[0..16], b.uuid[0..16]),
             };
         }
         // Cross-type int comparison
@@ -4071,6 +4074,7 @@ pub const Executor = struct {
                 const v = std.fmt.parseInt(i64, str, 10) catch return Value{ .bytes = str };
                 return .{ .decimal = v };
             },
+            .uuid => return .{ .uuid = str },
         }
     }
 
@@ -4184,6 +4188,21 @@ pub const Executor = struct {
                     else => false,
                 };
             },
+            .uuid => |lu| {
+                const ru = switch (right) {
+                    .uuid => |v| v,
+                    else => return false,
+                };
+                const cmp = std.mem.order(u8, lu[0..16], ru[0..16]);
+                return switch (op) {
+                    .eq => cmp == .eq,
+                    .neq => cmp != .eq,
+                    .lt => cmp == .lt,
+                    .gt => cmp == .gt,
+                    .lte => cmp != .gt,
+                    .gte => cmp != .lt,
+                };
+            },
             .null_value => return false,
         }
     }
@@ -4285,6 +4304,7 @@ pub const Executor = struct {
             .date => .date,
             .timestamp => .timestamp,
             .decimal => .decimal,
+            .uuid => .uuid,
         };
     }
 
@@ -4296,7 +4316,7 @@ pub const Executor = struct {
         };
     }
 
-    fn litToValue(lit: ast.LiteralValue, col_type: ColumnType) !Value {
+    fn litToValue(allocator: std.mem.Allocator, lit: ast.LiteralValue, col_type: ColumnType) !Value {
         return switch (lit) {
             .integer => |i| switch (col_type) {
                 .smallint => Value{ .smallint = @intCast(i) },
@@ -4315,6 +4335,16 @@ pub const Executor = struct {
                 .varchar, .text => Value{ .bytes = s },
                 .date => Value{ .date = parseDateToEpochDays(s) orelse return error.TypeMismatch },
                 .timestamp => Value{ .timestamp = parseTimestampToEpochSecs(s) orelse return error.TypeMismatch },
+                .uuid => blk: {
+                    const uuid_mem = allocator.alloc(u8, 16) catch return error.TypeMismatch;
+                    var uuid_buf: [16]u8 = undefined;
+                    if (!tuple_mod.parseUuidString(s, &uuid_buf)) {
+                        allocator.free(uuid_mem);
+                        return error.TypeMismatch;
+                    }
+                    @memcpy(uuid_mem, &uuid_buf);
+                    break :blk Value{ .uuid = uuid_mem };
+                },
                 else => error.TypeMismatch,
             },
             .boolean => |b| switch (col_type) {
@@ -4338,6 +4368,11 @@ pub const Executor = struct {
             .date => |d| formatEpochDays(allocator, d),
             .timestamp => |t| formatEpochSecs(allocator, t),
             .decimal => |d| try std.fmt.allocPrint(allocator, "{d}", .{d}),
+            .uuid => |u| blk: {
+                var buf: [36]u8 = undefined;
+                const s = tuple_mod.formatUuidBytes(u, &buf) catch return error.OutOfMemory;
+                break :blk try allocator.dupe(u8, s);
+            },
         };
     }
 
