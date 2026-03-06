@@ -184,24 +184,24 @@ fn analyzePredicate(expr: *const ast.Expression, col_ordinal: u16, schema: *cons
             }
         },
         .and_expr => |a| {
-            // Try to combine dual bounds: col >= low AND col <= high → range scan
             const left_result = analyzePredicate(a.left, col_ordinal, schema);
-            const right_result = analyzePredicate(a.right, col_ordinal, schema);
-
-            if (left_result != null and right_result != null) {
-                // Try to combine range_from + range_to into range
-                const lr = left_result.?.scan_type;
-                const rr = right_result.?.scan_type;
-                if (lr == .range_from and rr == .range_to) {
-                    return .{ .scan_type = .{ .range = .{ .low = lr.range_from, .high = rr.range_to } } };
+            if (left_result) |lr| {
+                // If left is a partial range, try to combine with right
+                if (lr.scan_type == .range_from or lr.scan_type == .range_to) {
+                    if (analyzePredicate(a.right, col_ordinal, schema)) |rr| {
+                        if (lr.scan_type == .range_from and rr.scan_type == .range_to) {
+                            return .{ .scan_type = .{ .range = .{ .low = lr.scan_type.range_from, .high = rr.scan_type.range_to } } };
+                        }
+                        if (lr.scan_type == .range_to and rr.scan_type == .range_from) {
+                            return .{ .scan_type = .{ .range = .{ .low = rr.scan_type.range_from, .high = lr.scan_type.range_to } } };
+                        }
+                        return lr; // Can't combine, use left
+                    }
                 }
-                if (lr == .range_to and rr == .range_from) {
-                    return .{ .scan_type = .{ .range = .{ .low = rr.range_from, .high = lr.range_to } } };
-                }
+                return lr; // Left is complete (point/range), short-circuit
             }
-            // Fall back to using either side
-            if (left_result) |result| return result;
-            if (right_result) |result| return result;
+            // Left failed, try right
+            if (analyzePredicate(a.right, col_ordinal, schema)) |result| return result;
         },
         .or_expr => |o| {
             // OR optimization: col = A OR col = B → range(min, max)

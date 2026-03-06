@@ -92,8 +92,8 @@ pub const Executor = struct {
     serial_columns: std.StringHashMapUnmanaged([]const usize) = .empty,
     /// Tracks columnar tables (table_name → columnar table page ID)
     columnar_tables: std.StringHashMapUnmanaged(PageId) = .empty,
-    /// Prepared statement cache (SQL → parsed AST)
-    stmt_cache: ?stmt_cache_mod.StmtCache = null,
+    /// Prepared statement cache (heap-allocated to keep Executor struct small)
+    stmt_cache: ?*stmt_cache_mod.StmtCache = null,
 
     const Self = @This();
 
@@ -163,7 +163,10 @@ pub const Executor = struct {
         }
         self.columnar_tables.deinit(self.allocator);
 
-        if (self.stmt_cache) |*sc| sc.deinit();
+        if (self.stmt_cache) |sc| {
+            sc.deinit();
+            self.allocator.destroy(sc);
+        }
     }
 
     /// A prepared statement that can be executed multiple times with different parameters.
@@ -221,14 +224,16 @@ pub const Executor = struct {
     /// Enable the prepared statement cache with given max size.
     pub fn enableStmtCache(self: *Self, max_size: usize) void {
         if (self.stmt_cache == null) {
-            self.stmt_cache = stmt_cache_mod.StmtCache.init(self.allocator, max_size);
+            const cache = self.allocator.create(stmt_cache_mod.StmtCache) catch return;
+            cache.* = stmt_cache_mod.StmtCache.init(self.allocator, max_size);
+            self.stmt_cache = cache;
         }
     }
 
     /// Execute a SQL string using the statement cache if enabled.
     /// For DDL statements (CREATE, DROP, ALTER), bypasses cache and invalidates it.
     pub fn executeCached(self: *Self, sql: []const u8) ExecError!ExecResult {
-        if (self.stmt_cache) |*cache| {
+        if (self.stmt_cache) |cache| {
             const cached = cache.getOrParse(sql) catch return ExecError.ParseError;
             const result = self.dispatchStatement(cached.statement);
 
@@ -1153,7 +1158,7 @@ pub const Executor = struct {
         return ExecResult{ .message = msg };
     }
 
-    fn execViewSelect(self: *Self, outer_sel: ast.Select, view_sql: []const u8) ExecError!ExecResult {
+    noinline fn execViewSelect(self: *Self, outer_sel: ast.Select, view_sql: []const u8) ExecError!ExecResult {
         // Parse and execute the view's stored query
         var parser = Parser.init(self.allocator, view_sql);
         defer parser.deinit();
@@ -1536,8 +1541,10 @@ pub const Executor = struct {
 
     fn execInsertImpl(self: *Self, ins: ast.Insert) ExecError!ExecResult {
         // Route columnar tables to specialized path
-        if (self.columnar_tables.get(ins.table_name)) |col_table_id| {
-            return self.execColumnarInsert(ins, col_table_id);
+        if (self.columnar_tables.count() > 0) {
+            if (self.columnar_tables.get(ins.table_name)) |col_table_id| {
+                return self.execColumnarInsert(ins, col_table_id);
+            }
         }
 
         const result = self.catalog.openTable(ins.table_name) catch {
@@ -1833,7 +1840,7 @@ pub const Executor = struct {
         self.allocator.free(row.values);
     }
 
-    fn execDerivedTable(self: *Self, outer_sel: ast.Select, sub: *const ast.Select) ExecError!ExecResult {
+    noinline fn execDerivedTable(self: *Self, outer_sel: ast.Select, sub: *const ast.Select) ExecError!ExecResult {
         // Execute the subquery
         const sub_result = try self.execSelect(sub.*);
         defer self.freeResult(sub_result);
@@ -1927,7 +1934,7 @@ pub const Executor = struct {
         return ExecResult{ .rows = .{ .columns = col_names, .rows = rows } };
     }
 
-    fn execTruncate(self: *Self, table_name: []const u8) ExecError!ExecResult {
+    noinline fn execTruncate(self: *Self, table_name: []const u8) ExecError!ExecResult {
         const result = self.catalog.openTable(table_name) catch return ExecError.StorageError;
         const opened = result orelse return ExecError.TableNotFound;
         defer self.catalog.freeSchema(opened.schema);
@@ -1968,7 +1975,7 @@ pub const Executor = struct {
         return .{ .message = msg };
     }
 
-    fn execScalarSubquery(self: *Self, sub: *const ast.Select) ![]const u8 {
+    noinline fn execScalarSubquery(self: *Self, sub: *const ast.Select) ![]const u8 {
         const result = self.execSelect(sub.*) catch return error.OutOfMemory;
         switch (result) {
             .rows => |r| {
@@ -1990,7 +1997,7 @@ pub const Executor = struct {
         }
     }
 
-    fn execColumnarInsert(self: *Self, ins: ast.Insert, col_table_id: PageId) ExecError!ExecResult {
+    noinline fn execColumnarInsert(self: *Self, ins: ast.Insert, col_table_id: PageId) ExecError!ExecResult {
         const result = self.catalog.openTable(ins.table_name) catch return ExecError.StorageError;
         if (result == null) return ExecError.TableNotFound;
         const sr = result.?;
@@ -2022,7 +2029,7 @@ pub const Executor = struct {
         return .{ .row_count = @intCast(row_count) };
     }
 
-    fn execColumnarSelect(self: *Self, sel: ast.Select, col_table_id: PageId) ExecError!ExecResult {
+    noinline fn execColumnarSelect(self: *Self, sel: ast.Select, col_table_id: PageId) ExecError!ExecResult {
         const result = self.catalog.openTable(sel.table_name) catch return ExecError.StorageError;
         if (result == null) return ExecError.TableNotFound;
         const sr = result.?;
@@ -2099,7 +2106,7 @@ pub const Executor = struct {
         return .{ .rows = .{ .columns = col_names, .rows = result_rows } };
     }
 
-    fn execCTESelect(self: *Self, cs: ast.CTESelect) ExecError!ExecResult {
+    noinline fn execCTESelect(self: *Self, cs: ast.CTESelect) ExecError!ExecResult {
         // Transform the main SELECT by replacing CTE name references with subqueries
         var main = cs.select;
         for (cs.ctes) |cte| {
@@ -2127,8 +2134,10 @@ pub const Executor = struct {
         }
 
         // Route columnar tables to specialized path
-        if (self.columnar_tables.get(sel.table_name)) |col_table_id| {
-            return self.execColumnarSelect(sel, col_table_id);
+        if (self.columnar_tables.count() > 0) {
+            if (self.columnar_tables.get(sel.table_name)) |col_table_id| {
+                return self.execColumnarSelect(sel, col_table_id);
+            }
         }
 
         const result = self.catalog.openTable(sel.table_name) catch {

@@ -50,10 +50,10 @@ pub fn runBenchmark(config: BenchmarkConfig, ctx: *BenchContext, func: Benchmark
     const iters: u64 = @min(config.measure_iters, 1000);
 
     for (0..iters) |i| {
-        const start = Io.Clock.Timestamp.now(ctx.io, .awake);
+        const start = Io.Clock.Timestamp.now(ctx.io, .awake) catch @panic("clock failed");
         func(ctx);
-        const elapsed = start.untilNow(ctx.io);
-        latencies[i] = @intCast(elapsed.raw.nanoseconds);
+        const elapsed = (start.untilNow(ctx.io) catch @panic("clock failed")).raw.nanoseconds;
+        latencies[i] = @intCast(elapsed);
     }
 
     // Sort for percentile calculations
