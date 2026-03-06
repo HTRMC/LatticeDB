@@ -13,6 +13,7 @@ const plan_mod = @import("../planner/plan.zig");
 const vec_exec_mod = @import("vec_exec.zig");
 const expr_eval = @import("expr_eval.zig");
 const columnar_mod = @import("../storage/columnar.zig");
+pub const stmt_cache_mod = @import("stmt_cache.zig");
 
 const Value = tuple_mod.Value;
 const Column = tuple_mod.Column;
@@ -91,6 +92,8 @@ pub const Executor = struct {
     serial_columns: std.StringHashMapUnmanaged([]const usize) = .empty,
     /// Tracks columnar tables (table_name → columnar table page ID)
     columnar_tables: std.StringHashMapUnmanaged(PageId) = .empty,
+    /// Prepared statement cache (SQL → parsed AST)
+    stmt_cache: ?stmt_cache_mod.StmtCache = null,
 
     const Self = @This();
 
@@ -159,6 +162,8 @@ pub const Executor = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.columnar_tables.deinit(self.allocator);
+
+        if (self.stmt_cache) |*sc| sc.deinit();
     }
 
     /// A prepared statement that can be executed multiple times with different parameters.
@@ -213,6 +218,33 @@ pub const Executor = struct {
         };
     }
 
+    /// Enable the prepared statement cache with given max size.
+    pub fn enableStmtCache(self: *Self, max_size: usize) void {
+        if (self.stmt_cache == null) {
+            self.stmt_cache = stmt_cache_mod.StmtCache.init(self.allocator, max_size);
+        }
+    }
+
+    /// Execute a SQL string using the statement cache if enabled.
+    /// For DDL statements (CREATE, DROP, ALTER), bypasses cache and invalidates it.
+    pub fn executeCached(self: *Self, sql: []const u8) ExecError!ExecResult {
+        if (self.stmt_cache) |*cache| {
+            const cached = cache.getOrParse(sql) catch return ExecError.ParseError;
+            const result = self.dispatchStatement(cached.statement);
+
+            // Invalidate cache on DDL
+            switch (cached.statement) {
+                .create_table, .drop_table, .alter_table, .create_index, .drop_index, .create_view, .drop_view => {
+                    cache.invalidateAll();
+                },
+                else => {},
+            }
+
+            return result;
+        }
+        return self.execute(sql);
+    }
+
     /// Execute a SQL string. Caller must call freeResult on the result.
     pub fn execute(self: *Self, sql: []const u8) ExecError!ExecResult {
         var parser = Parser.init(self.allocator, sql);
@@ -222,6 +254,10 @@ pub const Executor = struct {
             return ExecError.ParseError;
         };
 
+        return self.dispatchStatement(stmt);
+    }
+
+    fn dispatchStatement(self: *Self, stmt: ast.Statement) ExecError!ExecResult {
         return switch (stmt) {
             .create_table => |ct| self.execCreateTable(ct),
             .create_index => |ci| self.execCreateIndex(ci),

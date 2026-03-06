@@ -14,4 +14,6 @@ comptime {
     _ = @import("storage/page.zig");
     _ = @import("storage/buffer_pool.zig");
     _ = @import("storage/columnar.zig");
+    _ = @import("executor/stmt_cache.zig");
+    _ = @import("executor/conn_pool.zig");
 }
