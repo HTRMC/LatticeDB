@@ -11,6 +11,8 @@ pub const ProjectionColumn = union(enum) {
     index: usize,
     /// Computed expression
     expression: *const ast.Expression,
+    /// Scalar subquery — must be handled by executor (needs execution context)
+    scalar_subquery: *const ast.Select,
 };
 
 /// Format a single projection column from row values to a string.
@@ -28,6 +30,7 @@ pub fn formatProjection(
             defer result.deinit(allocator);
             return formatValue(allocator, result.value);
         },
+        .scalar_subquery => return allocator.dupe(u8, "NULL"), // handled by executor
     }
 }
 
@@ -120,6 +123,7 @@ pub fn projectionColumnName(proj: ProjectionColumn, schema: *const Schema, func_
                 else => return "?expr?",
             }
         },
+        .scalar_subquery => return "?subquery?",
     }
     _ = func_name_buf;
 }

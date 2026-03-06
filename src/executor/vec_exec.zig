@@ -39,9 +39,9 @@ pub fn canUseVectorized(sel: ast.Select) bool {
     // No HAVING (not implemented in vectorized path)
     if (sel.having_clause != null) return false;
 
-    // No expression columns (not yet supported in vectorized path)
+    // No expression or scalar subquery columns (not yet supported in vectorized path)
     for (sel.columns) |col| {
-        if (col == .expression) return false;
+        if (col == .expression or col == .scalar_subquery) return false;
     }
 
     // Check WHERE for subqueries
@@ -708,7 +708,7 @@ fn resolveSelectColumns(allocator: std.mem.Allocator, sel_cols: []const ast.Sele
                 allocator.free(indices);
                 return null;
             },
-            .aggregate, .expression, .window_function => {
+            .aggregate, .expression, .window_function, .scalar_subquery => {
                 allocator.free(indices);
                 return null;
             },

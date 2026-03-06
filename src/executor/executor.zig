@@ -1229,6 +1229,7 @@ pub const Executor = struct {
                     }
                     try buf.append(self.allocator, ')');
                 },
+                .scalar_subquery => try buf.appendSlice(self.allocator, "(SELECT ...)"),
             }
             if (sel.aliases) |aliases| {
                 if (aliases[ci]) |alias| {
@@ -1378,7 +1379,10 @@ pub const Executor = struct {
         const formatted = try self.allocator.alloc([]const u8, col_proj.len);
         errdefer self.allocator.free(formatted);
         for (col_proj, 0..) |cp, i| {
-            formatted[i] = try expr_eval.formatProjection(self.allocator, cp, vals, schema, self.current_params);
+            formatted[i] = if (cp == .scalar_subquery)
+                self.execScalarSubquery(cp.scalar_subquery) catch return error.OutOfMemory
+            else
+                try expr_eval.formatProjection(self.allocator, cp, vals, schema, self.current_params);
         }
 
         try rows.append(self.allocator, .{ .values = formatted });
@@ -1900,6 +1904,28 @@ pub const Executor = struct {
         return .{ .message = msg };
     }
 
+    fn execScalarSubquery(self: *Self, sub: *const ast.Select) ![]const u8 {
+        const result = self.execSelect(sub.*) catch return error.OutOfMemory;
+        switch (result) {
+            .rows => |r| {
+                defer {
+                    for (r.rows) |row| {
+                        for (row.values) |v| self.allocator.free(v);
+                        self.allocator.free(row.values);
+                    }
+                    self.allocator.free(r.rows);
+                    for (r.columns) |c| self.allocator.free(c);
+                    self.allocator.free(r.columns);
+                }
+                if (r.rows.len > 0 and r.rows[0].values.len > 0) {
+                    return self.allocator.dupe(u8, r.rows[0].values[0]) catch return error.OutOfMemory;
+                }
+                return self.allocator.dupe(u8, "NULL") catch return error.OutOfMemory;
+            },
+            else => return self.allocator.dupe(u8, "NULL") catch return error.OutOfMemory,
+        }
+    }
+
     fn execCTESelect(self: *Self, cs: ast.CTESelect) ExecError!ExecResult {
         // Transform the main SELECT by replacing CTE name references with subqueries
         var main = cs.select;
@@ -2065,14 +2091,24 @@ pub const Executor = struct {
                     return ExecError.OutOfMemory;
                 };
                 for (col_proj, 0..) |cp, i| {
-                    formatted[i] = expr_eval.formatProjection(self.allocator, cp, row.values, schema, self.current_params) catch {
-                        for (formatted[0..i]) |f| self.allocator.free(f);
-                        self.allocator.free(formatted);
-                        for (col_names) |cn| self.allocator.free(cn);
-                        self.allocator.free(col_names);
-                        self.abortImplicitTxn(txn);
-                        return ExecError.OutOfMemory;
-                    };
+                    formatted[i] = if (cp == .scalar_subquery)
+                        self.execScalarSubquery(cp.scalar_subquery) catch {
+                            for (formatted[0..i]) |f| self.allocator.free(f);
+                            self.allocator.free(formatted);
+                            for (col_names) |cn| self.allocator.free(cn);
+                            self.allocator.free(col_names);
+                            self.abortImplicitTxn(txn);
+                            return ExecError.OutOfMemory;
+                        }
+                    else
+                        expr_eval.formatProjection(self.allocator, cp, row.values, schema, self.current_params) catch {
+                            for (formatted[0..i]) |f| self.allocator.free(f);
+                            self.allocator.free(formatted);
+                            for (col_names) |cn| self.allocator.free(cn);
+                            self.allocator.free(col_names);
+                            self.abortImplicitTxn(txn);
+                            return ExecError.OutOfMemory;
+                        };
                 }
 
                 rows.append(self.allocator, .{ .values = formatted }) catch {
@@ -2762,6 +2798,9 @@ pub const Executor = struct {
                 .qualified => |q| {
                     agg_col_indices[i] = resolveColumnIndex(schema, q.column) orelse return ExecError.ColumnNotFound;
                 },
+                .scalar_subquery => {
+                    agg_col_indices[i] = null; // computed separately
+                },
                 .all_columns, .expression, .window_function => return ExecError.ColumnNotFound,
             }
         }
@@ -2961,6 +3000,7 @@ pub const Executor = struct {
                 },
                 .named => |name| self.allocator.dupe(u8, name) catch return ExecError.OutOfMemory,
                 .qualified => |q| self.allocator.dupe(u8, q.column) catch return ExecError.OutOfMemory,
+                .scalar_subquery => self.allocator.dupe(u8, "?subquery?") catch return ExecError.OutOfMemory,
                 .all_columns => unreachable,
                 .expression, .window_function => return ExecError.ColumnNotFound,
             };
@@ -3003,6 +3043,7 @@ pub const Executor = struct {
                         }
                         break :blk self.allocator.dupe(u8, "NULL") catch return ExecError.OutOfMemory;
                     },
+                    .scalar_subquery => |sub| self.execScalarSubquery(sub) catch return ExecError.OutOfMemory,
                     .all_columns => unreachable,
                     .expression, .window_function => return ExecError.ColumnNotFound,
                 };
@@ -3666,11 +3707,18 @@ pub const Executor = struct {
         const formatted = self.allocator.alloc([]const u8, col_proj.len) catch return ExecError.OutOfMemory;
         errdefer self.allocator.free(formatted);
         for (col_proj, 0..) |cp, i| {
-            formatted[i] = expr_eval.formatProjection(self.allocator, cp, combined_values, combined_schema, self.current_params) catch {
-                for (formatted[0..i]) |f| self.allocator.free(f);
-                self.allocator.free(formatted);
-                return ExecError.OutOfMemory;
-            };
+            formatted[i] = if (cp == .scalar_subquery)
+                self.execScalarSubquery(cp.scalar_subquery) catch {
+                    for (formatted[0..i]) |f| self.allocator.free(f);
+                    self.allocator.free(formatted);
+                    return ExecError.OutOfMemory;
+                }
+            else
+                expr_eval.formatProjection(self.allocator, cp, combined_values, combined_schema, self.current_params) catch {
+                    for (formatted[0..i]) |f| self.allocator.free(f);
+                    self.allocator.free(formatted);
+                    return ExecError.OutOfMemory;
+                };
         }
         rows.append(self.allocator, .{ .values = formatted }) catch {
             for (formatted) |f| self.allocator.free(f);
@@ -4507,6 +4555,9 @@ pub const Executor = struct {
                 },
                 .expression => |expr| {
                     proj[i] = .{ .expression = expr };
+                },
+                .scalar_subquery => |sub| {
+                    proj[i] = .{ .scalar_subquery = sub };
                 },
                 else => {
                     self.allocator.free(proj);
@@ -9640,4 +9691,39 @@ test "executor DATE and TIMESTAMP types" {
     defer exec.freeResult(r3);
     try std.testing.expectEqual(@as(usize, 1), r3.rows.rows.len);
     try std.testing.expectEqualStrings("2", r3.rows.rows[0].values[0]);
+}
+
+test "executor scalar subquery in SELECT" {
+    const test_file = "test_exec_scalar_subquery.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 50);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+
+    // Setup tables
+    exec.freeResult(try exec.execute("CREATE TABLE departments (id INT, name VARCHAR(100))"));
+    exec.freeResult(try exec.execute("INSERT INTO departments VALUES (1, 'Engineering')"));
+    exec.freeResult(try exec.execute("INSERT INTO departments VALUES (2, 'Sales')"));
+
+    exec.freeResult(try exec.execute("CREATE TABLE employees (id INT, name VARCHAR(100), dept_id INT)"));
+    exec.freeResult(try exec.execute("INSERT INTO employees VALUES (1, 'Alice', 1)"));
+    exec.freeResult(try exec.execute("INSERT INTO employees VALUES (2, 'Bob', 1)"));
+    exec.freeResult(try exec.execute("INSERT INTO employees VALUES (3, 'Charlie', 2)"));
+
+    // Scalar subquery: SELECT name, (SELECT COUNT(*) FROM employees) AS total FROM departments
+    const r1 = try exec.execute("SELECT name, (SELECT COUNT(*) FROM employees) AS total FROM departments");
+    defer exec.freeResult(r1);
+    try std.testing.expectEqual(@as(usize, 2), r1.rows.rows.len);
+    try std.testing.expectEqualStrings("Engineering", r1.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("3", r1.rows.rows[0].values[1]);
+    try std.testing.expectEqualStrings("Sales", r1.rows.rows[1].values[0]);
+    try std.testing.expectEqualStrings("3", r1.rows.rows[1].values[1]);
 }
