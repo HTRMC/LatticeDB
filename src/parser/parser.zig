@@ -827,13 +827,16 @@ pub const Parser = struct {
             } else break;
         }
 
+        // SERIAL columns are implicitly NOT NULL
+        const is_serial = data_type == .serial;
+
         return .{
             .name = name,
             .data_type = data_type,
             .max_length = max_length,
             .precision = precision,
             .scale = scale,
-            .nullable = !is_primary_key and !not_null,
+            .nullable = !is_primary_key and !not_null and !is_serial,
             .is_primary_key = is_primary_key,
             .default_value = default_value,
         };
@@ -852,6 +855,7 @@ pub const Parser = struct {
             .kw_date => .date,
             .kw_timestamp => .timestamp,
             .kw_decimal, .kw_numeric => .decimal,
+            .kw_serial => .serial,
             else => return ParseError.UnexpectedToken,
         };
         self.advance();

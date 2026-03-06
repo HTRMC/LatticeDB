@@ -752,7 +752,7 @@ fn evalCast(
     if (val == .null_value) return ExprResult.borrowed(.{ .null_value = {} });
 
     switch (ce.target_type) {
-        .int, .integer => {
+        .int, .integer, .serial => {
             const i = valToInt(val, allocator) orelse return ExprResult.borrowed(.{ .null_value = {} });
             if (i >= std.math.minInt(i32) and i <= std.math.maxInt(i32)) {
                 return ExprResult.borrowed(.{ .integer = @intCast(i) });

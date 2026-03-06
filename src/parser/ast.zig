@@ -13,6 +13,7 @@ pub const DataType = enum {
     date,
     timestamp,
     decimal,
+    serial,
 };
 
 /// Column definition in CREATE TABLE

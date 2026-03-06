@@ -84,6 +84,10 @@ pub const Executor = struct {
     views: std.StringHashMapUnmanaged([]const u8) = .empty,
     /// In-memory foreign key constraints (child_table → []FkDef)
     foreign_keys: std.StringHashMapUnmanaged([]const FkDef) = .empty,
+    /// Auto-increment counters per table (table_name → next serial value)
+    serial_counters: std.StringHashMapUnmanaged(i32) = .empty,
+    /// Tracks which columns are SERIAL for each table (table_name → []column_index)
+    serial_columns: std.StringHashMapUnmanaged([]const usize) = .empty,
 
     const Self = @This();
 
@@ -133,6 +137,19 @@ pub const Executor = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.foreign_keys.deinit(self.allocator);
+
+        var sit = self.serial_counters.iterator();
+        while (sit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.serial_counters.deinit(self.allocator);
+
+        var scit = self.serial_columns.iterator();
+        while (scit.next()) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.serial_columns.deinit(self.allocator);
     }
 
     /// A prepared statement that can be executed multiple times with different parameters.
@@ -587,6 +604,25 @@ pub const Executor = struct {
             }
             const name_copy = self.allocator.dupe(u8, ct.table_name) catch return ExecError.OutOfMemory;
             self.foreign_keys.put(self.allocator, name_copy, fks) catch return ExecError.OutOfMemory;
+        }
+
+        // Track SERIAL columns
+        {
+            var serial_list: std.ArrayList(usize) = .empty;
+            for (ct.columns, 0..) |col_def, i| {
+                if (col_def.data_type == .serial) {
+                    serial_list.append(self.allocator, i) catch return ExecError.OutOfMemory;
+                }
+            }
+            if (serial_list.items.len > 0) {
+                const name_copy = self.allocator.dupe(u8, ct.table_name) catch return ExecError.OutOfMemory;
+                self.serial_columns.put(self.allocator, name_copy, serial_list.toOwnedSlice(self.allocator) catch return ExecError.OutOfMemory) catch return ExecError.OutOfMemory;
+                // Initialize counter (use separate key copy)
+                const counter_name = self.allocator.dupe(u8, ct.table_name) catch return ExecError.OutOfMemory;
+                self.serial_counters.put(self.allocator, counter_name, 1) catch return ExecError.OutOfMemory;
+            } else {
+                serial_list.deinit(self.allocator);
+            }
         }
 
         const msg = std.fmt.allocPrint(self.allocator, "CREATE TABLE", .{}) catch {
@@ -1505,6 +1541,22 @@ pub const Executor = struct {
                         self.abortImplicitTxn(txn);
                         return ExecError.TypeMismatch;
                     };
+                }
+            }
+
+            // Auto-fill SERIAL columns
+            if (self.serial_columns.get(ins.table_name)) |serial_cols| {
+                const counter_ptr = self.serial_counters.getPtr(ins.table_name).?;
+                for (serial_cols) |col_idx| {
+                    if (values[col_idx] == .null_value) {
+                        values[col_idx] = .{ .integer = counter_ptr.* };
+                        counter_ptr.* += 1;
+                    } else if (values[col_idx] == .integer) {
+                        // If user provides value, advance counter past it
+                        if (values[col_idx].integer >= counter_ptr.*) {
+                            counter_ptr.* = values[col_idx].integer + 1;
+                        }
+                    }
                 }
             }
 
@@ -4223,7 +4275,7 @@ pub const Executor = struct {
 
     fn mapDataType(dt: ast.DataType) ColumnType {
         return switch (dt) {
-            .int, .integer => .integer,
+            .int, .integer, .serial => .integer,
             .smallint => .smallint,
             .bigint => .bigint,
             .float => .float,
