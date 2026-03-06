@@ -553,6 +553,7 @@ pub const Executor = struct {
                 .max_length = col_def.max_length,
                 .nullable = col_def.nullable,
                 .default_value = if (col_def.default_value) |dv| litToValue(dv, mapDataType(col_def.data_type)) catch null else null,
+                .scale = col_def.scale,
             };
         }
 
@@ -792,11 +793,13 @@ pub const Executor = struct {
         if (tag_a != tag_b) {
             // Cross-type integer comparison
             const int_a = switch (a) {
+                .smallint => |v| @as(i64, v),
                 .integer => |v| @as(i64, v),
                 .bigint => |v| v,
                 else => return false,
             };
             const int_b = switch (b) {
+                .smallint => |v| @as(i64, v),
                 .integer => |v| @as(i64, v),
                 .bigint => |v| v,
                 else => return false,
@@ -804,6 +807,7 @@ pub const Executor = struct {
             return int_a == int_b;
         }
         return switch (a) {
+            .smallint => |v| v == b.smallint,
             .integer => |v| v == b.integer,
             .bigint => |v| v == b.bigint,
             .float => |v| v == b.float,
@@ -812,6 +816,7 @@ pub const Executor = struct {
             .null_value => true,
             .date => |v| v == b.date,
             .timestamp => |v| v == b.timestamp,
+            .decimal => |v| v == b.decimal,
         };
     }
 
@@ -844,6 +849,7 @@ pub const Executor = struct {
                     .col_type = mapDataType(col_def.data_type),
                     .max_length = col_def.max_length,
                     .nullable = true,
+                    .scale = col_def.scale,
                 };
                 self.catalog.addColumn(at.table_name, col) catch |err| {
                     return switch (err) {
@@ -1402,12 +1408,14 @@ pub const Executor = struct {
         if (std.mem.eql(u8, str, "NULL")) return .{ .null_value = {} };
         return switch (col_type) {
             .boolean => Value{ .boolean = std.mem.eql(u8, str, "true") },
+            .smallint => Value{ .smallint = std.fmt.parseInt(i16, str, 10) catch return error.TypeMismatch },
             .integer => Value{ .integer = std.fmt.parseInt(i32, str, 10) catch return error.TypeMismatch },
             .bigint => Value{ .bigint = std.fmt.parseInt(i64, str, 10) catch return error.TypeMismatch },
             .float => Value{ .float = std.fmt.parseFloat(f64, str) catch return error.TypeMismatch },
             .varchar, .text => Value{ .bytes = str },
             .date => Value{ .date = std.fmt.parseInt(i64, str, 10) catch return error.TypeMismatch },
             .timestamp => Value{ .timestamp = std.fmt.parseInt(i64, str, 10) catch return error.TypeMismatch },
+            .decimal => Value{ .decimal = std.fmt.parseInt(i64, str, 10) catch return error.TypeMismatch },
         };
     }
 
@@ -2216,8 +2224,10 @@ pub const Executor = struct {
         state.non_null_counts[col_idx] += 1;
 
         const num_val: ?f64 = switch (val) {
+            .smallint => |v| @floatFromInt(v),
             .integer => |v| @floatFromInt(v),
             .bigint => |v| @floatFromInt(v),
+            .decimal => |v| @floatFromInt(v),
             .float => |v| v,
             else => null,
         };
@@ -2551,6 +2561,7 @@ pub const Executor = struct {
         if (b == .null_value) return .gt;
         if (tag_a == tag_b) {
             return switch (a) {
+                .smallint => |v| std.math.order(v, b.smallint),
                 .integer => |v| std.math.order(v, b.integer),
                 .bigint => |v| std.math.order(v, b.bigint),
                 .float => |v| std.math.order(v, b.float),
@@ -2559,15 +2570,18 @@ pub const Executor = struct {
                 .null_value => .eq,
                 .date => |v| std.math.order(v, b.date),
                 .timestamp => |v| std.math.order(v, b.timestamp),
+                .decimal => |v| std.math.order(v, b.decimal),
             };
         }
         // Cross-type int comparison
         const int_a = switch (a) {
+            .smallint => |v| @as(i64, v),
             .integer => |v| @as(i64, v),
             .bigint => |v| v,
             else => return .lt,
         };
         const int_b = switch (b) {
+            .smallint => |v| @as(i64, v),
             .integer => |v| @as(i64, v),
             .bigint => |v| v,
             else => return .gt,
@@ -3989,6 +4003,10 @@ pub const Executor = struct {
                 return .{ .bytes = str };
             },
             .null_value => return .{ .null_value = {} },
+            .smallint => {
+                const v = std.fmt.parseInt(i16, str, 10) catch return Value{ .bytes = str };
+                return .{ .smallint = v };
+            },
             .date => {
                 const v = std.fmt.parseInt(i64, str, 10) catch return Value{ .bytes = str };
                 return .{ .date = v };
@@ -3996,6 +4014,10 @@ pub const Executor = struct {
             .timestamp => {
                 const v = std.fmt.parseInt(i64, str, 10) catch return Value{ .bytes = str };
                 return .{ .timestamp = v };
+            },
+            .decimal => {
+                const v = std.fmt.parseInt(i64, str, 10) catch return Value{ .bytes = str };
+                return .{ .decimal = v };
             },
         }
     }
@@ -4018,25 +4040,45 @@ pub const Executor = struct {
         if (left == .null_value or right == .null_value) return false;
 
         switch (left) {
-            .integer => |li| {
-                const ri = switch (right) {
+            .smallint => |li| {
+                const li_wide: i64 = li;
+                const ri: i64 = switch (right) {
+                    .smallint => |v| v,
                     .integer => |v| v,
-                    .bigint => |v| @as(i32, @intCast(v)),
+                    .bigint => |v| v,
                     else => return false,
                 };
                 return switch (op) {
-                    .eq => li == ri,
-                    .neq => li != ri,
-                    .lt => li < ri,
-                    .gt => li > ri,
-                    .lte => li <= ri,
-                    .gte => li >= ri,
+                    .eq => li_wide == ri,
+                    .neq => li_wide != ri,
+                    .lt => li_wide < ri,
+                    .gt => li_wide > ri,
+                    .lte => li_wide <= ri,
+                    .gte => li_wide >= ri,
                 };
             },
-            .bigint, .date, .timestamp => |li| {
+            .integer => |li| {
+                const li_wide: i64 = li;
                 const ri: i64 = switch (right) {
+                    .smallint => |v| v,
                     .integer => |v| v,
-                    .bigint, .date, .timestamp => |v| v,
+                    .bigint => |v| v,
+                    else => return false,
+                };
+                return switch (op) {
+                    .eq => li_wide == ri,
+                    .neq => li_wide != ri,
+                    .lt => li_wide < ri,
+                    .gt => li_wide > ri,
+                    .lte => li_wide <= ri,
+                    .gte => li_wide >= ri,
+                };
+            },
+            .bigint, .date, .timestamp, .decimal => |li| {
+                const ri: i64 = switch (right) {
+                    .smallint => |v| v,
+                    .integer => |v| v,
+                    .bigint, .date, .timestamp, .decimal => |v| v,
                     else => return false,
                 };
                 return switch (op) {
@@ -4051,6 +4093,7 @@ pub const Executor = struct {
             .float => |lf| {
                 const rf: f64 = switch (right) {
                     .float => |v| v,
+                    .smallint => |v| @floatFromInt(v),
                     .integer => |v| @floatFromInt(v),
                     else => return false,
                 };
@@ -4181,6 +4224,7 @@ pub const Executor = struct {
     fn mapDataType(dt: ast.DataType) ColumnType {
         return switch (dt) {
             .int, .integer => .integer,
+            .smallint => .smallint,
             .bigint => .bigint,
             .float => .float,
             .boolean => .boolean,
@@ -4188,6 +4232,7 @@ pub const Executor = struct {
             .text => .text,
             .date => .date,
             .timestamp => .timestamp,
+            .decimal => .decimal,
         };
     }
 
@@ -4202,13 +4247,16 @@ pub const Executor = struct {
     fn litToValue(lit: ast.LiteralValue, col_type: ColumnType) !Value {
         return switch (lit) {
             .integer => |i| switch (col_type) {
+                .smallint => Value{ .smallint = @intCast(i) },
                 .integer => Value{ .integer = @intCast(i) },
                 .bigint => Value{ .bigint = i },
                 .float => Value{ .float = @floatFromInt(i) },
+                .decimal => Value{ .decimal = i }, // will be scaled by caller
                 else => error.TypeMismatch,
             },
             .float => |f| switch (col_type) {
                 .float => Value{ .float = f },
+                .decimal => Value{ .decimal = @intFromFloat(f) }, // will be scaled by caller
                 else => error.TypeMismatch,
             },
             .string => |s| switch (col_type) {
@@ -4230,12 +4278,14 @@ pub const Executor = struct {
         return switch (val) {
             .null_value => try allocator.dupe(u8, "NULL"),
             .boolean => |b| try allocator.dupe(u8, if (b) "true" else "false"),
+            .smallint => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
             .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
             .bigint => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
             .float => |f| try std.fmt.allocPrint(allocator, "{d:.6}", .{f}),
             .bytes => |s| try allocator.dupe(u8, s),
             .date => |d| formatEpochDays(allocator, d),
             .timestamp => |t| formatEpochSecs(allocator, t),
+            .decimal => |d| try std.fmt.allocPrint(allocator, "{d}", .{d}),
         };
     }
 

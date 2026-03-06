@@ -4,6 +4,7 @@ const std = @import("std");
 pub const DataType = enum {
     int,
     integer,
+    smallint,
     bigint,
     float,
     boolean,
@@ -11,13 +12,16 @@ pub const DataType = enum {
     text,
     date,
     timestamp,
+    decimal,
 };
 
 /// Column definition in CREATE TABLE
 pub const ColumnDef = struct {
     name: []const u8,
     data_type: DataType,
-    max_length: u16, // for VARCHAR(n)
+    max_length: u16, // for VARCHAR(n), also precision for DECIMAL
+    precision: u8 = 0, // DECIMAL(precision, scale)
+    scale: u8 = 0, // DECIMAL(precision, scale)
     nullable: bool, // default true unless PRIMARY KEY
     is_primary_key: bool,
     default_value: ?LiteralValue, // DEFAULT literal

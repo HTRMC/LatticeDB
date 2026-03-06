@@ -36,7 +36,7 @@ pub fn detectBetweenPredicate(expr: *const ast.Expression, schema: *const Schema
 
             // Only numeric types for SIMD
             switch (col_type) {
-                .integer, .bigint, .float => {},
+                .smallint, .integer, .bigint, .float, .decimal => {},
                 else => return null,
             }
 
@@ -72,7 +72,7 @@ pub fn detectSimplePredicate(expr: *const ast.Expression, schema: *const Schema)
             if (col_info) |info| {
                 // Only numeric types for SIMD
                 switch (info.col_type) {
-                    .integer, .bigint, .float => return .{
+                    .smallint, .integer, .bigint, .float, .decimal => return .{
                         .col_idx = info.col_idx,
                         .col_type = info.col_type,
                         .op = if (info.reversed) flipOp(cmp.op) else cmp.op,
@@ -127,8 +127,10 @@ fn literalToValue(lit: ast.LiteralValue, target_type: ColumnType) ?Value {
     switch (lit) {
         .integer => |v| {
             return switch (target_type) {
+                .smallint => .{ .smallint = std.math.cast(i16, v) orelse return null },
                 .integer => .{ .integer = std.math.cast(i32, v) orelse return null },
                 .bigint => .{ .bigint = v },
+                .decimal => .{ .decimal = v },
                 .float => .{ .float = @as(f64, @floatFromInt(v)) },
                 else => null,
             };
@@ -215,8 +217,13 @@ pub fn filterSimdWithSel(chunk: *DataChunk, pred: SimplePredicate) SelectionVect
     for (existing_sel.indices[0..existing_sel.len]) |row_idx| {
         if (col.isNull(row_idx)) continue;
         const matches = switch (pred.col_type) {
+            .smallint => scalarCompare_i32(@as(i32, col.data.smallints[row_idx]), @as(i32, pred.literal.smallint), pred.op),
             .integer => scalarCompare_i32(col.data.integers[row_idx], pred.literal.integer, pred.op),
-            .bigint => scalarCompare_i64(col.data.bigints[row_idx], pred.literal.bigint, pred.op),
+            .bigint, .decimal => scalarCompare_i64(col.data.bigints[row_idx], switch (pred.literal) {
+                .bigint => |v| v,
+                .decimal => |v| v,
+                else => 0,
+            }, pred.op),
             .float => scalarCompare_f64(col.data.floats[row_idx], pred.literal.float, pred.op),
             else => false,
         };
@@ -276,8 +283,23 @@ pub fn filterSimd(chunk: *DataChunk, pred: SimplePredicate) SelectionVector {
                 }
             }
         },
-        .bigint => {
-            const lit_val = pred.literal.bigint;
+        .smallint => {
+            const lit_val = pred.literal.smallint;
+            const data = &col.data.smallints;
+            var i: u16 = 0;
+            while (i < count) : (i += 1) {
+                if (!col.isNull(i) and scalarCompare_i32(@as(i32, data[i]), @as(i32, lit_val), pred.op)) {
+                    sel.indices[sel.len] = i;
+                    sel.len += 1;
+                }
+            }
+        },
+        .bigint, .decimal => {
+            const lit_val: i64 = switch (pred.literal) {
+                .bigint => |v| v,
+                .decimal => |v| v,
+                else => 0,
+            };
             const splat: Vec4i64 = @splat(lit_val);
             const data = &col.data.bigints;
 

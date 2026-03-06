@@ -272,6 +272,11 @@ pub const Catalog = struct {
         // Insert columns into gp_columns
         for (columns, 0..) |col, i| {
             const default_str: Value = if (col.default_value) |dv| switch (dv) {
+                .smallint => |iv| blk: {
+                    var buf: [20]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "{d}", .{iv}) catch break :blk Value{ .null_value = {} };
+                    break :blk Value{ .bytes = s };
+                },
                 .integer => |iv| blk: {
                     var buf: [20]u8 = undefined;
                     const s = std.fmt.bufPrint(&buf, "{d}", .{iv}) catch break :blk Value{ .null_value = {} };
@@ -296,6 +301,11 @@ pub const Catalog = struct {
                     break :blk Value{ .bytes = s };
                 },
                 .timestamp => |iv| blk: {
+                    var buf: [20]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "{d}", .{iv}) catch break :blk Value{ .null_value = {} };
+                    break :blk Value{ .bytes = s };
+                },
+                .decimal => |iv| blk: {
                     var buf: [20]u8 = undefined;
                     const s = std.fmt.bufPrint(&buf, "{d}", .{iv}) catch break :blk Value{ .null_value = {} };
                     break :blk Value{ .bytes = s };
@@ -736,6 +746,7 @@ pub const Catalog = struct {
                             if (s.len == 0) break :blk null;
                             break :blk switch (col_type) {
                                 .boolean => Value{ .boolean = std.mem.eql(u8, s, "true") },
+                                .smallint => Value{ .smallint = std.fmt.parseInt(i16, s, 10) catch break :blk null },
                                 .integer => Value{ .integer = std.fmt.parseInt(i32, s, 10) catch break :blk null },
                                 .bigint => Value{ .bigint = std.fmt.parseInt(i64, s, 10) catch break :blk null },
                                 .float => Value{ .float = std.fmt.parseFloat(f64, s) catch break :blk null },
@@ -744,6 +755,7 @@ pub const Catalog = struct {
                                 } },
                                 .date => Value{ .date = std.fmt.parseInt(i64, s, 10) catch break :blk null },
                                 .timestamp => Value{ .timestamp = std.fmt.parseInt(i64, s, 10) catch break :blk null },
+                                .decimal => Value{ .decimal = std.fmt.parseInt(i64, s, 10) catch break :blk null },
                             };
                         },
                         else => break :blk null,

@@ -22,6 +22,7 @@ pub const ColumnVector = struct {
 
     pub const Data = union {
         booleans: [VECTOR_SIZE]bool,
+        smallints: [VECTOR_SIZE]i16,
         integers: [VECTOR_SIZE]i32,
         bigints: [VECTOR_SIZE]i64,
         floats: [VECTOR_SIZE]f64,
@@ -35,8 +36,9 @@ pub const ColumnVector = struct {
         };
         switch (col_type) {
             .boolean => cv.data = .{ .booleans = undefined },
+            .smallint => cv.data = .{ .smallints = undefined },
             .integer => cv.data = .{ .integers = undefined },
-            .bigint, .date, .timestamp => cv.data = .{ .bigints = undefined },
+            .bigint, .date, .timestamp, .decimal => cv.data = .{ .bigints = undefined },
             .float => cv.data = .{ .floats = undefined },
             .varchar, .text => cv.data = .{ .bytes_ptrs = undefined },
         }
@@ -60,10 +62,12 @@ pub const ColumnVector = struct {
         if (self.isNull(row)) return .{ .null_value = {} };
         return switch (self.col_type) {
             .boolean => .{ .boolean = self.data.booleans[row] },
+            .smallint => .{ .smallint = self.data.smallints[row] },
             .integer => .{ .integer = self.data.integers[row] },
             .bigint => .{ .bigint = self.data.bigints[row] },
             .date => .{ .date = self.data.bigints[row] },
             .timestamp => .{ .timestamp = self.data.bigints[row] },
+            .decimal => .{ .decimal = self.data.bigints[row] },
             .float => .{ .float = self.data.floats[row] },
             .varchar, .text => .{ .bytes = self.data.bytes_ptrs[row] },
         };
@@ -78,10 +82,12 @@ pub const ColumnVector = struct {
         self.clearNull(row);
         switch (self.col_type) {
             .boolean => self.data.booleans[row] = val.boolean,
+            .smallint => self.data.smallints[row] = val.smallint,
             .integer => self.data.integers[row] = val.integer,
             .bigint => self.data.bigints[row] = val.bigint,
             .date => self.data.bigints[row] = val.date,
             .timestamp => self.data.bigints[row] = val.timestamp,
+            .decimal => self.data.bigints[row] = val.decimal,
             .float => self.data.floats[row] = val.float,
             .varchar, .text => self.data.bytes_ptrs[row] = val.bytes,
         }

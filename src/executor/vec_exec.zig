@@ -607,19 +607,31 @@ fn orderCompareValues(a: Value, b: Value) std.math.Order {
     if (b == .null_value) return .lt;
 
     switch (a) {
-        .integer => |ai| {
+        .smallint => |ai| {
             const bi: i64 = switch (b) {
+                .smallint => |v| v,
                 .integer => |v| v,
-                .bigint, .date, .timestamp => |v| return std.math.order(@as(i64, ai), v),
+                .bigint, .date, .timestamp, .decimal => |v| return std.math.order(@as(i64, ai), v),
                 .float => |v| return std.math.order(@as(f64, @floatFromInt(ai)), v),
                 else => return .lt,
             };
             return std.math.order(@as(i64, ai), bi);
         },
-        .bigint, .date, .timestamp => |ai| {
+        .integer => |ai| {
             const bi: i64 = switch (b) {
+                .smallint => |v| v,
                 .integer => |v| v,
-                .bigint, .date, .timestamp => |v| v,
+                .bigint, .date, .timestamp, .decimal => |v| return std.math.order(@as(i64, ai), v),
+                .float => |v| return std.math.order(@as(f64, @floatFromInt(ai)), v),
+                else => return .lt,
+            };
+            return std.math.order(@as(i64, ai), bi);
+        },
+        .bigint, .date, .timestamp, .decimal => |ai| {
+            const bi: i64 = switch (b) {
+                .smallint => |v| v,
+                .integer => |v| v,
+                .bigint, .date, .timestamp, .decimal => |v| v,
                 .float => |v| return std.math.order(@as(f64, @floatFromInt(ai)), v),
                 else => return .lt,
             };
@@ -628,8 +640,9 @@ fn orderCompareValues(a: Value, b: Value) std.math.Order {
         .float => |af| {
             const bf: f64 = switch (b) {
                 .float => |v| v,
+                .smallint => |v| @floatFromInt(v),
                 .integer => |v| @floatFromInt(v),
-                .bigint, .date, .timestamp => |v| @floatFromInt(v),
+                .bigint, .date, .timestamp, .decimal => |v| @floatFromInt(v),
                 else => return .lt,
             };
             return std.math.order(af, bf);

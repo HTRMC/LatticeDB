@@ -122,7 +122,7 @@ pub const VecSeqScan = struct {
         if (self.scan_pred_count >= MAX_SCAN_PREDS) return false;
         // Only numeric types
         switch (pred.col_type) {
-            .integer, .bigint, .float => {},
+            .smallint, .integer, .bigint, .float, .decimal => {},
             else => return false,
         }
         self.scan_preds[self.scan_pred_count] = pred;
@@ -285,8 +285,9 @@ pub const VecSeqScan = struct {
                 if (!col_null) {
                     switch (col_def.col_type) {
                         .boolean => offset += 1,
+                        .smallint => offset += 2,
                         .integer => offset += 4,
-                        .bigint, .float, .date, .timestamp => offset += 8,
+                        .bigint, .float, .date, .timestamp, .decimal => offset += 8,
                         .varchar, .text => {
                             if (offset + 2 > data.len) return false;
                             const str_len = std.mem.bytesToValue(u16, data[offset..][0..2]);
@@ -298,15 +299,25 @@ pub const VecSeqScan = struct {
 
             // Read and compare
             const matches = switch (pred.col_type) {
+                .smallint => blk: {
+                    if (offset + 2 > data.len) break :blk false;
+                    const val = std.mem.bytesToValue(i16, data[offset..][0..2]);
+                    break :blk cmpI32(@as(i32, val), @as(i32, pred.literal.smallint), pred.op);
+                },
                 .integer => blk: {
                     if (offset + 4 > data.len) break :blk false;
                     const val = std.mem.bytesToValue(i32, data[offset..][0..4]);
                     break :blk cmpI32(val, pred.literal.integer, pred.op);
                 },
-                .bigint => blk: {
+                .bigint, .decimal => blk: {
                     if (offset + 8 > data.len) break :blk false;
                     const val = std.mem.bytesToValue(i64, data[offset..][0..8]);
-                    break :blk cmpI64(val, pred.literal.bigint, pred.op);
+                    const lit_val: i64 = switch (pred.literal) {
+                        .bigint => |v| v,
+                        .decimal => |v| v,
+                        else => break :blk false,
+                    };
+                    break :blk cmpI64(val, lit_val, pred.op);
                 },
                 .float => blk: {
                     if (offset + 8 > data.len) break :blk false;
@@ -421,6 +432,15 @@ pub const VecSeqScan = struct {
                                 self.chunk.columns[i].setNull(row_idx);
                             }
                         },
+                        .smallint => {
+                            if (offset + 2 <= data.len) {
+                                self.chunk.columns[i].clearNull(row_idx);
+                                self.chunk.columns[i].data.smallints[row_idx] = std.mem.bytesToValue(i16, data[offset..][0..2]);
+                                offset += 2;
+                            } else {
+                                self.chunk.columns[i].setNull(row_idx);
+                            }
+                        },
                         .integer => {
                             if (offset + 4 <= data.len) {
                                 self.chunk.columns[i].clearNull(row_idx);
@@ -430,7 +450,7 @@ pub const VecSeqScan = struct {
                                 self.chunk.columns[i].setNull(row_idx);
                             }
                         },
-                        .bigint, .date, .timestamp => {
+                        .bigint, .date, .timestamp, .decimal => {
                             if (offset + 8 <= data.len) {
                                 self.chunk.columns[i].clearNull(row_idx);
                                 self.chunk.columns[i].data.bigints[row_idx] = std.mem.bytesToValue(i64, data[offset..][0..8]);

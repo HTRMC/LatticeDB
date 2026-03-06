@@ -340,8 +340,10 @@ fn accumulateAgg(allocator: std.mem.Allocator, state: *GroupState, col_idx: usiz
     state.non_null_counts[col_idx] += 1;
 
     const num_val: ?f64 = switch (val) {
+        .smallint => |v| @floatFromInt(v),
         .integer => |v| @floatFromInt(v),
         .bigint => |v| @floatFromInt(v),
+        .decimal => |v| @floatFromInt(v),
         .float => |v| v,
         else => null,
     };
@@ -414,11 +416,15 @@ fn appendValueToKey(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, val: 
     switch (val) {
         .null_value => try buf.append(allocator, 0),
         .boolean => |b| try buf.append(allocator, if (b) 2 else 1),
+        .smallint => |v| {
+            try buf.append(allocator, 3);
+            try buf.appendSlice(allocator, std.mem.asBytes(&@as(i32, v)));
+        },
         .integer => |v| {
             try buf.append(allocator, 3);
             try buf.appendSlice(allocator, std.mem.asBytes(&v));
         },
-        .bigint, .date, .timestamp => |v| {
+        .bigint, .date, .timestamp, .decimal => |v| {
             try buf.append(allocator, 4);
             try buf.appendSlice(allocator, std.mem.asBytes(&v));
         },

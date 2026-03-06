@@ -35,12 +35,14 @@ pub fn formatValue(allocator: std.mem.Allocator, val: Value) ![]const u8 {
     return switch (val) {
         .null_value => try allocator.dupe(u8, "NULL"),
         .boolean => |b| try allocator.dupe(u8, if (b) "true" else "false"),
+        .smallint => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
         .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
         .bigint => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
         .float => |f| try std.fmt.allocPrint(allocator, "{d:.6}", .{f}),
         .bytes => |s| try allocator.dupe(u8, s),
         .date => |d| try formatEpochDays(allocator, d),
         .timestamp => |t| try formatEpochSecs(allocator, t),
+        .decimal => |d| try std.fmt.allocPrint(allocator, "{d}", .{d}),
     };
 }
 
@@ -177,9 +179,27 @@ pub fn compareValues(left: Value, op: ast.CompOp, right: Value) bool {
     if (left == .null_value or right == .null_value) return false;
 
     switch (left) {
+        .smallint => |li| {
+            const li_wide: i64 = li;
+            const ri: i64 = switch (right) {
+                .smallint => |v| v,
+                .integer => |v| v,
+                .bigint => |v| v,
+                else => return false,
+            };
+            return switch (op) {
+                .eq => li_wide == ri,
+                .neq => li_wide != ri,
+                .lt => li_wide < ri,
+                .gt => li_wide > ri,
+                .lte => li_wide <= ri,
+                .gte => li_wide >= ri,
+            };
+        },
         .integer => |li| {
             const li_wide: i64 = li;
             const ri: i64 = switch (right) {
+                .smallint => |v| v,
                 .integer => |v| v,
                 .bigint => |v| v,
                 else => return false,
@@ -195,6 +215,7 @@ pub fn compareValues(left: Value, op: ast.CompOp, right: Value) bool {
         },
         .bigint => |li| {
             const ri: i64 = switch (right) {
+                .smallint => |v| v,
                 .integer => |v| v,
                 .bigint => |v| v,
                 else => return false,
@@ -211,6 +232,7 @@ pub fn compareValues(left: Value, op: ast.CompOp, right: Value) bool {
         .float => |lf| {
             const rf: f64 = switch (right) {
                 .float => |v| v,
+                .smallint => |v| @floatFromInt(v),
                 .integer => |v| @floatFromInt(v),
                 else => return false,
             };
@@ -268,6 +290,22 @@ pub fn compareValues(left: Value, op: ast.CompOp, right: Value) bool {
             const ri: i64 = switch (right) {
                 .timestamp => |v| v,
                 .bytes => |s| parseTimestampToEpochSecs(s) orelse return false,
+                else => return false,
+            };
+            return switch (op) {
+                .eq => li == ri,
+                .neq => li != ri,
+                .lt => li < ri,
+                .gt => li > ri,
+                .lte => li <= ri,
+                .gte => li >= ri,
+            };
+        },
+        .decimal => |li| {
+            const ri: i64 = switch (right) {
+                .decimal => |v| v,
+                .integer => |v| v,
+                .bigint => |v| v,
                 else => return false,
             };
             return switch (op) {
@@ -690,8 +728,10 @@ fn evalUnaryMinus(
     defer res.deinit(allocator);
 
     return switch (res.value) {
+        .smallint => |i| ExprResult.borrowed(.{ .smallint = -%i }),
         .integer => |i| ExprResult.borrowed(.{ .integer = -%i }),
         .bigint => |i| ExprResult.borrowed(.{ .bigint = -%i }),
+        .decimal => |i| ExprResult.borrowed(.{ .decimal = -%i }),
         .float => |f| ExprResult.borrowed(.{ .float = -f }),
         .null_value => ExprResult.borrowed(.{ .null_value = {} }),
         else => ExprResult.borrowed(.{ .null_value = {} }),
@@ -719,6 +759,13 @@ fn evalCast(
             }
             return ExprResult.borrowed(.{ .bigint = i });
         },
+        .smallint => {
+            const i = valToInt(val, allocator) orelse return ExprResult.borrowed(.{ .null_value = {} });
+            if (i >= std.math.minInt(i16) and i <= std.math.maxInt(i16)) {
+                return ExprResult.borrowed(.{ .smallint = @intCast(i) });
+            }
+            return ExprResult.borrowed(.{ .null_value = {} });
+        },
         .bigint => {
             const i = valToInt(val, allocator) orelse return ExprResult.borrowed(.{ .null_value = {} });
             return ExprResult.borrowed(.{ .bigint = i });
@@ -727,9 +774,14 @@ fn evalCast(
             const f = valToFloat(val, allocator) orelse return ExprResult.borrowed(.{ .null_value = {} });
             return ExprResult.borrowed(.{ .float = f });
         },
+        .decimal => {
+            const i = valToInt(val, allocator) orelse return ExprResult.borrowed(.{ .null_value = {} });
+            return ExprResult.borrowed(.{ .decimal = i });
+        },
         .boolean => {
             return switch (val) {
                 .boolean => ExprResult.borrowed(val),
+                .smallint => |i| ExprResult.borrowed(.{ .boolean = i != 0 }),
                 .integer => |i| ExprResult.borrowed(.{ .boolean = i != 0 }),
                 .bigint => |i| ExprResult.borrowed(.{ .boolean = i != 0 }),
                 .bytes => |s| {
@@ -762,6 +814,7 @@ fn evalCast(
 fn valToInt(val: Value, allocator: std.mem.Allocator) ?i64 {
     _ = allocator;
     return switch (val) {
+        .smallint => |i| i,
         .integer => |i| i,
         .bigint => |i| i,
         .float => |f| blk: {
@@ -772,6 +825,7 @@ fn valToInt(val: Value, allocator: std.mem.Allocator) ?i64 {
         .bytes => |s| std.fmt.parseInt(i64, s, 10) catch null,
         .date => |d| d,
         .timestamp => |t| t,
+        .decimal => |d| d,
         .null_value => null,
     };
 }
@@ -780,12 +834,14 @@ fn valToFloat(val: Value, allocator: std.mem.Allocator) ?f64 {
     _ = allocator;
     return switch (val) {
         .float => |f| f,
+        .smallint => |i| @floatFromInt(i),
         .integer => |i| @floatFromInt(i),
         .bigint => |i| @floatFromInt(i),
         .boolean => |b| if (b) @as(f64, 1.0) else @as(f64, 0.0),
         .bytes => |s| std.fmt.parseFloat(f64, s) catch null,
         .date => |d| @floatFromInt(d),
         .timestamp => |t| @floatFromInt(t),
+        .decimal => |d| @floatFromInt(d),
         .null_value => null,
     };
 }
@@ -799,16 +855,20 @@ fn toFloat(val: Value) ?f64 {
 
 fn toFloatFromInt(val: Value) ?f64 {
     return switch (val) {
+        .smallint => |i| @floatFromInt(i),
         .integer => |i| @floatFromInt(i),
         .bigint => |i| @floatFromInt(i),
+        .decimal => |i| @floatFromInt(i),
         else => null,
     };
 }
 
 fn toInt(val: Value) ?i64 {
     return switch (val) {
+        .smallint => |i| i,
         .integer => |i| i,
         .bigint => |i| i,
+        .decimal => |i| i,
         else => null,
     };
 }
@@ -817,8 +877,10 @@ fn toInt(val: Value) ?i64 {
 
 fn numAbs(val: Value) ExprResult {
     return switch (val) {
+        .smallint => |i| ExprResult.borrowed(.{ .smallint = if (i < 0) -%i else i }),
         .integer => |i| ExprResult.borrowed(.{ .integer = if (i < 0) -%i else i }),
         .bigint => |i| ExprResult.borrowed(.{ .bigint = if (i < 0) -%i else i }),
+        .decimal => |i| ExprResult.borrowed(.{ .decimal = if (i < 0) -%i else i }),
         .float => |f| ExprResult.borrowed(.{ .float = @abs(f) }),
         .null_value => ExprResult.borrowed(.{ .null_value = {} }),
         else => ExprResult.borrowed(.{ .null_value = {} }),
@@ -1033,8 +1095,10 @@ fn strConcat(
 
 fn formatValueForConcat(allocator: std.mem.Allocator, val: Value) ![]const u8 {
     return switch (val) {
+        .smallint => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
         .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
         .bigint => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+        .decimal => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
         .float => |f| try std.fmt.allocPrint(allocator, "{d:.6}", .{f}),
         .boolean => |b| try allocator.dupe(u8, if (b) "true" else "false"),
         .null_value => try allocator.dupe(u8, "NULL"),

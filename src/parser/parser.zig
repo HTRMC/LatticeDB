@@ -779,13 +779,32 @@ pub const Parser = struct {
         const data_type = try self.parseDataType();
 
         var max_length: u16 = 0;
-        // Optional (length) for VARCHAR
+        var precision: u8 = 0;
+        var scale: u8 = 0;
+        // Optional (length) for VARCHAR or (precision, scale) for DECIMAL/NUMERIC
         if (self.current.type == .left_paren) {
             self.advance();
             if (self.current.type != .integer_literal) return ParseError.UnexpectedToken;
-            max_length = @intCast(std.fmt.parseInt(u16, self.current.text, 10) catch return ParseError.InvalidSyntax);
+            const first = std.fmt.parseInt(u16, self.current.text, 10) catch return ParseError.InvalidSyntax;
             self.advance();
+            if (data_type == .decimal and self.current.type == .comma) {
+                // DECIMAL(precision, scale)
+                precision = @intCast(first);
+                self.advance();
+                if (self.current.type != .integer_literal) return ParseError.UnexpectedToken;
+                scale = @intCast(std.fmt.parseInt(u8, self.current.text, 10) catch return ParseError.InvalidSyntax);
+                self.advance();
+            } else if (data_type == .decimal) {
+                // DECIMAL(precision) — scale defaults to 0
+                precision = @intCast(first);
+            } else {
+                max_length = first;
+            }
             try self.expect(.right_paren);
+        } else if (data_type == .decimal) {
+            // DECIMAL without parens defaults to (18, 2)
+            precision = 18;
+            scale = 2;
         }
 
         var is_primary_key = false;
@@ -812,6 +831,8 @@ pub const Parser = struct {
             .name = name,
             .data_type = data_type,
             .max_length = max_length,
+            .precision = precision,
+            .scale = scale,
             .nullable = !is_primary_key and !not_null,
             .is_primary_key = is_primary_key,
             .default_value = default_value,
@@ -822,6 +843,7 @@ pub const Parser = struct {
         const dt: ast.DataType = switch (self.current.type) {
             .kw_int => .int,
             .kw_integer => .integer,
+            .kw_smallint => .smallint,
             .kw_bigint => .bigint,
             .kw_float => .float,
             .kw_boolean => .boolean,
@@ -829,6 +851,7 @@ pub const Parser = struct {
             .kw_text => .text,
             .kw_date => .date,
             .kw_timestamp => .timestamp,
+            .kw_decimal, .kw_numeric => .decimal,
             else => return ParseError.UnexpectedToken,
         };
         self.advance();

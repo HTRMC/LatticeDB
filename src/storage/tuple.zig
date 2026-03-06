@@ -13,13 +13,16 @@ pub const ColumnType = enum(u8) {
     text = 6, // variable-length, no max
     date = 7, // epoch days as i64
     timestamp = 8, // epoch seconds as i64
+    smallint = 9, // i16
+    decimal = 10, // scaled i64 (value * 10^scale), scale in schema
 
     /// Size of a fixed-length type, null for variable-length
     pub fn fixedSize(self: ColumnType) ?usize {
         return switch (self) {
             .boolean => 1,
+            .smallint => 2,
             .integer => 4,
-            .bigint, .float, .date, .timestamp => 8,
+            .bigint, .float, .date, .timestamp, .decimal => 8,
             .varchar, .text => null,
         };
     }
@@ -33,9 +36,10 @@ pub const ColumnType = enum(u8) {
 pub const Column = struct {
     name: []const u8,
     col_type: ColumnType,
-    max_length: u16, // Only meaningful for varchar
+    max_length: u16, // Only meaningful for varchar; precision for decimal
     nullable: bool,
     default_value: ?Value = null,
+    scale: u8 = 0, // Only meaningful for decimal
 };
 
 /// Schema - describes the structure of a table's rows
@@ -71,12 +75,14 @@ pub const Schema = struct {
 pub const Value = union(enum) {
     null_value: void,
     boolean: bool,
+    smallint: i16,
     integer: i32,
     bigint: i64,
     float: f64,
     bytes: []const u8, // For varchar and text
     date: i64, // epoch days
     timestamp: i64, // epoch seconds
+    decimal: i64, // scaled integer (value * 10^scale)
 
     pub fn isNull(self: Value) bool {
         return self == .null_value;
@@ -90,6 +96,11 @@ pub const Value = union(enum) {
                 if (buf.len < 1) return error.BufferTooSmall;
                 buf[0] = if (v) 1 else 0;
                 return 1;
+            },
+            .smallint => |v| {
+                if (buf.len < 2) return error.BufferTooSmall;
+                @memcpy(buf[0..2], std.mem.asBytes(&v));
+                return 2;
             },
             .integer => |v| {
                 if (buf.len < 4) return error.BufferTooSmall;
@@ -115,7 +126,7 @@ pub const Value = union(enum) {
                 @memcpy(buf[2..][0..v.len], v);
                 return total;
             },
-            .date, .timestamp => |v| {
+            .date, .timestamp, .decimal => |v| {
                 if (buf.len < 8) return error.BufferTooSmall;
                 @memcpy(buf[0..8], std.mem.asBytes(&v));
                 return 8;
@@ -129,6 +140,13 @@ pub const Value = union(enum) {
             .boolean => {
                 if (buf.len < 1) return error.BufferTooSmall;
                 return .{ .value = .{ .boolean = buf[0] != 0 }, .size = 1 };
+            },
+            .smallint => {
+                if (buf.len < 2) return error.BufferTooSmall;
+                return .{
+                    .value = .{ .smallint = std.mem.bytesToValue(i16, buf[0..2]) },
+                    .size = 2,
+                };
             },
             .integer => {
                 if (buf.len < 4) return error.BufferTooSmall;
@@ -174,6 +192,13 @@ pub const Value = union(enum) {
                     .size = 8,
                 };
             },
+            .decimal => {
+                if (buf.len < 8) return error.BufferTooSmall;
+                return .{
+                    .value = .{ .decimal = std.mem.bytesToValue(i64, buf[0..8]) },
+                    .size = 8,
+                };
+            },
         }
     }
 
@@ -182,6 +207,9 @@ pub const Value = union(enum) {
         switch (self) {
             .null_value => return "NULL",
             .boolean => |v| return if (v) "true" else "false",
+            .smallint => |v| {
+                return std.fmt.bufPrint(buf, "{}", .{v}) catch return error.BufferTooSmall;
+            },
             .integer => |v| {
                 return std.fmt.bufPrint(buf, "{}", .{v}) catch return error.BufferTooSmall;
             },
@@ -194,6 +222,9 @@ pub const Value = union(enum) {
             .bytes => |v| return v,
             .date => return "DATE",
             .timestamp => return "TIMESTAMP",
+            .decimal => |v| {
+                return std.fmt.bufPrint(buf, "{}", .{v}) catch return error.BufferTooSmall;
+            },
         }
     }
 
@@ -206,6 +237,10 @@ pub const Value = union(enum) {
             .boolean => |v| {
                 hasher.update(&[_]u8{1});
                 hasher.update(&[_]u8{@intFromBool(v)});
+            },
+            .smallint => |v| {
+                hasher.update(&[_]u8{2});
+                hasher.update(std.mem.asBytes(&@as(i64, v)));
             },
             .integer => |v| {
                 hasher.update(&[_]u8{2});
@@ -240,6 +275,10 @@ pub const Value = union(enum) {
                 hasher.update(&[_]u8{6});
                 hasher.update(std.mem.asBytes(&v));
             },
+            .decimal => |v| {
+                hasher.update(&[_]u8{7});
+                hasher.update(std.mem.asBytes(&v));
+            },
         }
         return hasher.final();
     }
@@ -250,8 +289,18 @@ pub const Value = union(enum) {
         if (a == .null_value or b == .null_value) return false;
 
         switch (a) {
+            .smallint => |ai| {
+                return switch (b) {
+                    .smallint => |bi| ai == bi,
+                    .integer => |bi| @as(i64, ai) == @as(i64, bi),
+                    .bigint => |bi| @as(i64, ai) == bi,
+                    .float => |bf| @as(f64, @floatFromInt(ai)) == bf,
+                    else => false,
+                };
+            },
             .integer => |ai| {
                 return switch (b) {
+                    .smallint => |bi| @as(i64, ai) == @as(i64, bi),
                     .integer => |bi| ai == bi,
                     .bigint => |bi| @as(i64, ai) == bi,
                     .float => |bf| @as(f64, @floatFromInt(ai)) == bf,
@@ -260,6 +309,7 @@ pub const Value = union(enum) {
             },
             .bigint => |ai| {
                 return switch (b) {
+                    .smallint => |bi| ai == @as(i64, bi),
                     .integer => |bi| ai == @as(i64, bi),
                     .bigint => |bi| ai == bi,
                     .float => |bf| @as(f64, @floatFromInt(ai)) == bf,
@@ -269,6 +319,7 @@ pub const Value = union(enum) {
             .float => |af| {
                 return switch (b) {
                     .float => |bf| af == bf,
+                    .smallint => |bi| af == @as(f64, @floatFromInt(bi)),
                     .integer => |bi| af == @as(f64, @floatFromInt(bi)),
                     .bigint => |bi| af == @as(f64, @floatFromInt(bi)),
                     else => false,
@@ -295,6 +346,12 @@ pub const Value = union(enum) {
             .timestamp => |at| {
                 return switch (b) {
                     .timestamp => |bt| at == bt,
+                    else => false,
+                };
+            },
+            .decimal => |ad| {
+                return switch (b) {
+                    .decimal => |bd| ad == bd,
                     else => false,
                 };
             },
@@ -389,8 +446,9 @@ pub const Tuple = struct {
             switch (val) {
                 .null_value => {},
                 .boolean => size += 1,
+                .smallint => size += 2,
                 .integer => size += 4,
-                .bigint, .float, .date, .timestamp => size += 8,
+                .bigint, .float, .date, .timestamp, .decimal => size += 8,
                 .bytes => |v| {
                     _ = i;
                     size += 2 + v.len;
