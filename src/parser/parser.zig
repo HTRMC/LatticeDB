@@ -385,10 +385,56 @@ pub const Parser = struct {
             rows.append(alloc, try self.parseValueRow()) catch return ParseError.OutOfMemory;
         }
 
+        // Optional ON CONFLICT clause
+        var on_conflict: ?ast.OnConflict = null;
+        if (self.current.type == .kw_on and self.lexer.peek().type == .kw_conflict) {
+            self.advance(); // consume ON
+            self.advance(); // consume CONFLICT
+
+            // Parse conflict columns: (col1, col2, ...)
+            try self.expect(.left_paren);
+            var conflict_cols: std.ArrayList([]const u8) = .empty;
+            conflict_cols.append(alloc, try self.expectIdentifier()) catch return ParseError.OutOfMemory;
+            while (self.current.type == .comma) {
+                self.advance();
+                conflict_cols.append(alloc, try self.expectIdentifier()) catch return ParseError.OutOfMemory;
+            }
+            try self.expect(.right_paren);
+
+            try self.expect(.kw_do);
+
+            if (self.current.type == .kw_nothing) {
+                self.advance();
+                on_conflict = .{
+                    .conflict_columns = conflict_cols.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
+                    .action = .{ .do_nothing = {} },
+                };
+            } else if (self.current.type == .kw_update) {
+                self.advance(); // consume UPDATE
+                try self.expect(.kw_set);
+                var assignments: std.ArrayList(ast.SetClause) = .empty;
+                while (true) {
+                    const col_name = try self.expectIdentifier();
+                    try self.expect(.op_eq);
+                    const expr = try self.parseExpression();
+                    assignments.append(alloc, .{ .column = col_name, .value = expr }) catch return ParseError.OutOfMemory;
+                    if (self.current.type != .comma) break;
+                    self.advance();
+                }
+                on_conflict = .{
+                    .conflict_columns = conflict_cols.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
+                    .action = .{ .do_update = assignments.toOwnedSlice(alloc) catch return ParseError.OutOfMemory },
+                };
+            } else {
+                return ParseError.UnexpectedToken;
+            }
+        }
+
         return .{ .insert = .{
             .table_name = table_name,
             .columns = columns,
             .rows = rows.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
+            .on_conflict = on_conflict,
         } };
     }
 

@@ -269,10 +269,21 @@ pub const CreateTable = struct {
     foreign_keys: []const ForeignKey = &.{},
 };
 
+pub const OnConflictAction = union(enum) {
+    do_nothing: void,
+    do_update: []const SetClause,
+};
+
+pub const OnConflict = struct {
+    conflict_columns: []const []const u8,
+    action: OnConflictAction,
+};
+
 pub const Insert = struct {
     table_name: []const u8,
     columns: ?[]const []const u8, // optional column list
     rows: []const []const LiteralValue,
+    on_conflict: ?OnConflict = null,
 };
 
 pub const InsertSelect = struct {

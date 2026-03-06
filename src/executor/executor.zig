@@ -1588,6 +1588,38 @@ pub const Executor = struct {
                 }
             }
 
+            // Handle ON CONFLICT (upsert)
+            if (ins.on_conflict) |oc| {
+                // Find conflict column indices
+                const conflict_indices = self.allocator.alloc(usize, oc.conflict_columns.len) catch return ExecError.OutOfMemory;
+                defer self.allocator.free(conflict_indices);
+                for (oc.conflict_columns, 0..) |name, ci| {
+                    conflict_indices[ci] = resolveColumnIndex(schema, name) orelse return ExecError.ColumnNotFound;
+                }
+
+                // Scan for conflicting row
+                const conflict_found = self.findConflictingRow(&table, schema, values, conflict_indices);
+                if (conflict_found) {
+                    switch (oc.action) {
+                        .do_nothing => continue, // skip this row
+                        .do_update => |assignments| {
+                            // Build WHERE matching the conflict columns and execute UPDATE
+                            const upd = ast.Update{
+                                .table_name = ins.table_name,
+                                .assignments = assignments,
+                                .where_clause = self.buildConflictWhere(schema, values, conflict_indices),
+                            };
+                            _ = self.execUpdate(upd) catch {
+                                self.abortImplicitTxn(txn);
+                                return ExecError.StorageError;
+                            };
+                            row_count += 1;
+                            continue;
+                        },
+                    }
+                }
+            }
+
             const tid = table.insertTuple(txn, values) catch {
                 self.abortImplicitTxn(txn);
                 return ExecError.StorageError;
@@ -4465,6 +4497,65 @@ pub const Executor = struct {
         return std.fmt.allocPrint(allocator, "{s} {d:0>2}:{d:0>2}:{d:0>2}", .{
             date_str, @as(u32, @intCast(hour)), @as(u32, @intCast(min)), @as(u32, @intCast(sec)),
         });
+    }
+
+    fn findConflictingRow(self: *Self, table: *Table, schema: *const Schema, values: []const Value, conflict_indices: []const usize) bool {
+        _ = schema;
+        var iter = table.scan() catch return false;
+        while (iter.next() catch null) |row| {
+            defer self.allocator.free(row.values);
+
+            var all_match = true;
+            for (conflict_indices) |idx| {
+                if (!valuesEqual(values[idx], row.values[idx])) {
+                    all_match = false;
+                    break;
+                }
+            }
+            if (all_match) return true;
+        }
+        return false;
+    }
+
+    fn buildConflictWhere(self: *Self, schema: *const Schema, values: []const Value, conflict_indices: []const usize) ?*const ast.Expression {
+        var result: ?*const ast.Expression = null;
+        for (conflict_indices) |idx| {
+            const col_name = schema.columns[idx].name;
+            // Build: col = value
+            const col_ref = self.allocator.create(ast.Expression) catch return null;
+            col_ref.* = .{ .column_ref = col_name };
+
+            const lit_expr = self.allocator.create(ast.Expression) catch return null;
+            lit_expr.* = .{ .literal = valueTo_astLiteral(values[idx]) };
+
+            const cmp = self.allocator.create(ast.Expression) catch return null;
+            cmp.* = .{ .comparison = .{ .left = col_ref, .op = .eq, .right = lit_expr } };
+
+            if (result) |prev| {
+                const and_expr = self.allocator.create(ast.Expression) catch return null;
+                and_expr.* = .{ .and_expr = .{ .left = prev, .right = cmp } };
+                result = and_expr;
+            } else {
+                result = cmp;
+            }
+        }
+        return result;
+    }
+
+    fn valueTo_astLiteral(val: Value) ast.LiteralValue {
+        return switch (val) {
+            .null_value => .{ .null_value = {} },
+            .boolean => |b| .{ .boolean = b },
+            .smallint => |i| .{ .integer = i },
+            .integer => |i| .{ .integer = i },
+            .bigint => |i| .{ .integer = i },
+            .float => |f| .{ .float = f },
+            .decimal => |d| .{ .integer = d },
+            .bytes => |s| .{ .string = s },
+            .date => |d| .{ .integer = d },
+            .timestamp => |t| .{ .integer = t },
+            .uuid => |u| .{ .string = u },
+        };
     }
 };
 
