@@ -16,6 +16,7 @@ pub const ColumnType = enum(u8) {
     smallint = 9, // i16
     decimal = 10, // scaled i64 (value * 10^scale), scale in schema
     uuid = 11, // 16-byte UUID
+    json = 12, // variable-length validated JSON text
 
     /// Size of a fixed-length type, null for variable-length
     pub fn fixedSize(self: ColumnType) ?usize {
@@ -25,7 +26,7 @@ pub const ColumnType = enum(u8) {
             .integer => 4,
             .bigint, .float, .date, .timestamp, .decimal => 8,
             .uuid => 16,
-            .varchar, .text => null,
+            .varchar, .text, .json => null,
         };
     }
 
@@ -177,7 +178,7 @@ pub const Value = union(enum) {
                     .size = 8,
                 };
             },
-            .varchar, .text => {
+            .varchar, .text, .json => {
                 if (buf.len < 2) return error.BufferTooSmall;
                 const len = std.mem.bytesToValue(u16, buf[0..2]);
                 if (buf.len < 2 + len) return error.BufferTooSmall;

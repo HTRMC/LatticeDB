@@ -1449,7 +1449,7 @@ pub const Executor = struct {
             .integer => Value{ .integer = std.fmt.parseInt(i32, str, 10) catch return error.TypeMismatch },
             .bigint => Value{ .bigint = std.fmt.parseInt(i64, str, 10) catch return error.TypeMismatch },
             .float => Value{ .float = std.fmt.parseFloat(f64, str) catch return error.TypeMismatch },
-            .varchar, .text => Value{ .bytes = str },
+            .varchar, .text, .json => Value{ .bytes = str },
             .date => Value{ .date = std.fmt.parseInt(i64, str, 10) catch return error.TypeMismatch },
             .timestamp => Value{ .timestamp = std.fmt.parseInt(i64, str, 10) catch return error.TypeMismatch },
             .decimal => Value{ .decimal = std.fmt.parseInt(i64, str, 10) catch return error.TypeMismatch },
@@ -4305,6 +4305,7 @@ pub const Executor = struct {
             .timestamp => .timestamp,
             .decimal => .decimal,
             .uuid => .uuid,
+            .json => .json,
         };
     }
 
@@ -4332,7 +4333,7 @@ pub const Executor = struct {
                 else => error.TypeMismatch,
             },
             .string => |s| switch (col_type) {
-                .varchar, .text => Value{ .bytes = s },
+                .varchar, .text, .json => Value{ .bytes = s },
                 .date => Value{ .date = parseDateToEpochDays(s) orelse return error.TypeMismatch },
                 .timestamp => Value{ .timestamp = parseTimestampToEpochSecs(s) orelse return error.TypeMismatch },
                 .uuid => blk: {

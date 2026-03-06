@@ -160,6 +160,8 @@ pub const TokenType = enum {
     kw_smallint,
     kw_serial,
     kw_uuid,
+    kw_json,
+    kw_jsonb,
 
     // Identifiers and literals
     identifier,
@@ -313,6 +315,8 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "smallint", .kw_smallint },
     .{ "serial", .kw_serial },
     .{ "uuid", .kw_uuid },
+    .{ "json", .kw_json },
+    .{ "jsonb", .kw_jsonb },
 });
 
 pub const Lexer = struct {

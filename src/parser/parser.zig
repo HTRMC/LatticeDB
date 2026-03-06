@@ -857,6 +857,7 @@ pub const Parser = struct {
             .kw_decimal, .kw_numeric => .decimal,
             .kw_serial => .serial,
             .kw_uuid => .uuid,
+            .kw_json, .kw_jsonb => .json,
             else => return ParseError.UnexpectedToken,
         };
         self.advance();

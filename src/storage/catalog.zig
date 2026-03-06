@@ -755,7 +755,7 @@ pub const Catalog = struct {
                                 .integer => Value{ .integer = std.fmt.parseInt(i32, s, 10) catch break :blk null },
                                 .bigint => Value{ .bigint = std.fmt.parseInt(i64, s, 10) catch break :blk null },
                                 .float => Value{ .float = std.fmt.parseFloat(f64, s) catch break :blk null },
-                                .varchar, .text => Value{ .bytes = self.allocator.dupe(u8, s) catch {
+                                .varchar, .text, .json => Value{ .bytes = self.allocator.dupe(u8, s) catch {
                                     return CatalogError.OutOfMemory;
                                 } },
                                 .date => Value{ .date = std.fmt.parseInt(i64, s, 10) catch break :blk null },

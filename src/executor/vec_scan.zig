@@ -289,7 +289,7 @@ pub const VecSeqScan = struct {
                         .integer => offset += 4,
                         .bigint, .float, .date, .timestamp, .decimal => offset += 8,
                         .uuid => offset += 16,
-                        .varchar, .text => {
+                        .varchar, .text, .json => {
                             if (offset + 2 > data.len) return false;
                             const str_len = std.mem.bytesToValue(u16, data[offset..][0..2]);
                             offset += 2 + str_len;
@@ -342,7 +342,7 @@ pub const VecSeqScan = struct {
 
         for (self.schema.columns, 0..) |col_def, i| {
             switch (col_def.col_type) {
-                .varchar, .text => {
+                .varchar, .text, .json => {
                     if (chunk.sel) |sel| {
                         for (sel.indices[0..sel.len]) |row_idx| {
                             if (!chunk.columns[i].isNull(row_idx)) {
@@ -379,7 +379,7 @@ pub const VecSeqScan = struct {
         const arena_alloc = self.chunk.arena.allocator();
         for (self.schema.columns, 0..) |col_def, i| {
             switch (col_def.col_type) {
-                .varchar, .text => {
+                .varchar, .text, .json => {
                     var r = start_row;
                     while (r < end_row) : (r += 1) {
                         if (!self.chunk.columns[i].isNull(r)) {
@@ -478,7 +478,7 @@ pub const VecSeqScan = struct {
                                 self.chunk.columns[i].setNull(row_idx);
                             }
                         },
-                        .varchar, .text => {
+                        .varchar, .text, .json => {
                             if (offset + 2 <= data.len) {
                                 const str_len = std.mem.bytesToValue(u16, data[offset..][0..2]);
                                 offset += 2;

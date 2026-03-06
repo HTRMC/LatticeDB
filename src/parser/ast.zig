@@ -15,6 +15,7 @@ pub const DataType = enum {
     decimal,
     serial,
     uuid,
+    json,
 };
 
 /// Column definition in CREATE TABLE

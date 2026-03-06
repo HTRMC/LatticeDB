@@ -816,7 +816,7 @@ fn evalCast(
                 else => ExprResult.borrowed(.{ .null_value = {} }),
             };
         },
-        .varchar, .text => {
+        .varchar, .text, .json => {
             const str = formatValue(allocator, val) catch return ExprResult.borrowed(.{ .null_value = {} });
             return ExprResult.owned_val(.{ .bytes = str });
         },
