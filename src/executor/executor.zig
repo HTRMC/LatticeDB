@@ -3815,6 +3815,11 @@ pub const Executor = struct {
     }
 
     fn execUpdate(self: *Self, upd: ast.Update) ExecError!ExecResult {
+        // Handle UPDATE ... FROM (join update)
+        if (upd.from_table) |from_name| {
+            return self.execUpdateFrom(upd, from_name);
+        }
+
         const result = self.catalog.openTable(upd.table_name) catch {
             return ExecError.StorageError;
         } orelse return ExecError.TableNotFound;
@@ -3953,6 +3958,136 @@ pub const Executor = struct {
             }
 
             updated += 1;
+        }
+
+        self.commitImplicitTxn(txn);
+        return .{ .row_count = updated };
+    }
+
+    fn execUpdateFrom(self: *Self, upd: ast.Update, from_name: []const u8) ExecError!ExecResult {
+        // Open both tables
+        const t1_result = (self.catalog.openTable(upd.table_name) catch return ExecError.StorageError) orelse return ExecError.TableNotFound;
+        const t2_result = (self.catalog.openTable(from_name) catch {
+            self.catalog.freeSchema(t1_result.schema);
+            return ExecError.StorageError;
+        }) orelse {
+            self.catalog.freeSchema(t1_result.schema);
+            return ExecError.TableNotFound;
+        };
+        defer self.catalog.freeSchema(t1_result.schema);
+        defer self.catalog.freeSchema(t2_result.schema);
+
+        var table1 = t1_result.table;
+        var table2 = t2_result.table;
+        table1.txn_manager = self.txn_manager;
+        table1.undo_log = self.undo_log;
+        table2.txn_manager = self.txn_manager;
+        table2.undo_log = self.undo_log;
+
+        const schema1 = t1_result.schema;
+        const schema2 = t2_result.schema;
+
+        // Build merged schema for WHERE/SET evaluation
+        const merged_cols = self.allocator.alloc(Column, schema1.columns.len + schema2.columns.len) catch return ExecError.OutOfMemory;
+        defer self.allocator.free(merged_cols);
+        @memcpy(merged_cols[0..schema1.columns.len], schema1.columns);
+        @memcpy(merged_cols[schema1.columns.len..], schema2.columns);
+        const merged_schema = Schema{ .columns = merged_cols };
+
+        // Resolve SET column indices (in target table only)
+        const set_indices = self.allocator.alloc(usize, upd.assignments.len) catch return ExecError.OutOfMemory;
+        defer self.allocator.free(set_indices);
+        for (upd.assignments, 0..) |assign, i| {
+            set_indices[i] = resolveColumnIndex(schema1, assign.column) orelse return ExecError.ColumnNotFound;
+        }
+
+        // Collect FROM table rows
+        var from_rows: std.ArrayList([]Value) = .empty;
+        defer {
+            for (from_rows.items) |r| self.allocator.free(r);
+            from_rows.deinit(self.allocator);
+        }
+        {
+            var iter = table2.scan() catch return ExecError.StorageError;
+            while (iter.next() catch null) |row| {
+                from_rows.append(self.allocator, row.values) catch return ExecError.OutOfMemory;
+            }
+        }
+
+        const txn = self.current_txn orelse self.beginImplicitTxn();
+        var updated: u64 = 0;
+
+        // For each target row, check against each FROM row
+        var to_update: std.ArrayList(CollectedRow) = .empty;
+        defer {
+            for (to_update.items) |e| self.allocator.free(e.values);
+            to_update.deinit(self.allocator);
+        }
+        self.collectMatchingRows(upd.table_name, &table1, schema1, null, txn, &to_update) catch {
+            self.abortImplicitTxn(txn);
+            return ExecError.StorageError;
+        };
+
+        for (to_update.items) |entry| {
+            for (from_rows.items) |from_vals| {
+                // Build merged values: [target_cols..., from_cols...]
+                const merged_vals = self.allocator.alloc(Value, merged_cols.len) catch {
+                    self.abortImplicitTxn(txn);
+                    return ExecError.OutOfMemory;
+                };
+                defer self.allocator.free(merged_vals);
+                @memcpy(merged_vals[0..schema1.columns.len], entry.values);
+                @memcpy(merged_vals[schema1.columns.len..], from_vals);
+
+                // Evaluate WHERE against merged schema
+                if (upd.where_clause) |wc| {
+                    if (!self.evalExprWithParams(wc, &merged_schema, merged_vals, self.current_params)) continue;
+                }
+
+                // Match found — apply SET
+                const new_values = self.allocator.alloc(Value, schema1.columns.len) catch {
+                    self.abortImplicitTxn(txn);
+                    return ExecError.OutOfMemory;
+                };
+                defer self.allocator.free(new_values);
+                @memcpy(new_values, entry.values);
+
+                for (upd.assignments, set_indices) |assign, ci| {
+                    const expr_result = expr_eval.evalExprToValue(self.allocator, assign.value, &merged_schema, merged_vals, self.current_params);
+                    defer expr_result.deinit(self.allocator);
+                    if (expr_result.owned) {
+                        switch (expr_result.value) {
+                            .bytes => |b| {
+                                const duped = self.allocator.dupe(u8, b) catch {
+                                    self.abortImplicitTxn(txn);
+                                    return ExecError.OutOfMemory;
+                                };
+                                new_values[ci] = .{ .bytes = duped };
+                            },
+                            else => new_values[ci] = expr_result.value,
+                        }
+                    } else {
+                        new_values[ci] = expr_result.value;
+                    }
+                }
+
+                _ = table1.deleteTuple(txn, entry.tid) catch |err| {
+                    if (err == table_mod.TableError.WriteConflict) {
+                        self.abortImplicitTxn(txn);
+                        return ExecError.WriteConflict;
+                    }
+                    self.abortImplicitTxn(txn);
+                    return ExecError.StorageError;
+                };
+                self.maintainIndexesDelete(table1.table_id, schema1, entry.values);
+                const new_tid = table1.insertTuple(txn, new_values) catch {
+                    self.abortImplicitTxn(txn);
+                    return ExecError.StorageError;
+                };
+                self.maintainIndexesInsert(table1.table_id, schema1, new_values, new_tid);
+                updated += 1;
+                break; // only update once per target row
+            }
         }
 
         self.commitImplicitTxn(txn);

@@ -333,6 +333,7 @@ pub const Update = struct {
     table_name: []const u8,
     assignments: []const SetClause,
     where_clause: ?*const Expression,
+    from_table: ?[]const u8 = null, // UPDATE ... FROM other_table WHERE ...
 };
 
 pub const SetClause = struct {

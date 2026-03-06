@@ -487,6 +487,13 @@ pub const Parser = struct {
             assignments.append(alloc, try self.parseSetClause()) catch return ParseError.OutOfMemory;
         }
 
+        // Optional FROM clause for UPDATE ... FROM ... WHERE ...
+        var from_table: ?[]const u8 = null;
+        if (self.current.type == .kw_from) {
+            self.advance();
+            from_table = try self.expectIdentifier();
+        }
+
         var where: ?*const ast.Expression = null;
         if (self.current.type == .kw_where) {
             self.advance();
@@ -497,6 +504,7 @@ pub const Parser = struct {
             .table_name = table_name,
             .assignments = assignments.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
             .where_clause = where,
+            .from_table = from_table,
         };
     }
 
