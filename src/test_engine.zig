@@ -13,4 +13,5 @@ comptime {
     _ = @import("storage/tuple.zig");
     _ = @import("storage/page.zig");
     _ = @import("storage/buffer_pool.zig");
+    _ = @import("storage/columnar.zig");
 }

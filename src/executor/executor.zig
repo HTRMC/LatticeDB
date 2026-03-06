@@ -12,6 +12,7 @@ const planner_mod = @import("../planner/planner.zig");
 const plan_mod = @import("../planner/plan.zig");
 const vec_exec_mod = @import("vec_exec.zig");
 const expr_eval = @import("expr_eval.zig");
+const columnar_mod = @import("../storage/columnar.zig");
 
 const Value = tuple_mod.Value;
 const Column = tuple_mod.Column;
@@ -88,6 +89,8 @@ pub const Executor = struct {
     serial_counters: std.StringHashMapUnmanaged(i32) = .empty,
     /// Tracks which columns are SERIAL for each table (table_name → []column_index)
     serial_columns: std.StringHashMapUnmanaged([]const usize) = .empty,
+    /// Tracks columnar tables (table_name → columnar table page ID)
+    columnar_tables: std.StringHashMapUnmanaged(PageId) = .empty,
 
     const Self = @This();
 
@@ -150,6 +153,12 @@ pub const Executor = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.serial_columns.deinit(self.allocator);
+
+        var cit = self.columnar_tables.iterator();
+        while (cit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.columnar_tables.deinit(self.allocator);
     }
 
     /// A prepared statement that can be executed multiple times with different parameters.
@@ -584,6 +593,20 @@ pub const Executor = struct {
                 else => ExecError.StorageError,
             };
         };
+
+        if (ct.storage_format == .columnar) {
+            // Create columnar storage alongside the catalog entry
+            const sr = (self.catalog.openTable(ct.table_name) catch return ExecError.StorageError) orelse return ExecError.TableNotFound;
+            defer self.catalog.freeSchema(sr.schema);
+            const ct_table = columnar_mod.ColumnarTable.create(
+                self.allocator,
+                self.catalog.buffer_pool,
+                sr.schema,
+                self.catalog.alloc_manager,
+            ) catch return ExecError.StorageError;
+            const name_copy = self.allocator.dupe(u8, ct.table_name) catch return ExecError.OutOfMemory;
+            self.columnar_tables.put(self.allocator, name_copy, ct_table.table_id) catch return ExecError.OutOfMemory;
+        }
 
         // Store CHECK constraints in memory
         if (ct.checks.len > 0) {
@@ -1476,6 +1499,11 @@ pub const Executor = struct {
     }
 
     fn execInsertImpl(self: *Self, ins: ast.Insert) ExecError!ExecResult {
+        // Route columnar tables to specialized path
+        if (self.columnar_tables.get(ins.table_name)) |col_table_id| {
+            return self.execColumnarInsert(ins, col_table_id);
+        }
+
         const result = self.catalog.openTable(ins.table_name) catch {
             return ExecError.StorageError;
         } orelse return ExecError.TableNotFound;
@@ -1926,6 +1954,115 @@ pub const Executor = struct {
         }
     }
 
+    fn execColumnarInsert(self: *Self, ins: ast.Insert, col_table_id: PageId) ExecError!ExecResult {
+        const result = self.catalog.openTable(ins.table_name) catch return ExecError.StorageError;
+        if (result == null) return ExecError.TableNotFound;
+        const sr = result.?;
+        defer self.catalog.freeSchema(sr.schema);
+        const schema = sr.schema;
+
+        var ct = columnar_mod.ColumnarTable.open(
+            self.allocator,
+            self.catalog.buffer_pool,
+            schema,
+            col_table_id,
+            self.catalog.alloc_manager,
+        );
+
+        const values = self.allocator.alloc(Value, schema.columns.len) catch return ExecError.OutOfMemory;
+        defer self.allocator.free(values);
+
+        var row_count: usize = 0;
+        for (ins.rows) |row_vals| {
+            if (row_vals.len != schema.columns.len) return ExecError.ColumnCountMismatch;
+            for (row_vals, 0..) |lit, i| {
+                const resolved = resolveParam(lit, self.current_params);
+                values[i] = litToValue(self.allocator, resolved, schema.columns[i].col_type) catch return ExecError.StorageError;
+            }
+            ct.insertRow(values) catch return ExecError.StorageError;
+            row_count += 1;
+        }
+
+        return .{ .row_count = @intCast(row_count) };
+    }
+
+    fn execColumnarSelect(self: *Self, sel: ast.Select, col_table_id: PageId) ExecError!ExecResult {
+        const result = self.catalog.openTable(sel.table_name) catch return ExecError.StorageError;
+        if (result == null) return ExecError.TableNotFound;
+        const sr = result.?;
+        defer self.catalog.freeSchema(sr.schema);
+        const schema = sr.schema;
+
+        var ct = columnar_mod.ColumnarTable.open(
+            self.allocator,
+            self.catalog.buffer_pool,
+            schema,
+            col_table_id,
+            self.catalog.alloc_manager,
+        );
+
+        const col_proj = try self.resolveSelectColumns(sel.columns, schema);
+        defer self.allocator.free(col_proj);
+
+        // Build column headers
+        const col_names = self.allocator.alloc([]const u8, col_proj.len) catch return ExecError.OutOfMemory;
+        var func_name_buf: [32]u8 = undefined;
+        for (col_proj, 0..) |cp, i| {
+            const alias_name = if (sel.aliases) |aliases| (if (i < aliases.len) aliases[i] else null) else null;
+            const name_src = alias_name orelse expr_eval.projectionColumnName(cp, schema, &func_name_buf);
+            col_names[i] = self.allocator.dupe(u8, name_src) catch return ExecError.OutOfMemory;
+        }
+
+        var rows: std.ArrayList(ResultRow) = .empty;
+        var iter = ct.scan() catch return ExecError.StorageError;
+        defer iter.deinit();
+
+        while (iter.next() catch return ExecError.StorageError) |row| {
+            defer iter.freeValues(row.values);
+
+            // Apply WHERE filter
+            if (sel.where_clause) |where| {
+                if (!self.evalWhere(where, schema, row.values)) continue;
+            }
+
+            // Format selected columns
+            const formatted = self.allocator.alloc([]const u8, col_proj.len) catch return ExecError.OutOfMemory;
+            for (col_proj, 0..) |cp, i| {
+                formatted[i] = if (cp == .scalar_subquery)
+                    self.execScalarSubquery(cp.scalar_subquery) catch return ExecError.OutOfMemory
+                else
+                    expr_eval.formatProjection(self.allocator, cp, row.values, schema, self.current_params) catch return ExecError.OutOfMemory;
+            }
+
+            rows.append(self.allocator, .{ .values = formatted }) catch return ExecError.OutOfMemory;
+        }
+
+        // Apply LIMIT/OFFSET
+        var result_rows = rows.toOwnedSlice(self.allocator) catch return ExecError.OutOfMemory;
+        if (sel.offset) |off| {
+            if (off < result_rows.len) {
+                const old = result_rows;
+                result_rows = self.allocator.dupe(ResultRow, old[off..]) catch return ExecError.OutOfMemory;
+                for (old[0..off]) |r| {
+                    for (r.values) |v| self.allocator.free(v);
+                    self.allocator.free(r.values);
+                }
+                self.allocator.free(old);
+            }
+        }
+        if (sel.limit) |lim| {
+            if (lim < result_rows.len) {
+                for (result_rows[lim..]) |r| {
+                    for (r.values) |v| self.allocator.free(v);
+                    self.allocator.free(r.values);
+                }
+                result_rows = self.allocator.realloc(result_rows, lim) catch result_rows;
+            }
+        }
+
+        return .{ .rows = .{ .columns = col_names, .rows = result_rows } };
+    }
+
     fn execCTESelect(self: *Self, cs: ast.CTESelect) ExecError!ExecResult {
         // Transform the main SELECT by replacing CTE name references with subqueries
         var main = cs.select;
@@ -1951,6 +2088,11 @@ pub const Executor = struct {
             if (join_list.len > 0) {
                 return self.execSelectJoin(sel);
             }
+        }
+
+        // Route columnar tables to specialized path
+        if (self.columnar_tables.get(sel.table_name)) |col_table_id| {
+            return self.execColumnarSelect(sel, col_table_id);
         }
 
         const result = self.catalog.openTable(sel.table_name) catch {
@@ -9726,4 +9868,49 @@ test "executor scalar subquery in SELECT" {
     try std.testing.expectEqualStrings("3", r1.rows.rows[0].values[1]);
     try std.testing.expectEqualStrings("Sales", r1.rows.rows[1].values[0]);
     try std.testing.expectEqualStrings("3", r1.rows.rows[1].values[1]);
+}
+
+test "executor columnar table" {
+    const test_file = "test_exec_columnar.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+
+    var exec = Executor.init(std.testing.allocator, &catalog);
+    defer exec.deinit();
+
+    // Create columnar table
+    exec.freeResult(try exec.execute("CREATE TABLE metrics (id INT, value FLOAT, label VARCHAR(50)) WITH COLUMNAR"));
+
+    // Insert rows
+    exec.freeResult(try exec.execute("INSERT INTO metrics VALUES (1, 10.5, 'alpha')"));
+    exec.freeResult(try exec.execute("INSERT INTO metrics VALUES (2, 20.3, 'beta')"));
+    exec.freeResult(try exec.execute("INSERT INTO metrics VALUES (3, 15.7, 'gamma')"));
+
+    // Select all
+    const r1 = try exec.execute("SELECT id, value, label FROM metrics");
+    defer exec.freeResult(r1);
+    try std.testing.expectEqual(@as(usize, 3), r1.rows.rows.len);
+    try std.testing.expectEqualStrings("1", r1.rows.rows[0].values[0]);
+    try std.testing.expectEqualStrings("10.500000", r1.rows.rows[0].values[1]);
+    try std.testing.expectEqualStrings("alpha", r1.rows.rows[0].values[2]);
+    try std.testing.expectEqualStrings("3", r1.rows.rows[2].values[0]);
+
+    // Select with WHERE
+    const r2 = try exec.execute("SELECT label FROM metrics WHERE value > 15.0");
+    defer exec.freeResult(r2);
+    try std.testing.expectEqual(@as(usize, 2), r2.rows.rows.len);
+
+    // Select *
+    const r3 = try exec.execute("SELECT * FROM metrics");
+    defer exec.freeResult(r3);
+    try std.testing.expectEqual(@as(usize, 3), r3.rows.rows.len);
+    try std.testing.expectEqual(@as(usize, 3), r3.rows.columns.len);
 }

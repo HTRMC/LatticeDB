@@ -222,6 +222,8 @@ pub const SelectColumn = union(enum) {
         func: WindowFunc,
         spec: WindowSpec,
     },
+    /// SELECT (SELECT ...) — scalar subquery in SELECT list
+    scalar_subquery: *const Select,
 };
 
 /// Top-level SQL statement
@@ -263,11 +265,14 @@ pub const ForeignKey = struct {
     ref_column: []const u8, // referenced column
 };
 
+pub const StorageFormat = enum { row, columnar };
+
 pub const CreateTable = struct {
     table_name: []const u8,
     columns: []const ColumnDef,
     checks: []const CheckConstraint = &.{},
     foreign_keys: []const ForeignKey = &.{},
+    storage_format: StorageFormat = .row,
 };
 
 pub const OnConflictAction = union(enum) {

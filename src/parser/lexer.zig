@@ -174,6 +174,9 @@ pub const TokenType = enum {
     kw_do,
     kw_nothing,
 
+    // COLUMNAR
+    kw_columnar,
+
     // Identifiers and literals
     identifier,
     integer_literal,
@@ -333,6 +336,7 @@ const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "conflict", .kw_conflict },
     .{ "do", .kw_do },
     .{ "nothing", .kw_nothing },
+    .{ "columnar", .kw_columnar },
 });
 
 pub const Lexer = struct {

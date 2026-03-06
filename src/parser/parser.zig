@@ -558,6 +558,15 @@ pub const Parser = struct {
     }
 
     fn parseSelectColumn(self: *Self) ParseError!ast.SelectColumn {
+        // Check for scalar subquery: (SELECT ...)
+        if (self.current.type == .left_paren and self.lexer.peek().type == .kw_select) {
+            self.advance(); // consume (
+            const sub = try self.arena().create(ast.Select);
+            sub.* = try self.parseSelect();
+            try self.expect(.right_paren);
+            return .{ .scalar_subquery = sub };
+        }
+
         // Check for window functions: ROW_NUMBER(), RANK(), DENSE_RANK()
         const win_func: ?ast.WindowFunc = switch (self.current.type) {
             .kw_row_number => .row_number,
@@ -769,11 +778,20 @@ pub const Parser = struct {
 
         try self.expect(.right_paren);
 
+        // Optional: WITH COLUMNAR
+        var storage_format: ast.StorageFormat = .row;
+        if (self.current.type == .kw_with and self.lexer.peek().type == .kw_columnar) {
+            self.advance(); // consume WITH
+            self.advance(); // consume COLUMNAR
+            storage_format = .columnar;
+        }
+
         return .{
             .table_name = table_name,
             .columns = cols.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
             .checks = checks.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
             .foreign_keys = fkeys.toOwnedSlice(alloc) catch return ParseError.OutOfMemory,
+            .storage_format = storage_format,
         };
     }
 
