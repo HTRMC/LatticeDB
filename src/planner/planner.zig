@@ -172,36 +172,7 @@ const AnalyzeResult = struct {
 fn analyzePredicate(expr: *const ast.Expression, col_ordinal: u16, schema: *const Schema) ?AnalyzeResult {
     switch (expr.*) {
         .comparison => |cmp| {
-            // Check if left is our indexed column and right is a literal integer
-            const col_idx = getColumnOrdinal(cmp.left, schema);
-            const lit_val = getLiteralInt(cmp.right);
-
-            if (col_idx != null and col_idx.? == col_ordinal and lit_val != null) {
-                return switch (cmp.op) {
-                    .eq => .{ .scan_type = .{ .point = @intCast(lit_val.?) } },
-                    .gte => .{ .scan_type = .{ .range_from = @intCast(lit_val.?) } },
-                    .gt => .{ .scan_type = .{ .range_from = @intCast(lit_val.? + 1) } },
-                    .lte => .{ .scan_type = .{ .range_to = @intCast(lit_val.?) } },
-                    .lt => .{ .scan_type = .{ .range_to = @intCast(lit_val.? - 1) } },
-                    else => null,
-                };
-            }
-
-            // Check reverse: literal op column
-            const col_idx_r = getColumnOrdinal(cmp.right, schema);
-            const lit_val_l = getLiteralInt(cmp.left);
-
-            if (col_idx_r != null and col_idx_r.? == col_ordinal and lit_val_l != null) {
-                return switch (cmp.op) {
-                    .eq => .{ .scan_type = .{ .point = @intCast(lit_val_l.?) } },
-                    // Reversed: literal >= col means col <= literal
-                    .gte => .{ .scan_type = .{ .range_to = @intCast(lit_val_l.?) } },
-                    .gt => .{ .scan_type = .{ .range_to = @intCast(lit_val_l.? - 1) } },
-                    .lte => .{ .scan_type = .{ .range_from = @intCast(lit_val_l.?) } },
-                    .lt => .{ .scan_type = .{ .range_from = @intCast(lit_val_l.? + 1) } },
-                    else => null,
-                };
-            }
+            return analyzeComparison(cmp, col_ordinal, schema);
         },
         .between_expr => |b| {
             const col_idx = getColumnOrdinal(b.value, schema);
@@ -213,11 +184,100 @@ fn analyzePredicate(expr: *const ast.Expression, col_ordinal: u16, schema: *cons
             }
         },
         .and_expr => |a| {
-            // Try left first, then right
-            if (analyzePredicate(a.left, col_ordinal, schema)) |result| return result;
-            if (analyzePredicate(a.right, col_ordinal, schema)) |result| return result;
+            // Try to combine dual bounds: col >= low AND col <= high → range scan
+            const left_result = analyzePredicate(a.left, col_ordinal, schema);
+            const right_result = analyzePredicate(a.right, col_ordinal, schema);
+
+            if (left_result != null and right_result != null) {
+                // Try to combine range_from + range_to into range
+                const lr = left_result.?.scan_type;
+                const rr = right_result.?.scan_type;
+                if (lr == .range_from and rr == .range_to) {
+                    return .{ .scan_type = .{ .range = .{ .low = lr.range_from, .high = rr.range_to } } };
+                }
+                if (lr == .range_to and rr == .range_from) {
+                    return .{ .scan_type = .{ .range = .{ .low = rr.range_from, .high = lr.range_to } } };
+                }
+            }
+            // Fall back to using either side
+            if (left_result) |result| return result;
+            if (right_result) |result| return result;
+        },
+        .or_expr => |o| {
+            // OR optimization: col = A OR col = B → range(min, max)
+            const left_result = analyzePredicate(o.left, col_ordinal, schema);
+            const right_result = analyzePredicate(o.right, col_ordinal, schema);
+
+            if (left_result != null and right_result != null) {
+                const lr = left_result.?.scan_type;
+                const rr = right_result.?.scan_type;
+                // Two point lookups → range scan over min..max
+                if (lr == .point and rr == .point) {
+                    const low = @min(lr.point, rr.point);
+                    const high = @max(lr.point, rr.point);
+                    return .{ .scan_type = .{ .range = .{ .low = low, .high = high } } };
+                }
+            }
+        },
+        .in_list => |il| {
+            // IN (val1, val2, ...) → range scan over min..max
+            const col_idx = getColumnOrdinal(il.value, schema);
+            if (col_idx != null and col_idx.? == col_ordinal and il.items.len > 0) {
+                var low: i64 = std.math.maxInt(i64);
+                var high: i64 = std.math.minInt(i64);
+                var all_ints = true;
+                for (il.items) |item| {
+                    const v = getLiteralInt(item);
+                    if (v == null) {
+                        all_ints = false;
+                        break;
+                    }
+                    if (v.? < low) low = v.?;
+                    if (v.? > high) high = v.?;
+                }
+                if (all_ints and il.items.len == 1) {
+                    return .{ .scan_type = .{ .point = @intCast(low) } };
+                }
+                if (all_ints) {
+                    return .{ .scan_type = .{ .range = .{ .low = @intCast(low), .high = @intCast(high) } } };
+                }
+            }
         },
         else => {},
+    }
+    return null;
+}
+
+fn analyzeComparison(cmp: anytype, col_ordinal: u16, schema: *const Schema) ?AnalyzeResult {
+    // Check if left is our indexed column and right is a literal integer
+    const col_idx = getColumnOrdinal(cmp.left, schema);
+    const lit_val = getLiteralInt(cmp.right);
+
+    if (col_idx != null and col_idx.? == col_ordinal and lit_val != null) {
+        return switch (cmp.op) {
+            .eq => .{ .scan_type = .{ .point = @intCast(lit_val.?) } },
+            .gte => .{ .scan_type = .{ .range_from = @intCast(lit_val.?) } },
+            .gt => .{ .scan_type = .{ .range_from = @intCast(lit_val.? + 1) } },
+            .lte => .{ .scan_type = .{ .range_to = @intCast(lit_val.?) } },
+            .lt => .{ .scan_type = .{ .range_to = @intCast(lit_val.? - 1) } },
+            else => null,
+        };
+    }
+
+    // Check reverse: literal op column
+    const col_idx_r = getColumnOrdinal(cmp.right, schema);
+    const lit_val_l = getLiteralInt(cmp.left);
+
+    if (col_idx_r != null and col_idx_r.? == col_ordinal and lit_val_l != null) {
+        return switch (cmp.op) {
+            .eq => .{ .scan_type = .{ .point = @intCast(lit_val_l.?) } },
+            // Reversed: literal >= col means col <= literal
+            .gte => .{ .scan_type = .{ .range_to = @intCast(lit_val_l.?) } },
+            .gt => .{ .scan_type = .{ .range_to = @intCast(lit_val_l.? - 1) } },
+            .lte => .{ .scan_type = .{ .range_from = @intCast(lit_val_l.?) } },
+            .lt => .{ .scan_type = .{ .range_from = @intCast(lit_val_l.? + 1) } },
+            else => null,
+        };
     }
     return null;
 }
@@ -674,7 +734,7 @@ test "planner empty table zero rows" {
     try std.testing.expectEqual(@as(u64, 0), plan.filter.child.seq_scan.estimated_rows);
 }
 
-test "planner OR expression is not sargable" {
+test "planner OR expression uses range index scan" {
     const test_file = "test_planner_or.db";
     var dm = DiskManager.init(std.testing.allocator, test_file);
     defer dm.deleteFile();
@@ -705,7 +765,7 @@ test "planner OR expression is not sargable" {
     var planner = Planner.init(std.testing.allocator, &catalog);
 
     const parser_mod = @import("../parser/parser.zig");
-    // OR is not sargable → should fall back to seq scan
+    // OR of two equality → range scan on min..max
     var parser = parser_mod.Parser.init(std.testing.allocator, "SELECT * FROM t WHERE id = 1 OR id = 2");
     defer parser.deinit();
     const stmt = try parser.parse();
@@ -714,7 +774,56 @@ test "planner OR expression is not sargable" {
     defer planner.freePlan(plan);
 
     try std.testing.expect(plan.* == .filter);
-    try std.testing.expect(plan.filter.child.* == .seq_scan);
+    try std.testing.expect(plan.filter.child.* == .index_scan);
+    try std.testing.expect(plan.filter.child.index_scan.scan_type == .range);
+    try std.testing.expectEqual(@as(i32, 1), plan.filter.child.index_scan.scan_type.range.low);
+    try std.testing.expectEqual(@as(i32, 2), plan.filter.child.index_scan.scan_type.range.high);
+}
+
+test "planner AND dual bounds combines into range scan" {
+    const test_file = "test_planner_and_range.db";
+    var dm = DiskManager.init(std.testing.allocator, test_file);
+    defer dm.deleteFile();
+    try dm.open();
+    defer dm.close();
+    var bp = try BufferPool.init(std.testing.allocator, &dm, 100);
+    defer bp.deinit();
+    var am = AllocManager.init(&bp, &dm);
+    try am.initializeFile();
+    var catalog = try Catalog.init(std.testing.allocator, &bp, &am);
+    defer catalog.deinit();
+
+    const cols = [_]Column{
+        .{ .name = "id", .col_type = .integer, .max_length = 0, .nullable = false },
+    };
+    _ = try catalog.createTable("t", &cols);
+
+    const table_result = (try catalog.openTable("t")).?;
+    defer catalog.freeSchema(table_result.schema);
+    var table = table_result.table;
+    var i: i32 = 0;
+    while (i < 200) : (i += 1) {
+        _ = try table.insertTuple(null, &.{.{ .integer = i }});
+    }
+
+    _ = try catalog.createIndex("t", "idx_t_id", "id", false);
+
+    var planner = Planner.init(std.testing.allocator, &catalog);
+
+    const parser_mod = @import("../parser/parser.zig");
+    // id >= 10 AND id <= 20 → combined range scan
+    var parser = parser_mod.Parser.init(std.testing.allocator, "SELECT * FROM t WHERE id >= 10 AND id <= 20");
+    defer parser.deinit();
+    const stmt = try parser.parse();
+
+    const plan = try planner.planSelect(stmt.select);
+    defer planner.freePlan(plan);
+
+    try std.testing.expect(plan.* == .filter);
+    try std.testing.expect(plan.filter.child.* == .index_scan);
+    try std.testing.expect(plan.filter.child.index_scan.scan_type == .range);
+    try std.testing.expectEqual(@as(i32, 10), plan.filter.child.index_scan.scan_type.range.low);
+    try std.testing.expectEqual(@as(i32, 20), plan.filter.child.index_scan.scan_type.range.high);
 }
 
 test "planner no WHERE clause always seq scan" {
